@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-%E2%89%A5%203.7-3776AB?logo=python&logoColor=white)
 ![Plateforme](https://img.shields.io/badge/Windows%20%C2%B7%20Linux%20%C2%B7%20macOS-supported-brightgreen)
 ![Dépendances](https://img.shields.io/badge/dépendances%20Python-0-blue)
-![Licence](https://img.shields.io/badge/licence-MIT-green)
+![Licence](https://img.shields.io/badge/licence-Apache%202.0-blue)
 
 *[English translation below](#-english-summary) · Outil offensif — usage strictement légal (labos, CTF, audits autorisés)*
 
@@ -310,7 +310,11 @@ tests. Ouvre une *issue* pour discuter d'un format avant de coder son validateur
 
 ## 📜 Licence
 
-Distribué sous licence **MIT** — voir [LICENSE](LICENSE).
+Distribué sous licence **Apache License 2.0** — voir [LICENSE](LICENSE).
+
+En résumé : utilisation, modification et redistribution libres (même commerciales),
+avec protection expresse contre les litiges de brevets ; les mentions de copyright
+et la licence doivent être conservées dans les copies.
 
 ---
 
