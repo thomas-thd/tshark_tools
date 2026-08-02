@@ -5,8 +5,11 @@
 **Extraction de hachés prêts pour Hashcat depuis des captures réseau, via Tshark.**
 
 [![Python](https://img.shields.io/badge/python-%E2%89%A5%203.7-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#)
+
 [![Dependencies](https://img.shields.io/badge/python%20dependencies-none-success)](#)
+
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 English version: [README_EN.md](README_EN.md)
@@ -31,9 +34,9 @@ manuelle d'empreintes (checksum mal positionné, séparateurs incorrects) et le
 choix du mauvais mode Hashcat parmi les onze variantes concernées.
 
 > **Avertissement légal.** Cet outil est destiné exclusivement à un usage
-> autorisé : laboratoires, environnements de test, CTF et missions d'audit
-> contractuelles. L'utilisateur est seul responsable de la conformité de son
-> usage avec la législation applicable.
+autorisé : laboratoires, environnements de test, CTF et missions d'audit
+contractuelles. L'utilisateur est seul responsable de la conformité de son
+usage avec la législation applicable.
 
 ## Sommaire
 
@@ -58,7 +61,7 @@ choix du mauvais mode Hashcat parmi les onze variantes concernées.
 |---|---|
 | Détection automatique | NTLMSSP et Kerberos identifiés sans configuration, y compris en présence des deux protocoles dans la même capture |
 | Couverture étendue | 12 modes Hashcat : NetNTLMv1/v2, AS-REP roasting, pré-authentification Kerberos, Kerberoasting (RC4 **et** AES 128/256), APOP |
-| Identifiants en clair | Repérage des couples user/pass transitant en clair : FTP et Telnet (`USER`/`PASS`), HTTP Basic, `AUTH PLAIN`/`LOGIN` (SMTP, IMAP, POP), formulaires HTTP — rapport dédié |
+| Identifiants en clair | Repérage des couples user/pass transitant en clair : FTP et Telnet `USER/PASS`, HTTP Basic, `AUTH PLAIN/LOGIN` (SMTP, IMAP, POP), formulaires HTTP — rapport dédié |
 | Validation stricte | Chaque ligne est vérifiée contre les contraintes exactes du tokenizer Hashcat (séparateurs, longueurs, bornes) **avant** écriture sur disque |
 | Rapport d'anomalies | Toute trame incomplète est journalisée avec la cause précise du rejet ; aucune empreinte bancale n'est produite |
 | Repli sur octets bruts | Pour NTLMSSP, APOP et les identifiants en clair : scan des octets bruts (signatures et expressions protocolaires, Base64 inclus) lorsque le dissecteur n'a pas reconnu l'encapsulation (HTTP, IMAP, SMTP, POP3, Telnet, RPC…) |
@@ -82,19 +85,13 @@ choix du mauvais mode Hashcat parmi les onze variantes concernées.
 
 Les subtilités de format sont gérées nativement :
 
-- **Position du checksum** — 16 premiers octets pour RC4 (etype 23), 12 **derniers**
-  octets pour AES (etypes 17/18) ;
+- **Position du checksum** — 16 premiers octets pour RC4 (etype 23), 12 **derniers** octets pour AES (etypes 17/18) ;
 - **Découpe NetNTLMv2** — séparation `NTProofStr` (16 octets) / blob ;
 - **Formats TGS** — astérisques présents en RC4 (`$krb5tgs$23$*…$…$…*$`), absents en AES ;
-- **Tickets `krbtgt` ignorés** — chiffrés avec la clé du KDC, donc non cassables ;
-  leur émission comme empreinte serait sans valeur ;
-- **Appairage APOP** — le digest `MD5(challenge + mot de passe)` n'est émis que si la
-  bannière contenant le challenge `<…>` a été capturée avant la commande `APOP`.
+- **Tickets `krbtgt` ignorés** — chiffrés avec la clé du KDC, donc non cassables ; leur émission comme empreinte serait sans valeur ;
+- **Appairage APOP** — le digest `MD5(challenge + mot de passe)` n'est émis que si la bannière contenant le challenge `<…>` a été capturée avant la commande `APOP`.
 
-> **À propos d'OSPF.** Hashcat ne propose aucun mode natif pour l'authentification
-> OSPF ; de plus, l'authentification cryptographique LLS (RFC 4813) observée sur les
-> réseaux modernes repose sur des hachages non réversibles qui ne sont pas cassables
-> par Hashcat. Ces paquets sont volontairement ignorés, sans message d'erreur.
+> **À propos d'OSPF.** Hashcat ne propose aucun mode natif pour l'authentification OSPF ; de plus, l'authentification cryptographique LLS (RFC 4813) observée sur les réseaux modernes repose sur des hachages non réversibles qui ne sont pas cassables par Hashcat. Ces paquets sont volontairement ignorés, sans message d'erreur.
 
 ## Prérequis
 
@@ -124,7 +121,7 @@ Aucune étape supplémentaire : pas de `pip install`, pas de compilation.
 
 ## Utilisation
 
-```
+```text
 usage: tshark2hashcat.py [-h] [-o SORTIE] [--tshark CHEMIN] [-v] pcap
 ```
 
@@ -163,15 +160,12 @@ C:\outils> python tshark2hashcat.py capture.pcapng
 [i] tshark -r capture.pcapng -T json -x
     [m5600]  frame #18 NTLM (j.dupont)
     [m32200] frame #61 Kerberos
-
 === RÉSULTATS ===
 [i] protocoles détectés : kerberos, ntlmssp
 [i] comptes AVEC pré-auth Kerberos vus : j.dupont
-
 === IDENTITÉS KERBEROS VUES (diagnostic) ===
     frame #61    AS-REQ   user=j.dupont realm=EXAMPLE.LOCAL spn=krbtgt/EXAMPLE.LOCAL salt=EXAMPLE.LOCALj.dupont etypes=18
     frame #62    AS-REP   user=j.dupont realm=EXAMPLE.LOCAL spn=krbtgt/EXAMPLE.LOCAL etypes=18
-
 [+]   1 hash (5600)  -> hashes_m5600.txt
       hashcat -m 5600 hashes_m5600.txt wordlist.txt
 [+]   1 hash (32200) -> hashes_m32200.txt
@@ -180,7 +174,6 @@ C:\outils> python tshark2hashcat.py capture.pcapng
 === IDENTIFIANTS EN CLAIR ===
     FTP/Telnet USER/PASS   j.dupont : Exemple2030!
     HTTP Basic             j.dupont : Exemple2030!
-
 [i] 2 empreintes également écrites dans .\hashes.txt
 ```
 
@@ -212,12 +205,7 @@ hashcat -m 32200 hashes_m32200.txt --show
 Les empreintes sont également compatibles avec **John the Ripper jumbo**
 (formats `netntlm`, `netntlmv2`, `krb5asrep`, `krb5pa-sha1`, `krb5tgs`).
 
-> **Note — modes 19600/19700 (TGS AES).** Le salt Kerberos AES est construit comme
-> `REALM + sAMAccountName` du **compte de service**. Le script retient par défaut
-> la première composante du SPN (convention des comptes machine : `HOST/srv` →
-> salt `REALMHOST$`). En cas d'échec du cassage, identifier le véritable compte de
-> service dans la section *Identités Kerberos vues* et ajuster le champ `user` de
-> la ligne en conséquence.
+> **Note — modes 19600/19700 (TGS AES).** Le salt Kerberos AES est construit comme `REALM + sAMAccountName` du **compte de service**. Le script retient par défaut la première composante du SPN (convention des comptes machine : `HOST/srv` → salt `REALMHOST$`). En cas d'échec du cassage, identifier le véritable compte de service dans la section *Identités Kerberos vues* et ajuster le champ `user` de la ligne en conséquence.
 
 ## Identifiants transmis en clair
 
@@ -233,7 +221,7 @@ chiffrement applicatif).
 | HTTP Basic | En-tête `Authorization: Basic` (décodage Base64) |
 | SMTP / IMAP / POP — `AUTH PLAIN` | Séquence Base64 `authzid\0user\0pass` |
 | SMTP / IMAP / POP — `AUTH LOGIN` | Challenge/réponse Base64 sur lignes successives |
-| Formulaire HTTP | Paramètres `user=…&pass=…` dans une requête `GET`/`POST` |
+| Formulaire HTTP | Paramètres `user=…&pass=…` dans une requête `GET/POST` |
 
 Les résultats sont dédupliqués et écrits dans `hashes_credentials.txt`
 (format TSV : `protocole`, `user`, `pass`), puis récapitulés à l'écran
@@ -253,7 +241,7 @@ rapportée dans un récapitulatif final indiquant la cause exacte :
 ```
 
 Cette politique garantit qu'aucune ligne du fichier de sortie ne peut être rejetée
-par Hashcat pour motif de format (`Separator unmatched`, `Token length exception`).
+par Hashcat pour motif de format `Separator unmatched`, `Token length exception`.
 
 ## Architecture
 
@@ -285,7 +273,7 @@ capture.pcapng
 1. **Champs disséqués prioritaires** — voie privilégiée : types de message,
    etypes et security buffers sont déjà interprétés par Tshark.
 2. **Scans bruts en repli** — indispensables lorsque l'encapsulation n'a pas été
-   reconnue (en-tête HTTP `Authorization:`, commandes `AUTH NTLM`/`PLAIN`/`LOGIN`,
+   reconnue (en-tête HTTP `Authorization:`, commandes `AUTH NTLM/PLAIN/LOGIN`,
    bannières POP3, RPC…) : signature `NTLMSSP\0`, expressions APOP et motifs
    d'identifiants, en clair comme en Base64.
 3. **Validation avant écriture** — chaque ligne candidate est confrontée aux
@@ -313,7 +301,7 @@ capture.pcapng
 | `protocoles détectés : aucun` | Capture sans authentification NTLM/Kerberos | Vérifier : `tshark -q -r capture.pcapng -z io,phs` |
 | `tshark a échoué` | Fichier corrompu ou format inattendu | Ouvrir la capture dans Wireshark pour validation |
 | Hashcat : `Separator unmatched` | Ligne écrite manuellement dans le fichier | Régénérer le fichier avec le script exclusivement |
-| Mode 19700 sans résultat | Compte de service incorrect (salt) | Voir la note des modes [19600/19700](#cassage-avec-hashcat) |
+| Mode 19700 sans résultat | Compte de service incorrect (salt) | Voir la note des modes 19600/19700 |
 
 ## Contribution
 
@@ -325,7 +313,6 @@ joindre une capture de test (anonymisée) ainsi que la sortie Hashcat attendue.
 ## Licence
 
 Distribué sous [Apache License 2.0](LICENSE) — © 2026 tshark2hashcat contributors.
-
 Utilisation, modification et redistribution libres, y compris à des fins
 commerciales, avec protection expresse contre les litiges de brevets. Les
 mentions de copyright et la licence doivent être conservées dans toute copie.
