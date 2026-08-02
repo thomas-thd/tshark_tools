@@ -9,6 +9,7 @@
 [![Dependencies](https://img.shields.io/badge/python%20dependencies-none-success)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
+Version française : [README.md](README.md)
 
 </div>
 
