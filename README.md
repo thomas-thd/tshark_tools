@@ -2,14 +2,11 @@
 
 # 🦈 tshark2hashcat
 
-**Extraction de hachés prêts pour Hashcat depuis des captures réseau, via Tshark.**
+**Extraction de hashes prêts pour Hashcat depuis des captures réseau, via Tshark.**
 
-[![Python](https://img.shields.io/badge/python-%E2%89%A5%203.7-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-
+[![Python](https://img.shields.io/badge/python-%E2%89%A5%203.10-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#)
-
-[![Dependencies](https://img.shields.io/badge/python%20dependencies-none-success)](#)
-
+[![Dependencies](https://img.shields.io/badge/python%20dependencies-none-success)](#prérequis)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 English version: [README_EN.md](README_EN.md)
@@ -20,35 +17,32 @@ English version: [README_EN.md](README_EN.md)
 
 ## Présentation
 
-`tshark2hashcat` analyse un fichier `.pcap` / `.pcapng` à l'aide de **Tshark** — son
-unique source de données —, détecte les authentifications **NetNTLM**, **Kerberos**
-et **APOP**, reconstruit les empreintes cassables dans le **format exact attendu
-par Hashcat**, les **valide individuellement** contre la grammaire des modules
-officiels, repère au passage les **identifiants transmis en clair** (FTP, Telnet,
-HTTP Basic, SMTP/IMAP/POP), puis génère les fichiers de sortie accompagnés de la
-**commande de cassage** correspondante.
+`tshark2hashcat` analyse des fichiers `.pcap` et `.pcapng` avec **Tshark comme unique source de données**, détecte différentes authentifications réseau, puis reconstruit les lignes dans les formats exacts attendus par [Hashcat](https://hashcat.net/hashcat/).
 
-L'outil s'adresse aux pentesters, analystes forensique et joueurs de CTF. Il
-élimine les deux sources d'erreur classiques de ce workflow : la reconstruction
-manuelle d'empreintes (checksum mal positionné, séparateurs incorrects) et le
-choix du mauvais mode Hashcat parmi les onze variantes concernées.
+Le programme :
 
-> **Avertissement légal.** Cet outil est destiné exclusivement à un usage
-autorisé : laboratoires, environnements de test, CTF et missions d'audit
-contractuelles. L'utilisateur est seul responsable de la conformité de son
-usage avec la législation applicable.
+- utilise un seul appel à Tshark avec `-T json -x` ;
+- exploite les champs disséqués et les octets bruts fournis par Tshark ;
+- valide chaque ligne avant son écriture ;
+- déduplique les résultats ;
+- produit un fichier global et un fichier par mode Hashcat ;
+- signale les données manquantes au lieu de générer des lignes invalides ;
+- détecte également certains identifiants transmis en clair.
+
+L'outil est destiné aux pentesters, analystes forensic, administrateurs et participants à des CTF dans un cadre autorisé.
+
+> **Avertissement légal** — Utilisez cet outil uniquement sur des captures que vous êtes autorisé à analyser : laboratoire, CTF, audit contractuel ou environnement de test. Les identifiants en clair peuvent contenir des données personnelles et des secrets sensibles.
 
 ## Sommaire
 
 - [Fonctionnalités](#fonctionnalités)
-- [Formats de hachés supportés](#formats-de-hachés-supportés)
+- [Formats supportés](#formats-supportés)
 - [Prérequis](#prérequis)
 - [Installation](#installation)
 - [Utilisation](#utilisation)
-- [Exemple de session](#exemple-de-session)
+- [Fichiers produits](#fichiers-produits)
 - [Cassage avec Hashcat](#cassage-avec-hashcat)
 - [Identifiants transmis en clair](#identifiants-transmis-en-clair)
-- [Gestion des données manquantes](#gestion-des-données-manquantes)
 - [Architecture](#architecture)
 - [Limites connues](#limites-connues)
 - [Dépannage](#dépannage)
@@ -59,56 +53,64 @@ usage avec la législation applicable.
 
 | Fonctionnalité | Description |
 |---|---|
-| Détection automatique | NTLMSSP et Kerberos identifiés sans configuration, y compris en présence des deux protocoles dans la même capture |
-| Couverture étendue | 12 modes Hashcat : NetNTLMv1/v2, AS-REP roasting, pré-authentification Kerberos, Kerberoasting (RC4 **et** AES 128/256), APOP |
-| Identifiants en clair | Repérage des couples user/pass transitant en clair : FTP et Telnet `USER/PASS`, HTTP Basic, `AUTH PLAIN/LOGIN` (SMTP, IMAP, POP), formulaires HTTP — rapport dédié |
-| Validation stricte | Chaque ligne est vérifiée contre les contraintes exactes du tokenizer Hashcat (séparateurs, longueurs, bornes) **avant** écriture sur disque |
-| Rapport d'anomalies | Toute trame incomplète est journalisée avec la cause précise du rejet ; aucune empreinte bancale n'est produite |
-| Repli sur octets bruts | Pour NTLMSSP, APOP et les identifiants en clair : scan des octets bruts (signatures et expressions protocolaires, Base64 inclus) lorsque le dissecteur n'a pas reconnu l'encapsulation (HTTP, IMAP, SMTP, POP3, Telnet, RPC…) |
-| Diagnostic Kerberos | Inventaire des identités observées : utilisateur, realm, SPN, salt ETYPE-INFO2, etype, type de message, numéro de trame |
-| Sortie normalisée | Déduplication, fichier global + un fichier par mode Hashcat, commandes `hashcat` prêtes à l'emploi |
-| Portabilité | Windows, Linux, macOS — bibliothèque standard Python uniquement, aucune dépendance tierce |
+| NetNTLM | Extraction de NetNTLMv1/ESS et NetNTLMv2, y compris depuis des flux Base64 |
+| Kerberos | AS-REQ avec PA-ENC-TIMESTAMP, AS-REP et TGS-REP en RC4, AES128 et AES256 |
+| WPA/WPA2 | Extraction des PMKID et des handshakes EAPOL au format unifié 22000 |
+| SNMPv3 | Extraction des authentifications USM au format Hashcat 25000 |
+| APOP | Appairage de la bannière POP3 et de la commande `APOP` |
+| Identifiants en clair | FTP, Telnet, HTTP Basic, formulaires HTTP et `AUTH PLAIN/LOGIN` SMTP/IMAP/POP |
+| Validation stricte | Vérification des séparateurs, longueurs et bornes avant écriture |
+| Repli sur octets bruts | Analyse de `frame_raw` et des charges utiles lorsque le dissecteur ne suffit pas |
+| Réassemblage | Reconstruction des charges utiles TCP/UDP à partir des paquets fournis par Tshark |
+| Sortie normalisée | Déduplication, fichier global, fichiers par mode et commandes Hashcat |
+| Portabilité | Windows, Linux et macOS ; bibliothèque standard Python uniquement |
 
-## Formats de hachés supportés
+## Formats supportés
 
-| Protocole / attaque | Condition dans la capture | Mode Hashcat | Format produit |
+| Protocole / authentification | Condition | Mode Hashcat | Format produit |
 |---|---|:---:|---|
-| NetNTLMv2 | Réponse NT > 24 octets | `5600` | `user::domaine:challenge:NTProofStr:blob` |
-| NetNTLMv1 (±ESS) | Réponse NT = 24 octets | `5500` | `user::domaine:challenge:LM:NT` |
-| AS-REP roasting | AS-REP, etype 23 (RC4) | `18200` | `$krb5asrep$23$user@realm:chk$edata2` |
-| AS-REP roasting | AS-REP, etype 17 / 18 (AES) | `32100` / `32200` | `$krb5asrep$18$user$realm$chk$edata2` |
-| Pré-authentification | AS-REQ, etype 23 | `7500` | `$krb5pa$23$user$realm$timestamp` |
-| Pré-authentification | AS-REQ, etype 17 / 18 | `19800` / `19900` | `$krb5pa$18$user$realm$timestamp` |
-| Kerberoasting | TGS-REP, etype 23 (RC4) | `13100` | `$krb5tgs$23$*user$realm$spn*$chk$edata2` |
-| Kerberoasting | TGS-REP, etype 17 / 18 | `19600` / `19700` | `$krb5tgs$18$service$realm$chk$edata2` |
-| APOP (POP3) | Bannière `+OK …<horodatage>` + `APOP user digest` | `20` | `digest:challenge` |
+| NetNTLMv2 | Réponse NT supérieure à 24 octets | `5600` | `user::domain:challenge:NTProofStr:blob` |
+| NetNTLMv1 / ESS | Réponses LM et NT de 24 octets | `5500` | `user::domain:LM:NT:challenge` |
+| Kerberos AS-REP, RC4 | Etype `23` | `18200` | `$krb5asrep$23$...` |
+| Kerberos AS-REP, AES128 | Etype `17` | `32100` | `$krb5asrep$17$...` |
+| Kerberos AS-REP, AES256 | Etype `18` | `32200` | `$krb5asrep$18$...` |
+| Kerberos AS-REQ, RC4 | PA-ENC-TIMESTAMP, etype `23` | `7500` | `$krb5pa$23$...` |
+| Kerberos AS-REQ, AES128 | PA-ENC-TIMESTAMP, etype `17` | `19800` | `$krb5pa$17$...` |
+| Kerberos AS-REQ, AES256 | PA-ENC-TIMESTAMP, etype `18` | `19900` | `$krb5pa$18$...` |
+| Kerberos TGS-REP, RC4 | Etype `23` | `13100` | `$krb5tgs$23$...` |
+| Kerberos TGS-REP, AES128 | Etype `17` | `19600` | `$krb5tgs$17$...` |
+| Kerberos TGS-REP, AES256 | Etype `18` | `19700` | `$krb5tgs$18$...` |
+| APOP | Bannière `<challenge>` et commande `APOP` | `20` | `digest:challenge` |
+| SNMPv3 USM | Authentification USM | `25000` | `$SNMPv3$0$...` |
+| WPA/WPA2 PMKID | PMKID RSN disponible | `22000` | `WPA*01*...` |
+| WPA/WPA2 EAPOL | Handshake 4-way M1 + M2 disponible | `22000` | `WPA*02*...` |
 
-Les subtilités de format sont gérées nativement :
+### Particularités prises en charge
 
-- **Position du checksum** — 16 premiers octets pour RC4 (etype 23), 12 **derniers** octets pour AES (etypes 17/18) ;
-- **Découpe NetNTLMv2** — séparation `NTProofStr` (16 octets) / blob ;
-- **Formats TGS** — astérisques présents en RC4 (`$krb5tgs$23$*…$…$…*$`), absents en AES ;
-- **Tickets `krbtgt` ignorés** — chiffrés avec la clé du KDC, donc non cassables ; leur émission comme empreinte serait sans valeur ;
-- **Appairage APOP** — le digest `MD5(challenge + mot de passe)` n'est émis que si la bannière contenant le challenge `<…>` a été capturée avant la commande `APOP`.
-
-> **À propos d'OSPF.** Hashcat ne propose aucun mode natif pour l'authentification OSPF ; de plus, l'authentification cryptographique LLS (RFC 4813) observée sur les réseaux modernes repose sur des hachages non réversibles qui ne sont pas cassables par Hashcat. Ces paquets sont volontairement ignorés, sans message d'erreur.
+- **NetNTLMv2** : séparation automatique du `NTProofStr` et du blob.
+- **Kerberos RC4** : checksum placé au début du cipher selon le format du module.
+- **Kerberos AES** : checksum extrait des 12 derniers octets.
+- **Kerberos moderne** : prise en charge du champ générique `kerberos.cipher` avec analyse du contexte ASN.1.
+- **PA-ENC-TIMESTAMP** : repli sur les octets DER bruts quand les champs répétés ne sont pas conservés dans le JSON.
+- **TGS `krbtgt`** : tickets ignorés, car ils ne correspondent pas à un hash de service utile au Kerberoasting.
+- **APOP** : le digest n'est produit que si le challenge de la bannière a été capturé.
+- **WPA** : le MIC est remis à zéro dans la trame EAPOL avant génération de la ligne `WPA*02*`.
 
 ## Prérequis
 
 | Composant | Version / remarque |
 |---|---|
-| Python | ≥ 3.7 — aucun paquet tiers requis |
-| Tshark | Installé avec [Wireshark](https://www.wireshark.org/download.html) (composant *TShark* à cocher) |
+| Python | **3.10 ou supérieur** ; aucun paquet tiers requis |
+| Tshark | Fourni avec [Wireshark](https://www.wireshark.org/download.html) |
+| Hashcat | Optionnel, uniquement pour le cassage des hashes |
 
-Chemins détectés automatiquement, par ordre de priorité :
+Le script recherche automatiquement Tshark dans cet ordre :
 
+```text
+C:\Program Files\Wireshark\tshark.exe
+C:\Program Files (x86)\Wireshark\tshark.exe
+tshark  # PATH
 ```
-1. C:\Program Files\Wireshark\tshark.exe
-2. C:\Program Files (x86)\Wireshark\tshark.exe
-3. tshark (résolution via le PATH)
-```
-
-Un chemin différent peut être fourni explicitement avec `--tshark`.
 
 ## Installation
 
@@ -117,202 +119,296 @@ git clone https://github.com/<organisation>/tshark2hashcat.git
 cd tshark2hashcat
 ```
 
-Aucune étape supplémentaire : pas de `pip install`, pas de compilation.
+Aucune installation Python supplémentaire n'est nécessaire :
+
+```bash
+python3 tshark2hashcat.py --help
+```
+
+Sous Windows, utilisez `python` au lieu de `python3` si nécessaire.
 
 ## Utilisation
 
-```text
-usage: tshark2hashcat.py [-h] [-o SORTIE] [--tshark CHEMIN] [-v] pcap
-```
-
-| Argument | Description | Défaut |
-|---|---|---|
-| `pcap` | Capture `.pcap` / `.pcapng`, ou export JSON de Tshark (analyse hors-ligne) | — |
-| `-o`, `--output` | Fichier global agrégeant toutes les empreintes | `hashes.txt` |
-| `--tshark` | Chemin complet vers l'exécutable Tshark | détection automatique |
-| `-v`, `--verbose` | Journalisation détaillée | désactivé |
+### Analyse standard
 
 ```bash
-# Analyse standard
-python tshark2hashcat.py capture.pcapng
-
-# Sortie personnalisée, Tshark hors des chemins standards
-python tshark2hashcat.py capture.pcap -o empreintes.txt --tshark "D:\Outils\Wireshark\tshark.exe"
-
-# Rejeu d'un export JSON Tshark (tests, intégration continue)
-python tshark2hashcat.py export_tshark.json
+python3 tshark2hashcat.py capture.pcapng
 ```
 
-**Windows — glisser-déposer.** Créer `run.bat` à côté du script permet de
-déposer une capture directement sur le raccourci :
+### Choisir le fichier de sortie
 
-```bat
-@echo off
-python "%~dp0tshark2hashcat.py" %*
-pause
+```bash
+python3 tshark2hashcat.py capture.pcap \
+  --output resultats/hashes.txt
 ```
+
+### Indiquer le chemin de Tshark
+
+```bash
+python3 tshark2hashcat.py capture.pcap \
+  --tshark /usr/bin/tshark
+```
+
+Sous Windows PowerShell :
+
+```powershell
+python tshark2hashcat.py capture.pcap `
+  --tshark "C:\Program Files\Wireshark\tshark.exe"
+```
+
+### Analyser un export JSON Tshark
+
+Le script accepte directement un export JSON produit par Tshark :
+
+```bash
+tshark -r capture.pcapng -T json -x > export_tshark.json
+python3 tshark2hashcat.py export_tshark.json
+```
+
+Dans ce cas, Tshark n'est pas relancé.
+
+### Captures compressées
+
+Les fichiers `.bz2` et `.xz` sont décompressés temporairement avant l'appel à Tshark. Le fichier temporaire est supprimé automatiquement après traitement.
+
+### Filtre de sélection et grosses captures
+
+Par défaut, Tshark reçoit un filtre ciblant les protocoles et signatures utiles afin de limiter le volume du JSON produit. Pour analyser tous les paquets :
+
+```bash
+python3 tshark2hashcat.py capture.pcapng --full-packets
+```
+
+Cette option peut augmenter fortement la durée d'analyse et l'utilisation mémoire.
+
+### Mode verbeux
+
+```bash
+python3 tshark2hashcat.py capture.pcapng --verbose
+```
+
+### Aide
+
+```bash
+python3 tshark2hashcat.py --help
+```
+
+## Fichiers produits
+
+Avec `--output hashes.txt`, le programme génère :
+
+| Fichier | Contenu |
+|---|---|
+| `hashes.txt` | Tous les hashes, tous modes confondus |
+| `hashes_m<mode>.txt` | Un fichier par mode Hashcat, directement exploitable avec `-m` |
+| `hashes_credentials.txt` | Identifiants transmis en clair, lorsqu'ils sont détectés |
+
+Exemples :
+
+```text
+hashes.txt
+hashes_m20.txt
+hashes_m5600.txt
+hashes_m18200.txt
+hashes_m22000.txt
+hashes_credentials.txt
+```
+
+Les fichiers de hashes sont dédupliqués. Le fichier d'identifiants en clair est un rapport TSV contenant le protocole, l'utilisateur et le mot de passe.
 
 ## Exemple de session
 
 ```console
-C:\outils> python tshark2hashcat.py capture.pcapng
-[i] tshark : C:\Program Files\Wireshark\tshark.exe
-[i] tshark -r capture.pcapng -T json -x
-    [m5600]  frame #18 NTLM (j.dupont)
+$ python3 tshark2hashcat.py capture.pcapng -v
+[i] tshark : /usr/bin/tshark
+[i] /usr/bin/tshark -n -2 -r capture.pcapng ... -T json -x
+    [m5600] frame #18 NTLM brut (j.dupont)
     [m32200] frame #61 Kerberos
+
 === RÉSULTATS ===
 [i] protocoles détectés : kerberos, ntlmssp
 [i] comptes AVEC pré-auth Kerberos vus : j.dupont
-=== IDENTITÉS KERBEROS VUES (diagnostic) ===
-    frame #61    AS-REQ   user=j.dupont realm=EXAMPLE.LOCAL spn=krbtgt/EXAMPLE.LOCAL salt=EXAMPLE.LOCALj.dupont etypes=18
-    frame #62    AS-REP   user=j.dupont realm=EXAMPLE.LOCAL spn=krbtgt/EXAMPLE.LOCAL etypes=18
-[+]   1 hash (5600)  -> hashes_m5600.txt
-      hashcat -m 5600 hashes_m5600.txt wordlist.txt
+
+[+]   1 hash (5600) -> hashes_m5600.txt
+    hashcat -m 5600 hashes_m5600.txt wordlist.txt
 [+]   1 hash (32200) -> hashes_m32200.txt
-      hashcat -m 32200 hashes_m32200.txt wordlist.txt
-[+] 2 identifiants en clair -> hashes_credentials.txt
-=== IDENTIFIANTS EN CLAIR ===
-    FTP/Telnet USER/PASS   j.dupont : Exemple2030!
-    HTTP Basic             j.dupont : Exemple2030!
-[i] 2 empreintes également écrites dans .\hashes.txt
+    hashcat -m 32200 hashes_m32200.txt wordlist.txt
+
+[i] 2 hash(s) écrit(s) aussi dans ./hashes.txt
 ```
 
-Fichiers produits à côté de la capture :
-
-| Fichier | Contenu |
-|---|---|
-| `hashes.txt` | Toutes les empreintes, tous modes confondus |
-| `hashes_m<mode>.txt` | Un fichier par mode Hashcat, directement exploitable avec `-m` |
-| `hashes_credentials.txt` | Identifiants transmis en clair (protocole, utilisateur, mot de passe) |
+Les valeurs affichées dans cet exemple sont fictives.
 
 ## Cassage avec Hashcat
 
+### NetNTLMv2
+
 ```bash
-# Attaque par dictionnaire
-hashcat -m 5600  hashes_m5600.txt  rockyou.txt
-hashcat -m 32200 hashes_m32200.txt rockyou.txt
-
-# Dictionnaire + règles
-hashcat -m 32200 hashes_m32200.txt rockyou.txt -r rules/best64.rule
-
-# Attaque par masque (politique de mot de passe connue)
-hashcat -m 19700 hashes_m19700.txt -a 3 ?u?l?l?l?l?l?l?d
-
-# Consultation des résultats
-hashcat -m 32200 hashes_m32200.txt --show
+hashcat -m 5600 hashes_m5600.txt wordlist.txt
 ```
 
-Les empreintes sont également compatibles avec **John the Ripper jumbo**
-(formats `netntlm`, `netntlmv2`, `krb5asrep`, `krb5pa-sha1`, `krb5tgs`).
+### AS-REP roasting RC4
 
-> **Note — modes 19600/19700 (TGS AES).** Le salt Kerberos AES est construit comme `REALM + sAMAccountName` du **compte de service**. Le script retient par défaut la première composante du SPN (convention des comptes machine : `HOST/srv` → salt `REALMHOST$`). En cas d'échec du cassage, identifier le véritable compte de service dans la section *Identités Kerberos vues* et ajuster le champ `user` de la ligne en conséquence.
+```bash
+hashcat -m 18200 hashes_m18200.txt wordlist.txt
+```
+
+### Kerberoasting AES256
+
+```bash
+hashcat -m 19700 hashes_m19700.txt wordlist.txt
+```
+
+### WPA/WPA2
+
+```bash
+hashcat -m 22000 hashes_m22000.txt wordlist.txt
+```
+
+### SNMPv3
+
+```bash
+hashcat -m 25000 hashes_m25000.txt wordlist.txt
+```
+
+Avec des règles :
+
+```bash
+hashcat -m 5600 hashes_m5600.txt wordlist.txt \
+  -r rules/best64.rule
+```
+
+Afficher les résultats déjà trouvés :
+
+```bash
+hashcat -m 5600 hashes_m5600.txt --show
+```
+
+> Vérifiez le format attendu par la version de Hashcat installée. Les modules et formats peuvent évoluer entre versions.
 
 ## Identifiants transmis en clair
 
-En complément des empreintes cassables, le script repère les couples
-utilisateur/mot de passe qui transitent **sans chiffrement** sur le réseau.
-Ils ne nécessitent aucun cassage : ils sont utilisables tels quels, et leur
-présence dans une capture est en soi un constat de sécurité (défaut de
-chiffrement applicatif).
+En complément des hashes, le programme recherche des couples utilisateur/mot de passe transmis sans chiffrement :
 
-| Source | Méthode de détection |
+| Source | Détection |
 |---|---|
-| FTP / Telnet | Commandes `USER` puis `PASS` appairées dans l'ordre des trames |
-| HTTP Basic | En-tête `Authorization: Basic` (décodage Base64) |
-| SMTP / IMAP / POP — `AUTH PLAIN` | Séquence Base64 `authzid\0user\0pass` |
-| SMTP / IMAP / POP — `AUTH LOGIN` | Challenge/réponse Base64 sur lignes successives |
-| Formulaire HTTP | Paramètres `user=…&pass=…` dans une requête `GET/POST` |
+| FTP / Telnet | Commandes `USER` puis `PASS` |
+| Telnet | Prompts `login:` / `username:` puis `Password:` |
+| HTTP Basic | En-tête `Authorization: Basic` décodé en Base64 |
+| SMTP / IMAP / POP | `AUTH PLAIN` |
+| SMTP / IMAP / POP | `AUTH LOGIN` avec valeurs Base64 |
+| Formulaires HTTP | Paramètres `user=`, `username=`, `login=`, `pass=` ou `password=` |
+| SNMPv1/v2c | Community string rapportée comme donnée en clair |
 
-Les résultats sont dédupliqués et écrits dans `hashes_credentials.txt`
-(format TSV : `protocole`, `user`, `pass`), puis récapitulés à l'écran
-dans la section *IDENTIFIANTS EN CLAIR*.
+Les résultats sont dédupliqués et enregistrés dans :
+
+```text
+hashes_credentials.txt
+```
+
+Exemple de contenu :
+
+```text
+HTTP Basic	user=alice	pass=ExempleTemporaire!
+FTP/Telnet USER/PASS	user=bob	pass=MotDePasseDeTest
+```
+
+Ces valeurs ne nécessitent aucun cassage. Traitez ce fichier comme un secret.
 
 ## Gestion des données manquantes
 
-Le programme ne procède à aucune extrapolation. Chaque trame inexploitable est
-rapportée dans un récapitulatif final indiquant la cause exacte :
+Le programme n'extrapole pas les champs absents. Toute donnée inexploitable est signalée dans le rapport final, par exemple :
 
-```console
+```text
 [!] Données manquantes / éléments ignorés :
-    - NTLM frame #51: 'server_challenge' manquant -> hash non généré
-    - Kerberos frame #77: TGS-REP mais cname/realm/spn manquant (user=j.dupont, realm=EXAMPLE.LOCAL, spn=None) -> ignoré
+    - NTLM frame #51: server challenge absent -> hash non généré
+    - Kerberos frame #77: TGS-REP sans cname/realm/spn -> ignoré
     - Kerberos frame #80: AS-REP etype inconnu (1) -> ignoré
-    - APOP (j.dupont): challenge introuvable (pas de bannière '<...>') -> ignoré
+    - APOP (alice): challenge introuvable -> ignoré
 ```
 
-Cette politique garantit qu'aucune ligne du fichier de sortie ne peut être rejetée
-par Hashcat pour motif de format `Separator unmatched`, `Token length exception`.
+Une capture valide peut donc ne produire aucun hash si elle ne contient pas tous les éléments nécessaires : challenge, réponse, handshake complet, SSID, realm, SPN, etc.
 
 ## Architecture
 
-```
+```text
 capture.pcapng
       │
       ▼
-┌──────────────────────────────────┐
-│ tshark -r capture -T json -x     │   Appel unique : champs disséqués
-└──────────────────────────────────┘   + octets bruts de chaque couche
-        │                    │
-        ▼                    ▼
-  Champs disséqués      Octets bruts (-x)
-  ntlmssp.* /           Scans de signatures :
-  kerberos.*            NTLMSSP\0, APOP, creds
-        │               (clair + Base64)
-        ▼                    │
-  Appairage challenge/       │
-  réponse par tuple IP:port  │
-        └──────────┬─────────┘
-                   ▼
-       Validateurs par mode Hashcat
-        (grammaire officielle)
-                   ▼
-    hashes.txt  +  hashes_m<mode>.txt
-              +  hashes_credentials.txt
+┌────────────────────────────────────┐
+│ tshark -n -2 -r capture -T json -x │  Appel unique
+└────────────────────────────────────┘
+      │
+      ├── Champs disséqués
+      │   ntlmssp.*, kerberos.*, wlan.*, snmp.*
+      │
+      └── Octets bruts (-x)
+          frame_raw, payload_raw, champs *_raw
+      │
+      ▼
+Réassemblage, scans de signatures et appariement
+      │
+      ▼
+Validateurs propres à chaque mode Hashcat
+      │
+      ▼
+hashes.txt + hashes_m<mode>.txt + hashes_credentials.txt
 ```
 
-1. **Champs disséqués prioritaires** — voie privilégiée : types de message,
-   etypes et security buffers sont déjà interprétés par Tshark.
-2. **Scans bruts en repli** — indispensables lorsque l'encapsulation n'a pas été
-   reconnue (en-tête HTTP `Authorization:`, commandes `AUTH NTLM/PLAIN/LOGIN`,
-   bannières POP3, RPC…) : signature `NTLMSSP\0`, expressions APOP et motifs
-   d'identifiants, en clair comme en Base64.
-3. **Validation avant écriture** — chaque ligne candidate est confrontée aux
-   contraintes des modules Hashcat officiels (longueurs, séparateurs, bornes :
-   `user` ≤ 60 caractères, domaine ≤ 45, tailles de checksum…).
+1. **Tshark** décode la capture et fournit les champs structurés ainsi que les octets bruts.
+2. **Les champs disséqués** sont privilégiés lorsqu'ils sont disponibles.
+3. **Les octets bruts** servent de repli pour NTLMSSP, APOP, Kerberos PA-ENC-TIMESTAMP et les identifiants encapsulés ou Base64.
+4. **Les flux** sont réassemblés à partir des charges utiles capturées.
+5. **Les candidats** sont validés puis dédupliqués avant écriture.
+
+Pour les captures très volumineuses, l'export JSON est parcouru progressivement afin de limiter la mémoire utilisée par Python.
 
 ## Limites connues
 
-- Un échange d'authentification **incomplet ou tronqué** ne produit aucune
-  empreinte — comportement voulu, signalé dans le récapitulatif des anomalies.
-- Kerberos **PKINIT / FAST** ne fournit pas de matériel cassable : l'absence de
-  résultat est cryptographiquement attendue.
-- L'appairage NetNTLM challenge/réponse repose sur le tuple IP:port, puis sur
-  l'ordre d'apparition en dernier recours ; des flux fortement entrelacés peuvent
-  nécessiter un filtrage préalable de la capture.
-- **OSPF** : aucun mode Hashcat n'existe pour ce protocole (authentification MD5
-  simple ou cryptographique LLS, RFC 4813) — ces paquets sont ignorés par conception.
-- SNMP, LDAP simple-bind et autres : non couverts à ce stade (contributions bienvenues).
+- Une authentification incomplète, tronquée ou filtrée ne produit pas de hash.
+- Le rapprochement NTLM repose prioritairement sur le tuple IP/port et, en dernier recours, sur l'ordre des trames.
+- Des flux fortement entrelacés ou des paquets manquants peuvent empêcher l'appariement challenge/réponse.
+- Les protocoles et etypes non listés dans [Formats supportés](#formats-supportés) sont ignorés.
+- PKINIT, FAST et les échanges Kerberos sans matériel exploitable ne produisent pas de hash.
+- Les tickets `krbtgt` sont volontairement ignorés pour les TGS-REP.
+- WPA/WPA2 nécessite les éléments suffisants du handshake et, selon le cas, le SSID.
+- Les données transmises en clair sont seulement rapportées ; elles ne sont pas converties en hash.
+- OSPF n'est pas pris en charge : Hashcat ne fournit pas de mode natif correspondant à cette authentification.
+- Le script ne lit jamais directement un fichier PCAP avec une bibliothèque Python : le décodage est effectué par Tshark.
 
 ## Dépannage
 
 | Symptôme | Cause probable | Résolution |
 |---|---|---|
-| `tshark introuvable` | Tshark hors des chemins standards | `--tshark "C:\chemin\vers\tshark.exe"` |
-| `protocoles détectés : aucun` | Capture sans authentification NTLM/Kerberos | Vérifier : `tshark -q -r capture.pcapng -z io,phs` |
-| `tshark a échoué` | Fichier corrompu ou format inattendu | Ouvrir la capture dans Wireshark pour validation |
-| Hashcat : `Separator unmatched` | Ligne écrite manuellement dans le fichier | Régénérer le fichier avec le script exclusivement |
-| Mode 19700 sans résultat | Compte de service incorrect (salt) | Voir la note des modes 19600/19700 |
+| `tshark introuvable` | Tshark n'est pas installé ou absent du `PATH` | Installer Wireshark ou utiliser `--tshark` |
+| `aucun hash produit` | Aucun échange complet ou filtre trop restrictif | Essayer `--full-packets` et `--verbose` |
+| JSON Tshark invalide ou vide | Export interrompu ou Tshark incompatible | Régénérer l'export avec `tshark -T json -x` |
+| Challenge NTLM absent | Capture incomplète ou challenge dans un paquet non capturé | Capturer le début complet de l'échange |
+| Handshake WPA absent | M1/M2, SSID ou données EAPOL manquants | Capturer l'association complète |
+| `Separator unmatched` dans Hashcat | Hash modifié manuellement ou format non supporté | Utiliser exclusivement les fichiers générés par le script |
+| Aucun identifiant en clair | Protocole non couvert ou flux incomplet | Vérifier les charges utiles avec Wireshark/Tshark |
 
 ## Contribution
 
-Les contributions sont les bienvenues : nouveaux formats d'empreintes, prise en
-charge d'encapsulations supplémentaires, jeux de tests. Merci d'ouvrir une
-*issue* pour discuter de tout nouveau validateur avant son implémentation, et de
-joindre une capture de test (anonymisée) ainsi que la sortie Hashcat attendue.
+Les contributions sont bienvenues :
+
+- nouveaux alias de champs Tshark ;
+- nouvelles encapsulations ou signatures ;
+- nouveaux modes Hashcat ;
+- tests sur des exports JSON anonymisés ;
+- corrections de documentation et de compatibilité multiplateforme.
+
+Avant une pull request :
+
+1. conservez la compatibilité avec Python 3.10+ ;
+2. n'ajoutez pas de dépendance externe sans nécessité ;
+3. ajoutez un cas de test ou un exemple reproductible ;
+4. anonymisez les captures et supprimez tous les secrets réels.
+
+Les rapports de bugs devraient préciser les versions de Python, Tshark et Hashcat, le système d'exploitation, la commande utilisée et le message obtenu.
 
 ## Licence
 
-Distribué sous [Apache License 2.0](LICENSE) — © 2026 tshark2hashcat contributors.
-Utilisation, modification et redistribution libres, y compris à des fins
-commerciales, avec protection expresse contre les litiges de brevets. Les
-mentions de copyright et la licence doivent être conservées dans toute copie.
+Distribué sous [Apache License 2.0](LICENSE).
+
+Ajoutez le fichier `LICENSE` correspondant au dépôt avant publication si ce n'est pas déjà fait.
