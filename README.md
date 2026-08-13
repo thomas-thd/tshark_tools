@@ -1,368 +1,496 @@
-<div align="center">
-<img src="assets/banner.svg" alt="tshark2hashcat" width="880">
-
-# tshark2hashcat
-
-**Tu poses un pcap. Tshark disséque. Hashcat reçoit des lignes propres.  
-Toi, tu récupères un Excel qu’un pentester peut poser sur la table.**
-
-[![2.7.0](https://img.shields.io/badge/2.7.0-00d7ff?style=flat-square)](#)
-[![python ≥ 3.10](https://img.shields.io/badge/python-%3E%3D%203.10-3776AB?style=flat-square&logo=python&logoColor=white)](#installation)
-[![tshark](https://img.shields.io/badge/engine-tshark-5f87ff?style=flat-square)](#installation)
-[![Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](LICENSE)
+████████╗███████╗██╗  ██╗ █████╗ ██████╗ ██╗  ██╗██████╗
+╚══██╔══╝██╔════╝██║  ██║██╔══██╗██╔══██╗██║ ██╔╝╚════██╗
+██║   ███████╗███████║███████║██████╔╝█████╔╝  █████╔╝
+██║   ╚════██║██╔══██║██╔══██║██╔══██╗██╔═██╗ ██╔═══╝
+██║   ███████║██║  ██║██║  ██║██║  ██║██║  ██╗███████╗
+╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝
+██╗  ██╗ █████╗ ███████╗██╗  ██╗ ██████╗ █████╗ ████████╗
+██║  ██║██╔══██╗██╔════╝██║  ██║██╔════╝██╔══██╗╚══██╔══╝
+███████║███████║███████╗███████║██║     ███████║   ██║
+██╔══██║██╔══██║╚════██║██╔══██║██║     ██╔══██║   ██║
+██║  ██║██║  ██║███████║██║  ██║╚██████╗██║  ██║   ██║
+╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝   ╚═╝
 
 ```
-  1 fichier   ·   2 dossier   ·   0 quitter
+                TSHARK2HASHCAT
+          PCAP -> HASHCAT + AUDIT SÉCURITÉ
 ```
 
-</div>
+## DESCRIPTION
 
-Un seul script. Un menu à trois touches. Pas de roman argparse, pas douze fichiers de sortie qui pourrissent le bureau.
+tshark2hashcat est un outil Python permettant d'analyser des captures
+réseau PCAP, PCAPNG et CAP avec TShark.
 
-| Tu lui donnes | Tu récupères |
-|---|---|
-| un `.pcap` / `.pcapng` | un classeur d’audit + un `.txt` par mode Hashcat |
-| un dossier de captures | **un** Excel fusionné, même logique |
-| une interface réseau (`-live`) | le même Excel, mis à jour en direct, mail si ça dérape |
+L'outil extrait automatiquement les éléments d'authentification, les hashes,
+les identifiants, les secrets et différentes informations réseau présentes
+dans les captures.
 
-Tshark est la seule source. Python ne lit jamais le pcap tout seul.
+Il génère également un rapport d'audit permettant d'identifier les
+expositions de sécurité, les chemins d'attaque et les techniques
+MITRE ATT&CK associées.
 
----
+## FONCTIONNALITÉS
 
-## En 30 secondes
+* Analyse de fichiers PCAP / PCAPNG / CAP
+* Analyse basée sur TShark
+* Extraction NetNTLMv1
+* Extraction NetNTLMv2
+* Extraction Kerberos AS-REQ
+* Extraction Kerberos AS-REP
+* Détection du Kerberoasting
+* Extraction WPA PMKID
+* Extraction APOP
+* Extraction SIP Digest
+* Extraction CHAP
+* Détection des JWT
+* Détection d'identifiants en clair
+* Détection FTP / Telnet
+* Détection HTTP Basic Authentication
+* Analyse SMTP / IMAP / POP
+* Analyse LDAP
+* Détection des communautés SNMP
+* Analyse SMB et SYSVOL
+* Extraction DNS / DHCP / NetBIOS
+* Extraction TLS SNI et HTTP Host
+* Détection des cookies et tokens
+* Génération d'un rapport Excel
+* Génération de fichiers compatibles Hashcat
+* Cartographie MITRE ATT&CK
+* Reconstruction de chemins d'attaque
+* Évaluation du niveau de risque
 
-```text
-1. Installer Python 3.10+ et Wireshark (ça pose tshark)
-2. pip install -r requirements.txt
-3. py tshark2hashcat.py
-4. Touche 1 → ton fichier   ou   touche 2 → ton dossier
+## MODES HASHCAT
+
+Mode       Type
+
+20         APOP
+4800       CHAP
+5500       NetNTLMv1
+5600       NetNTLMv2
+7500       Kerberos AS-REQ RC4
+11400      SIP Digest
+13100      Kerberoast RC4
+16500      JWT
+18200      AS-REP RC4
+19600      Kerberoast AES128
+19700      Kerberoast AES256
+19800      AS-REQ AES128
+19900      AS-REQ AES256
+22000      WPA-PBKDF2-PMKID
+32100      AS-REP AES128
+32200      AS-REP AES256
+
+## PRÉREQUIS
+
+* Python 3
+* Wireshark / TShark
+* openpyxl
+* rich
+
+Optionnel :
+
+* editcap
+
+## INSTALLATION
+
+Installation des dépendances Python :
+
+```
+pip install openpyxl rich
 ```
 
-C’est tout. Le nom du rapport et le format, l’outil les choisit.
+Vérification de TShark :
 
----
-
-## Installation
-
-### Ce qu’il te faut
-
-| | Quoi | Pourquoi |
-|---|---|---|
-| **1** | Python **3.10 ou plus** | le script |
-| **2** | **Wireshark** (donc `tshark`) | la dissection |
-| **3** | 3 paquets pip | Excel + joli terminal |
-| **4** | Hashcat | seulement si tu veux casser ensuite |
-
-### 1 — Python
-
-**Windows** — le plus simple, depuis un terminal **en admin** :
-
-```powershell
-winget install Python.Python.3.12
+```
+tshark --version
 ```
 
-Sinon : [python.org/downloads](https://www.python.org/downloads/) — coche **« Add python.exe to PATH »**.
+## UTILISATION
 
-Vérifie :
+Lancer le programme :
 
-```powershell
-py --version
+```
+python tshark2hashcat.py
 ```
 
-Tu dois voir `Python 3.10` ou plus. `py` est le lanceur Windows. Si tu n’as que `python`, utilise `python`.
+Menu principal :
 
-**Linux**
-
-```bash
-# Debian / Ubuntu
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip
-
-# Fedora
-sudo dnf install -y python3 python3-pip
+```
+[1] Analyser un PCAP
+[2] Analyser un dossier
+[0] Quitter
 ```
 
-```bash
-python3 --version
+## ANALYSE D'UN PCAP
+
+L'option 1 permet d'analyser une capture réseau.
+
+Fichiers générés :
+
+```
+tshark2hashcat-rapport.xlsx
+tshark2hashcat-rapport_m5500.txt
+tshark2hashcat-rapport_m5600.txt
+tshark2hashcat-rapport_m18200.txt
+tshark2hashcat-rapport_m22000.txt
+...
 ```
 
-**macOS**
+## ANALYSE D'UN DOSSIER
 
-```bash
-brew install python
+L'option 2 recherche récursivement les fichiers :
+
+```
+.pcap
+.pcapng
+.cap
+.dmp
 ```
 
-### 2 — Tshark (Wireshark)
+Les captures sont analysées puis regroupées dans un seul rapport Excel.
 
-Sans ça, rien ne tourne. C’est le moteur.
+Les gros fichiers peuvent être découpés avec editcap.
 
-**Windows**
+L'analyse d'un dossier peut utiliser jusqu'à quatre workers en parallèle.
 
-```powershell
-winget install WiresharkFoundation.Wireshark
+## SORTIES
+
+Le rapport principal est :
+
+```
+tshark2hashcat-rapport.xlsx
 ```
 
-Ou l’installeur : [wireshark.org/download](https://www.wireshark.org/download.html).  
-Coche **Tshark** si l’installeur te le demande (c’est le cas par défaut).
+Le classeur contient notamment :
 
-Ferme et rouvre le terminal, puis :
-
-```powershell
-& "C:\Program Files\Wireshark\tshark.exe" -v
+```
+Couverture
+Findings
+Expositions
+Cartographie
+MITRE
+Chemins
+Écarts
+Analyse
+OSINT
+Identités
+Hôtes
+Secrets
+Hashes
+Wi-Fi
+Fichiers
+Captures
 ```
 
-**Linux**
+## EXTRACTION DES HASHES
 
-```bash
-# Debian / Ubuntu
-sudo apt install -y tshark
-# on te demande si les non-root peuvent capturer → Yes si tu veux le live
+Les hashes extraits sont automatiquement validés avant d'être écrits dans
+les fichiers de sortie Hashcat.
 
-# Fedora
-sudo dnf install -y wireshark-cli
+Exemple :
+
+```
+tshark2hashcat-rapport_m32200.txt
 ```
 
-```bash
-tshark -v
+Commande Hashcat :
+
+```
+hashcat -m 32200 -a 0 tshark2hashcat-rapport_m32200.txt wordlist.txt
 ```
 
-**macOS**
+La commande correspondante est également disponible dans le rapport Excel.
 
-```bash
-brew install wireshark
+## DÉTECTION DES IDENTIFIANTS
+
+L'outil recherche notamment les informations d'authentification visibles
+dans les protocoles suivants :
+
+```
+FTP
+Telnet
+HTTP
+SMTP
+IMAP
+POP
+LDAP
+PAP
+TACACS+
+NTLM
 ```
 
-### 3 — Paquets Python
+Les mécanismes HTTP Basic Authentication et Bearer Token sont également
+analysés.
 
-Dans le dossier du projet :
+## INFORMATIONS RÉSEAU
 
-```powershell
-# Windows
-py -m pip install --upgrade pip
-py -m pip install -r requirements.txt
+L'outil peut extraire :
+
+```
+DNS
+DHCP
+NetBIOS
+SMB
+SYSVOL
+TLS SNI
+HTTP Host
+URI
+Hôtes
+Adresses IP
+Partages réseau
+Fichiers
+Identités Kerberos
 ```
 
-```bash
-# Linux / macOS — un venv, et tu dors tranquille
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+## CLASSIFICATION
+
+Les éléments extraits sont classés selon leur nature :
+
+```
+secret
+identity
+host
+wifi
+file
+meta
+noise
 ```
 
-`requirements.txt` installe :
+Plusieurs filtres permettent de limiter les faux positifs.
 
-| Paquet | Version | Sert à |
-|---|---|---|
-| **openpyxl** | ≥ 3.1 | écrire l’Excel — **obligatoire** |
-| **rich** | ≥ 13.7 | logo, couleurs, barres — fortement conseillé |
-| **tqdm** | ≥ 4.66 | barre de repli si pas de Rich |
-| **tomli** | ≥ 2.0 | config TOML, seulement sous Python 3.10 |
+Exemples :
 
-Envie du strict minimum ?
-
-```text
-py -m pip install "openpyxl>=3.1,<4"
+```
+Les cookies Cloudflare sont filtrés.
+Les comptes machine terminés par "$" ne sont pas considérés comme humains.
+Les realms Active Directory ne sont pas considérés comme des personnes.
+Les empreintes JA3 ne sont pas considérées comme des numéros de téléphone.
+Les codes FTP sont considérés comme des métadonnées.
+Les tickets TGS normaux ne sont pas automatiquement considérés comme du
+Kerberoasting.
 ```
 
-L’Excel sortira. Le terminal sera juste moins joli.
+## KERBEROS
 
-### 4 — On vérifie que tout est là
+Les échanges Kerberos sont distingués :
 
-```powershell
-py tshark2hashcat.py doctor
+```
+AS-REQ
+AS-REP
+TGS-REP
 ```
 
-```text
-Suite Wireshark     tshark = C:\Program Files\Wireshark\tshark.exe
-Dépendances Python  openpyxl = ok    rich = ok    tqdm = ok
-environnement opérationnel
+L'outil différencie également le véritable Kerberoasting du trafic normal
+lié aux services Active Directory.
+
+Exemples de services qui ne sont pas automatiquement considérés comme du
+Kerberoasting :
+
+```
+cifs/DC
+ldap/DC
+host/PC
+netlogon/...
 ```
 
-Trois lumières vertes, tu roules.
+## AUDIT DE SÉCURITÉ
 
-`tshark introuvable` ? Réouvre le terminal après l’install Wireshark, ou pointe-le à la main :
+Le moteur d'audit génère des findings uniquement lorsqu'une preuve est
+présente dans la capture.
 
-```powershell
-py tshark2hashcat.py --tshark "C:\Program Files\Wireshark\tshark.exe"
+Exemples :
+
+```
+Mot de passe en clair
+NetNTLMv1
+NetNTLMv2
+AS-REP Roasting
+Kerberoasting
+LLMNR / NBNS
+WPAD
+LDAP en clair
+Communauté SNMP
+APOP
+PMKID Wi-Fi
+Cookies applicatifs
+Exposition de données personnelles
+Fichiers sensibles
 ```
 
-Tu peux aussi poser une variable d’environnement et n’y plus penser :
+Chaque finding contient :
 
-```powershell
-setx T2H_TSHARK_PATH "C:\Program Files\Wireshark\tshark.exe"
+```
+ID
+Gravité
+Titre
+Actifs concernés
+Description
+Preuve
+Impact
+Remédiation
+Technique MITRE ATT&CK
 ```
 
-### 5 — Hashcat (optionnel)
+## RAPPORT EXCEL
 
-Pour casser les hashes **après** l’extraction.
+Le fichier :
 
-```powershell
-winget install Hashcat.Hashcat
+```
+tshark2hashcat-rapport.xlsx
 ```
 
-```bash
-# Linux
-sudo apt install -y hashcat
-# ou le binaire officiel : https://hashcat.net/hashcat/
+contient plusieurs onglets permettant de consulter les résultats de
+l'analyse.
+
+COUVERTURE
+Résumé exécutif, score, niveau de risque et périmètre observé.
+
+FINDINGS
+Détail des vulnérabilités et expositions détectées.
+
+EXPOSITIONS
+Vue synthétique des principales expositions.
+
+CARTOGRAPHIE
+Domaines, contrôleurs, utilisateurs, machines, partages et fichiers.
+
+MITRE
+Techniques MITRE ATT&CK déclenchées par les preuves observées.
+
+CHEMINS
+Chemins d'attaque reconstruits à partir des éléments présents.
+
+ÉCARTS
+Comparaison entre contrôles attendus et éléments observés.
+
+ANALYSE
+Statistiques et informations techniques sur la capture.
+
+OSINT
+Personnes, organisations, e-mails, machines, sites et IP.
+
+IDENTITÉS
+Identités Kerberos, NTLM et DHCP.
+
+HÔTES
+Hôtes détectés via DNS, SNI, NetBIOS et HTTP.
+
+SECRETS
+Secrets et identifiants détectés.
+
+HASHES
+Hashes extraits et commandes Hashcat correspondantes.
+
+WI-FI
+SSID, BSSID et PMKID.
+
+FICHIERS
+Partages SMB, chemins SYSVOL et fichiers détectés.
+
+CAPTURES
+Résumé des captures analysées lors d'une analyse de dossier.
+
+## SCORING
+
+Le score de sécurité ne repose pas simplement sur le nombre de paquets
+ou de protocoles détectés.
+
+Les findings sont regroupés par familles d'attaque.
+
+La formule utilise ensuite des pondérations décroissantes afin d'éviter
+qu'une même faiblesse soit comptée plusieurs fois.
+
+Le rapport fournit :
+
+```
+Score
+Niveau de risque
+Findings
+Familles d'attaque
+Chemins d'attaque
 ```
 
----
+## LIMITES
 
-## Premier lancement
+L'outil ne peut analyser que les informations présentes dans la capture.
 
-```powershell
-py tshark2hashcat.py
+Limites importantes :
+
+* Une information absente du PCAP ne peut pas être récupérée.
+* "Non observé" ne signifie pas "conforme".
+* Un handshake WPA incomplet ne permet pas de fabriquer un hash valide.
+* Certaines structures JSON de TShark peuvent rendre les statistiques
+  incomplètes.
+* L'onglet Hôtes peut contenir du trafic légitime et du bruit réseau.
+* Un TGS vers un contrôleur de domaine ne prouve pas que son mot de passe
+  est faible.
+* L'outil n'exécute pas Hashcat.
+* L'outil n'exécute pas Responder.
+* L'outil n'exécute pas BloodHound.
+
+## ARCHITECTURE
+
+Le script principal contient notamment :
+
+```
+tshark2hashcat.py
+
+Hashcat validators
+Hashcat modes
+Hashcat commands
+
+Extracteur NTLM
+Extracteur Kerberos
+Extracteur APOP
+Extracteur WPA
+Extracteur de credentials
+Extracteur de secrets
+Autres extracteurs
+
+Classification des résultats
+Rapport réseau
+Rapport OSINT
+
+Rapport d'audit
+Rapport Excel
+Briefing terminal
 ```
 
-```text
-    1.  Un fichier   →   Excel + txt Hashcat
-    2.  Un dossier   →   Excel + txt Hashcat (tous les pcap)
-    0.  Quitter
+## VERSION
 
-  Votre choix :
+Version documentée :
+
+```
+2.7.0
 ```
 
-Tape `1`, colle le chemin du pcap, Entrée.  
-Tape `2`, colle le dossier, Entrée — un seul Excel pour tout le tas.
+## AUTEUR
 
-Pour les scripts / CI, sans menu :
+Thomas Thedie
 
-```bash
-python tshark2hashcat.py auto   capture.pcapng
-python tshark2hashcat.py folder ./captures/
+Administration systèmes et réseaux
+Cybersécurité
+
+## UTILISATION
+
+Projet destiné notamment à :
+
+```
+CTF
+Laboratoires de sécurité
+Pentest
+Analyse réseau
+Forensic réseau
+Audit de sécurité
+Formation cybersécurité
 ```
 
----
+Utiliser uniquement cet outil sur des captures réseau pour lesquelles
+vous disposez d'une autorisation.
 
-## Qu’est-ce qui sort ?
+## DOCUMENTATION
 
-À côté de ta capture :
-
-```text
-tshark2hashcat-rapport.xlsx     ← le livrable
-capture_m5600.txt               ← NetNTLMv2, prêt pour hashcat -m 5600
-capture_m18200.txt              ← AS-REP
-capture_m22000.txt              ← WPA
-… un .txt par mode réellement vu
-```
-
-Pas de CSV, pas de JSON, pas six Markdown. Excel + hashes. Point.
-
-### L’Excel, feuille par feuille
-
-| Feuille | Ce que tu y lis |
-|---|---|
-| **Couverture** | le verdict, le score, la conclusion — la page qu’on ouvre en premier |
-| **Findings** | les fiches T2H-xx : preuve, impact, remédiation, MITRE |
-| **Expositions** | la version courte, pour la restitution |
-| **Cartographie** | domaine, DC, comptes, partages |
-| **MITRE** | uniquement ce que la capture étaye |
-| **Chemins** | comment un attaquant enchaîne, d’après le trafic |
-| **Écarts** | ce qui devrait être là / ce qui est vraiment là |
-| **OSINT** | gens, mails, tél, orgs, IP publiques |
-| **Identités** | comptes AD. Un `MACHINE$` n’est pas un humain |
-| **Secrets** | vrais secrets. Un cookie Cloudflare, ça ne compte pas |
-| **Hashes** | l’inventaire Hashcat |
-| **Paquets** | le volume, par famille |
-
-### Casser ensuite
-
-```bash
-hashcat -m 5600  capture_m5600.txt  wordlist.txt
-hashcat -m 18200 capture_m18200.txt wordlist.txt
-hashcat -m 19700 capture_m19700.txt wordlist.txt
-hashcat -m 22000 capture_m22000.txt wordlist.txt
-hashcat -m 5600  capture_m5600.txt  --show
-```
-
-Ne touche pas aux lignes. Hashcat est allergique aux espaces « améliorés ».
-
----
-
-## Ce que l’outil extrait
-
-<details>
-<summary><b>Formats Hashcat — cliquer pour déplier</b></summary>
-
-<br>
-
-| Auth | Condition | Mode |
-|---|---|:---:|
-| NetNTLMv2 | réponse NT > 24 o | `5600` |
-| NetNTLMv1 / ESS | LM + NT = 24 o | `5500` |
-| Kerberos AS-REP RC4 / AES | etype 23 / 17 / 18 | `18200` `32100` `32200` |
-| Kerberos AS-REQ (pré-auth) | PA-ENC-TIMESTAMP | `7500` `19800` `19900` |
-| Kerberos TGS-REP | etype 23 / 17 / 18 | `13100` `19600` `19700` |
-| APOP | bannière + commande `APOP` | `20` |
-| WPA/WPA2 PMKID + EAPOL | RSN / handshake M1+M2 | `22000` |
-| SNMPv3 USM | | `25000` → `27300` |
-| SIP Digest | | `11400` |
-| JWT | `Bearer eyJ…` | `16500` |
-| CRAM-MD5 / Dovecot | IMAP, SMTP | `10200` `16400` |
-| IKE-PSK | | `5300` `5400` |
-| IPMI2 RAKP | | `7300` |
-| TACACS+ | | `16100` |
-| iSCSI CHAP | | `4800` |
-| PostgreSQL / MySQL CRAM | | `11100` `11200` |
-| XMPP SCRAM | | `23200` |
-| AWS SigV4 | | `28700` |
-| MS SNTP | | `31300` |
-
-En clair, sans hash : FTP, Telnet, HTTP Basic, formulaires, `AUTH PLAIN` / `LOGIN`, community SNMP v1/v2c, tokens. Feuille **Secrets**.
-
-</details>
-
-L’outil est un peu maniaque, exprès :
-
-- un TGS `cifs/DC` ce n’est **pas** un Kerberoast — c’est juste l’AD qui vit ;
-- Kerberoast = un humain qui demande un SPN de service ;
-- `MACHINE$` n’est pas un e-mail, ni une personne ;
-- `__cf_bm` n’est pas un secret ;
-- un JA3 n’est pas un numéro de téléphone.
-
-Si un champ manque, la ligne n’est pas inventée. Tu le vois dans le rapport, pas dans Hashcat.
-
----
-
-## Capture en direct
-
-Même dossier, autre script : `tshark2hashcat-live.py`.
-
-```powershell
-py tshark2hashcat-live.py
-```
-
-```text
-    1.  Démarrer la surveillance
-    2.  Choisir l'interface
-    3.  Tester l'envoi du mail
-    4.  Rejouer un pcap
-    0.  Quitter
-```
-
-Ça capture par tranches, réécrit l’Excel, et n’envoie un mail **que** si le niveau passe `CRITIQUE` ou `ÉLEVÉ` — et seulement quand un **nouveau** finding apparaît. Pas un mail toutes les minutes.
-
-Config : `t2h-live.conf` (destinataire, SMTP). Mot de passe d’application Gmail, jamais dans le `.py`.  
-Windows : lance **en administrateur**, sinon l’interface reste muette.
-
----
-
-## Ça coince ?
-
-| Tu vois | Tu fais |
-|---|---|
-| `tshark introuvable` | réinstalle Wireshark, rouvre le terminal, ou `--tshark "C:\Program Files\Wireshark\tshark.exe"` |
-| `openpyxl est requis` | `py -m pip install -r requirements.txt` |
-| `py` n’est pas reconnu | installe Python en cochant PATH, ou tape `python` |
-| `find_tshark() missing … cli_path` | ton `tshark2hashcat.py` est trop vieux — remets la 2.7.0 à côté du live |
-| Hashcat : `Separator unmatched` | tu as touché au `.txt` — reprends celui de l’outil |
-| live : 0 paquet | pas admin / pas root |
-| mail SMTP refusé | ce n’est pas le mot de passe du compte Gmail, c’est un **mot de passe d’application** |
-
----
-
-## Licence
-
-[Apache 2.0](LICENSE).  
-Wireshark, Tshark et Hashcat appartiennent à leurs auteurs. On n’est affilié à personne — on s’assoit juste dessus.
+La documentation technique détaillée décrit le fonctionnement interne,
+les extracteurs, les règles de classification, le scoring et les onglets
+du rapport Excel. Le fonctionnement général documenté est basé sur
+l'analyse TShark puis l'extraction et la validation des éléments détectés.
