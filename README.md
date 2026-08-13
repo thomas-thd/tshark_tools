@@ -15,104 +15,172 @@
   <code>v1.0.0</code> &nbsp;·&nbsp; Windows · Linux · macOS &nbsp;·&nbsp; MIT
 </p>
 
-> Audit, pentest, CTF : à utiliser uniquement sur des captures que vous êtes autorisé à analyser.
+> Audit, pentest, CTF : uniquement sur des captures que vous êtes autorisé à analyser.
 
 ---
 
-## Installation — 2 minutes
-
-**1.** Installez [Wireshark](https://www.wireshark.org/) (fournit `tshark`) :
+## Installation
 
 ```bash
+# 1. tshark (Wireshark)
 sudo apt install tshark          # Debian/Ubuntu
 sudo dnf install wireshark-cli   # Fedora
 brew install wireshark           # macOS
 winget install WiresharkFoundation.Wireshark   # Windows
-```
 
-**2.** Récupérez l'outil (un seul fichier Python) et ses extras optionnels :
-
-```bash
+# 2. l'outil + extras
 git clone https://github.com/tshark2hashcat/tshark2hashcat && cd tshark2hashcat
-pip install openpyxl rich tqdm   # openpyxl = Excel, rich/tqdm = joli terminal
+pip install openpyxl rich tqdm
+
+# 3. go
+python tshark2hashcat.py doctor
+python tshark2hashcat.py auto capture.pcapng     # 1 fichier → Excel + hashes
+python tshark2hashcat.py folder ./captures       # 1 dossier → 1 Excel
 ```
 
-**3.** Vérifiez, puis lancez :
-
-```bash
-python tshark2hashcat.py doctor   # tshark ok ? dépendances ok ?
-python tshark2hashcat.py          # menu : 1 fichier · 2 dossier · 0 quitter
-```
-
-Pas dans le `PATH` ? `python tshark2hashcat.py --tshark "C:\Program Files\Wireshark\tshark.exe" …`
+`tshark` hors `PATH` ? `--tshark CHEMIN` ou `T2H_TSHARK_PATH`.
 
 ---
 
-## Utilisation — 3 lignes à connaître
+## Hashes Hashcat extraits
 
-```bash
-python tshark2hashcat.py auto capture.pcapng    # 1 capture → Excel + txt par mode Hashcat
-python tshark2hashcat.py folder ./captures      # 1 dossier → 1 seul classeur Excel
-hashcat -m 5600 capture_m5600.txt wordlist.txt  # cassage
-```
+Chaque ligne est validée contre la grammaire exacte du mode avant écriture ;
+dédoublonnage systématique.
 
-C'est tout. Le reste (`--help`, `wizard`, 29 sous-commandes) est en bas de page.
+| Protocole | Détection | Mode |
+|:---|:---|---:|
+| NetNTLMv2 | NTLMSSP AUTH, NT response > 24 o | `-m 5600` |
+| NetNTLMv1 / +ESS | NTLMSSP AUTH, NT response = 24 o | `-m 5500` |
+| Kerberos AS-REQ | msg-type 10, PA-ENC-TIMESTAMP | `-m 7500` / `19800` / `19900` |
+| Kerberos AS-REP | msg-type 11, enc-part | `-m 18200` / `32100` / `32200` |
+| Kerberos TGS-REP | msg-type 13, ticket (krbtgt ignoré) | `-m 13100` / `19600` / `19700` |
+| WPA PMKID | RSN IE / EAPOL M1 → `WPA*01*` | `-m 22000` |
+| APOP (POP3) | digest = MD5(challenge + pass) | `-m 20` |
+| SIP Digest | `Authorization: Digest` en contexte SIP | `-m 11400` |
+| JWT | `Bearer eyJ…` | `-m 16500` |
+| CHAP | champs tshark CHAP | `-m 4800` |
 
----
+Aussi détectés et documentés : HTTP Digest (rapport), CRAM-MD5 (note + follow),
+EAPOL M1–M4 (note `hcxpcapngtool` pour le `WPA*02*`).
 
-## Ce qui sort d'une capture
+**Double chemin d'extraction** : champs disséqués `ntlmssp.*` / `kerberos.*` en priorité ;
+sinon scan binaire des octets `-x` (signature `NTLMSSP\0`, base64 HTTP/IMAP/SMTP) ;
+appairage challenge/auth par 4-tuple IP/ports.
 
-| Protocole | Mode Hashcat |
-|:---|---:|
-| NetNTLMv2 | `-m 5600` |
-| NetNTLMv1 (+ESS) | `-m 5500` |
-| Kerberos AS-REQ (PA-ENC-TIMESTAMP) | `-m 7500` · `19800` · `19900` |
-| Kerberos AS-REP (roasting) | `-m 18200` · `32100` · `32200` |
-| Kerberos TGS-REP (Kerberoast) | `-m 13100` · `19600` · `19700` |
-| WPA PMKID / handshake | `-m 22000` |
-| APOP (POP3) | `-m 20` |
-| SIP Digest | `-m 11400` |
-| JWT | `-m 16500` |
-| CHAP | `-m 4800` |
-
-Plus, dans le rapport : identifiants en clair (FTP, Telnet, HTTP Basic, AUTH PLAIN/LOGIN,
-formulaires), community SNMP, cookies, tokens, clés API, e-mails, et la section
-**« Identités Kerberos vues »** (user, realm, SPN, salt, etypes — casse exacte du flag CTF).
-
-Chaque hash est validé contre la grammaire exacte du mode Hashcat avant d'être écrit.
-OSPF : pas de mode hashcat natif (crypto-auth LLS, RFC 4813).
+**Diagnostic Kerberos** : section « Identités Kerberos vues » (frame, msg-type,
+user, realm, SPN, salt ETYPE_INFO2, etypes) ; liste des comptes **avec** pré-auth ;
+casse exacte de l'UPN pour les flags CTF.
 
 ---
 
-## Et dans l'Excel ?
+## Identifiants en clair et secrets
 
-Couverture & score de risque · Findings expliqués · Chemins d'attaque · MITRE ATT&CK ·
-Écarts attendu/observé · Cartographie du domaine · OSINT · Identités · Hôtes · Wi-Fi ·
-Fichiers vus · Secrets · Hashes + commandes hashcat · Kerberos.
-
-Autres exports : TXT par mode, CSV, JSON, HTML, Markdown, ré-export PCAP filtré.
+- **Clair** : FTP/Telnet `USER`+`PASS`, HTTP Basic, Proxy-Basic, AUTH PLAIN,
+  AUTH LOGIN, formulaires HTTP (`user=…&pass=…`), PAP, LDAP simple bind, TACACS+,
+  commandes POP/IMAP/SMTP, MQTT.
+- **Tokens** : cookies / Set-Cookie, `Authorization`, Bearer, clés API, AWS Access Keys.
+- **Réseau** : community SNMPv1/v2c (champs + scan BER), user SNMPv3, RADIUS User-Name,
+  DHCP hostname, TLS SNI / QUIC SNI / DTLS SNI.
+- **OSINT** : e-mails, téléphones FR (+33), noms dans chemins (`C:\Users\…`, `/home/…`),
+  claims JWT (name, email, upn, iss), sujets de mails, hosts DNS/mDNS/LLMNR/NBNS,
+  noms CDP/LLDP, partages et fichiers SMB, SSID/BSSID Wi-Fi.
+- **Métadonnées** : ~100 champs tshark récoltés sur tous les protocoles
+  (HTTP, TLS, SSH, DNS, SMB, LDAP, DB, OT/IoT, VoIP, routage, Wi-Fi…).
+- **Filtrage du bruit** : fuzz SNMP (`aaaa`, `%s%s`…), bannières SSH prises pour des
+  e-mails, cookies Cloudflare, faux téléphones, comptes machine vs humains.
 
 ---
 
-## Pour aller plus loin
+## Rapport d'audit
 
-```bash
-python tshark2hashcat.py extract dump.pcap -f txt,csv,json,xlsx   # formats au choix
-python tshark2hashcat.py analyze capture.pcapng                   # stats, conversations, expert
-python tshark2hashcat.py packets dump.pcap -Y http -o http.xlsx   # paquets filtrés → Excel
-python tshark2hashcat.py follow capture.pcapng --tcp 0            # suivre un flux
-python tshark2hashcat.py filter capture.pcapng -Y kerberos -o k.pcapng
-python tshark2hashcat.py hashcat hashes.txt                       # commandes prêtes à copier
-python tshark2hashcat.py modes kerberos                           # catalogue des modes Hashcat
-```
+- **Score /100 + niveau** (FAIBLE → CRITIQUE), calculé sur preuves extraites, pas sur
+  la simple présence de protocoles.
+- **Findings** avec gravité, preuve, impact, remédiation, actifs concernés :
+  mots de passe en clair, AS-REP roasting, Kerberoast, NetNTLMv1/v2, LLMNR/NBNS,
+  WPAD, LDAP clair, SNMP, APOP, WPA, cookies, PII/RGPD, Telnet/FTP.
+- **Chemins d'attaque** rédigés étape par étape (vol NTLM → roasting → TGS CIFS →
+  SYSVOL/partages → exfiltration).
+- **Mapping MITRE ATT&CK** (T1558.003/.004, T1557.001, T1003, T1021.002, T1040…).
+- **Écarts attendu vs observé** (pré-auth, NTLM, LLMNR, LDAP, SNMP, Wi-Fi, SYSVOL…).
+- **Cartographie** : domaine, DC, users humains, comptes machine, SPN, partages,
+  fichiers sensibles, IP LAN.
+- **Synthèse exécutive** rédigée + verdict.
+- **Rapport OSINT** : personnes, e-mails, téléphones, organisations, machines,
+  sites/SNI, équipements (vendeurs OUI), IP publiques/privées.
 
-Sous-commandes disponibles : `auto · folder · extract · analyze · stats · packets ·
-follow · objects · filter · report · creds · convert · capture · decode · fields ·
-info · ifaces · protocols · expert · hosts · voip · hashcat · modes · filters ·
-tshark-help · wizard · doctor · examples · init-config`.
+---
 
-En cas de pépin : `--tshark CHEMIN` si tshark n'est pas trouvé, `--no-color` si le
-terminal n'aime pas les couleurs, `-v` pour voir pourquoi un élément a été ignoré.
+## Export Excel (`.xlsx`)
+
+Onglets : Couverture (KPI, synthèse, findings, actions P1/P2/P3, méthode) · Analyse
+(volumes, durée, débit, familles + graphique, protocoles classés clair/chiffré/auth,
+IP/MAC) · Findings · Expositions · MITRE · Chemins · Écarts · Cartographie · OSINT ·
+Identités · Hôtes · Wi-Fi · Fichiers · Secrets · Hashes (+ commandes hashcat) ·
+Kerberos · Fichiers sources (mode dossier).
+
+Mise en forme : palette de sévérités, zébrures, filtres auto, volets figés, en-têtes/pieds de page.
+
+**Autres exports** : TXT par mode (`*_m5600.txt`…), CSV, JSON (méta + hashes + creds +
+Kerberos + commandes), HTML, Markdown, ré-export PCAP/PCAPNG filtré.
+
+---
+
+## Wrapper tshark — 29 sous-commandes
+
+| Commande | Fait |
+|:---|:---|
+| `auto` | fichier → hashes + secrets + rapport + Excel + txt par mode |
+| `folder` | dossier (récursif) → 1 Excel, découpe editcap + extraction parallèle |
+| `extract` | extraction avec choix des formats, `-Y`, `-d`, `--limit`, `--no-*` par famille |
+| `analyze` | capinfos + SHA-256 + presets `-z` (io,phs · conv · endpoints · expert · http · dns · hosts · credentials · sip · rtp) + `-z` libres |
+| `stats` | toute statistique `-z` du catalogue |
+| `packets` | paquets filtrés → CSV/JSON/XLSX/MD/TXT, champs `-e` au choix |
+| `follow` | flux TCP/UDP/HTTP/TLS/SIP (ascii/hex/raw/yaml) |
+| `objects` | export objets HTTP/SMB/IMF/TFTP/DICOM |
+| `filter` | ré-écriture pcap/pcapng filtrée |
+| `report` | rapport complet HTML/MD/JSON/XLSX + dump des stats |
+| `creds` | identifiants en clair uniquement |
+| `convert` | pcap ↔ pcapng, découpe (paquets/secondes), fusion (mergecap) |
+| `capture` | capture live : durée, nb paquets, BPF, snaplen, promisc, monitor |
+| `decode` | decode-as, ré-écriture ou arbre `-V` |
+| `fields` | extraction de champs `-T fields` |
+| `info` | capinfos |
+| `ifaces` | interfaces de capture (`-D`) |
+| `protocols` | glossaires `-G` (protocols/fields/plugins/…) |
+| `expert` | infos expert (error/warn/note/chat) |
+| `hosts` | fichier hosts vu dans la capture |
+| `voip` | `sip,stat` + `rtp,streams` |
+| `hashcat` | commandes prêtes : dictionnaire, règles (best64, rockyou-30000), combinator, masques, hybrides, `--show`, `--left`, mode auto-détecté |
+| `modes` | catalogue 300+ modes Hashcat (catégorie, protocole, exemple, flag PCAP) |
+| `filters` | bibliothèque ~100 filtres d'affichage par cas d'usage |
+| `tshark-help` | catalogue des options tshark et des stats `-z` |
+| `wizard` | menu interactif (1 fichier / 2 dossier / 0 quitter) |
+| `doctor` | tshark/dumpcap/capinfos/editcap/mergecap/text2pcap + dépendances Python |
+| `examples` | exemples d'utilisation |
+| `init-config` | fichier de config exemple |
+
+Sans argument (ou double-clic) : menu interactif. `python tshark2hashcat.py capture.pcap` = `auto` ; `python tshark2hashcat.py ./dossier` = `folder` ; relit aussi un export JSON tshark.
+
+---
+
+## Moteur et interface
+
+- Un seul appel `tshark -r … -T json -x` ; gros fichiers découpés (`editcap`) et
+  traités en parallèle.
+- i18n FR/EN (`--lang`, `T2H_LANG`).
+- Config : CLI > `T2H_*` > `tshark2hashcat.toml`/`.json` (cwd ou `~`) > défauts.
+- Sortie : logo/bannière, tableaux et barres Rich (repli tqdm / texte brut),
+  `--quiet`, `--verbose`, `--no-color`, `--no-progress`, `--limit`.
+- Filtre d'affichage `-Y`, read filter `-R`/`-2`, decode-as `-d`, `-n`, timeout tshark.
+- Un seul fichier Python, zéro dépendance obligatoire (Excel excepté).
+
+---
+
+## Limites
+
+- `WPA*02*` : sans octets EAPOL bruts, préférer `hcxpcapngtool`.
+- OSPF : pas de mode hashcat natif (crypto-auth LLS, RFC 4813).
+- CRAM-MD5 : export via follow SMTP/IMAP.
 
 ---
 
