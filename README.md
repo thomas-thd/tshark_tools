@@ -3,308 +3,366 @@
 
 # tshark2hashcat
 
-**Extraction de hashes Hashcat et rapport d’audit réseau à partir d’une capture Tshark.**
+**Tu poses un pcap. Tshark disséque. Hashcat reçoit des lignes propres.  
+Toi, tu récupères un Excel qu’un pentester peut poser sur la table.**
 
-[![version](https://img.shields.io/badge/version-2.7.0-0ea5e9)](#)
-[![python](https://img.shields.io/badge/python-%3E%3D%203.10-3776AB?logo=python&logoColor=white)](#dépendances)
-[![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-111827)](#dépendances)
-[![engine](https://img.shields.io/badge/engine-Tshark%20--T%20json%20-x-6366f1)](#architecture)
+[![2.7.0](https://img.shields.io/badge/2.7.0-00d7ff?style=flat-square)](#)
+[![python ≥ 3.10](https://img.shields.io/badge/python-%3E%3D%203.10-3776AB?style=flat-square&logo=python&logoColor=white)](#installation)
+[![tshark](https://img.shields.io/badge/engine-tshark-5f87ff?style=flat-square)](#installation)
+[![Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square)](LICENSE)
+
+```
+  1 fichier   ·   2 dossier   ·   0 quitter
+```
 
 </div>
 
+Un seul script. Un menu à trois touches. Pas de roman argparse, pas douze fichiers de sortie qui pourrissent le bureau.
+
+| Tu lui donnes | Tu récupères |
+|---|---|
+| un `.pcap` / `.pcapng` | un classeur d’audit + un `.txt` par mode Hashcat |
+| un dossier de captures | **un** Excel fusionné, même logique |
+| une interface réseau (`-live`) | le même Excel, mis à jour en direct, mail si ça dérape |
+
+Tshark est la seule source. Python ne lit jamais le pcap tout seul.
+
 ---
 
-`tshark2hashcat` lit un fichier `.pcap` / `.pcapng` (ou un répertoire de captures), le fait disséquer par **Tshark** (`-T json -x`), reconstruit les authentifications réseau dans le format exact attendu par [Hashcat](https://hashcat.net/hashcat/), et produit un **classeur Excel d’audit** (findings, MITRE ATT&CK, cartographie, secrets, OSINT).
-
-Le décodage des paquets n’est jamais effectué en Python. Tshark est la seule source de données.
-
-Utilisation autorisée uniquement : laboratoire, CTF, audit contractuel, environnement dont vous avez la maîtrise.
-
-## Table des matières
-
-1. [Dépendances](#dépendances)
-2. [Installation](#installation)
-3. [Utilisation](#utilisation)
-4. [Livrables](#livrables)
-5. [Formats Hashcat](#formats-hashcat)
-6. [Règles d’analyse](#règles-danalyse)
-7. [Surveillance temps réel](#surveillance-temps-réel)
-8. [Architecture](#architecture)
-9. [Limites](#limites)
-10. [Diagnostic](#diagnostic)
-11. [Licence](#licence)
-
-## Dépendances
-
-### Environnement
-
-| Composant | Version minimale | Rôle |
-|---|---|---|
-| Python | **3.10** (3.11+ recommandé) | Interpréteur |
-| Tshark | Wireshark **3.6+** | Dissection et dump hexadécimal |
-| Hashcat | 6.2+ | Cassage (optionnel, hors de cet outil) |
-
-Tshark est recherché dans cet ordre : `T2H_TSHARK_PATH`, `TSHARK`,  
-`C:\Program Files\Wireshark\tshark.exe`, `C:\Program Files (x86)\Wireshark\tshark.exe`, puis le `PATH`.
-
-### Paquets Python
-
-Fichier : [`requirements.txt`](requirements.txt)
-
-| Paquet | Contrainte | Statut | Usage |
-|---|---|---|---|
-| **openpyxl** | `>=3.1.0,<4` | **obligatoire** | Génération du classeur `.xlsx` (livrable principal) |
-| **rich** | `>=13.7.0,<15` | recommandé | Logo, tableaux, barres de progression, menus |
-| **tqdm** | `>=4.66.0,<5` | optionnel | Barre de progression si `rich` est absent |
-| **tomli** | `>=2.0.1,<3` | Python **3.10** uniquement | Lecture de `tshark2hashcat.toml` (`tomllib` est natif dès 3.11) |
-
-Bibliothèque standard utilisée (aucun pip) : `argparse`, `json`, `hashlib`, `subprocess`, `concurrent.futures`, `smtplib`, `email`, `configparser`, `tomllib` (3.11+).
-
-Vérification après installation :
+## En 30 secondes
 
 ```text
-python tshark2hashcat.py doctor
+1. Installer Python 3.10+ et Wireshark (ça pose tshark)
+2. pip install -r requirements.txt
+3. py tshark2hashcat.py
+4. Touche 1 → ton fichier   ou   touche 2 → ton dossier
 ```
 
-| Module | Attendu |
-|---|---|
-| `openpyxl` | `ok` |
-| `rich` | `ok` |
-| `tqdm` | `ok` (sinon repli texte) |
-| `tshark` | chemin du binaire |
+C’est tout. Le nom du rapport et le format, l’outil les choisit.
 
-Sans `openpyxl`, l’export Excel échoue avec :
-
-```text
-openpyxl est requis pour l'export Excel (pip install openpyxl)
-```
-
-Sans `rich`, l’outil reste fonctionnel (sortie texte).
+---
 
 ## Installation
 
+### Ce qu’il te faut
+
+| | Quoi | Pourquoi |
+|---|---|---|
+| **1** | Python **3.10 ou plus** | le script |
+| **2** | **Wireshark** (donc `tshark`) | la dissection |
+| **3** | 3 paquets pip | Excel + joli terminal |
+| **4** | Hashcat | seulement si tu veux casser ensuite |
+
+### 1 — Python
+
+**Windows** — le plus simple, depuis un terminal **en admin** :
+
+```powershell
+winget install Python.Python.3.12
+```
+
+Sinon : [python.org/downloads](https://www.python.org/downloads/) — coche **« Add python.exe to PATH »**.
+
+Vérifie :
+
+```powershell
+py --version
+```
+
+Tu dois voir `Python 3.10` ou plus. `py` est le lanceur Windows. Si tu n’as que `python`, utilise `python`.
+
+**Linux**
+
 ```bash
-python -m venv .venv
+# Debian / Ubuntu
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip
 
-# Linux / macOS
-source .venv/bin/activate
+# Fedora
+sudo dnf install -y python3 python3-pip
+```
 
+```bash
+python3 --version
+```
+
+**macOS**
+
+```bash
+brew install python
+```
+
+### 2 — Tshark (Wireshark)
+
+Sans ça, rien ne tourne. C’est le moteur.
+
+**Windows**
+
+```powershell
+winget install WiresharkFoundation.Wireshark
+```
+
+Ou l’installeur : [wireshark.org/download](https://www.wireshark.org/download.html).  
+Coche **Tshark** si l’installeur te le demande (c’est le cas par défaut).
+
+Ferme et rouvre le terminal, puis :
+
+```powershell
+& "C:\Program Files\Wireshark\tshark.exe" -v
+```
+
+**Linux**
+
+```bash
+# Debian / Ubuntu
+sudo apt install -y tshark
+# on te demande si les non-root peuvent capturer → Yes si tu veux le live
+
+# Fedora
+sudo dnf install -y wireshark-cli
+```
+
+```bash
+tshark -v
+```
+
+**macOS**
+
+```bash
+brew install wireshark
+```
+
+### 3 — Paquets Python
+
+Dans le dossier du projet :
+
+```powershell
 # Windows
-.venv\Scripts\activate
+py -m pip install --upgrade pip
+py -m pip install -r requirements.txt
+```
 
+```bash
+# Linux / macOS — un venv, et tu dors tranquille
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Installation minimale (Excel uniquement) :
+`requirements.txt` installe :
 
-```bash
-python -m pip install "openpyxl>=3.1.0,<4"
+| Paquet | Version | Sert à |
+|---|---|---|
+| **openpyxl** | ≥ 3.1 | écrire l’Excel — **obligatoire** |
+| **rich** | ≥ 13.7 | logo, couleurs, barres — fortement conseillé |
+| **tqdm** | ≥ 4.66 | barre de repli si pas de Rich |
+| **tomli** | ≥ 2.0 | config TOML, seulement sous Python 3.10 |
+
+Envie du strict minimum ?
+
+```text
+py -m pip install "openpyxl>=3.1,<4"
 ```
 
-Installation complète :
+L’Excel sortira. Le terminal sera juste moins joli.
 
-```bash
-python -m pip install -r requirements.txt
-```
-
-Contrôle :
-
-```bash
-python -c "import openpyxl, rich, tqdm; print(openpyxl.__version__, rich.__version__, tqdm.__version__)"
-python tshark2hashcat.py doctor
-```
-
-## Utilisation
-
-L’interface par défaut est un **menu numéroté**. Aucune sous-commande n’est requise.
-
-```bash
-python tshark2hashcat.py
-```
-
-```
-  1.  Un fichier   →   Excel + txt Hashcat
-  2.  Un dossier   →   Excel + txt Hashcat (tous les pcap)
-  0.  Quitter
-```
-
-| Choix | Entrée | Sortie |
-|:---:|---|---|
-| `1` | un `.pcap` / `.pcapng` | un classeur + un `.txt` par mode Hashcat |
-| `2` | un répertoire (récursif) | **un** classeur fusionné + les `.txt` |
-| `0` | — | sortie |
-
-Le format et le nom des fichiers sont déterminés automatiquement.
-
-### Automatisation
-
-```bash
-python tshark2hashcat.py auto    capture.pcapng
-python tshark2hashcat.py folder  ./captures/
-python tshark2hashcat.py doctor
-```
-
-Chemin Tshark explicite :
-
-```bash
-python tshark2hashcat.py --tshark /usr/bin/tshark
-```
+### 4 — On vérifie que tout est là
 
 ```powershell
-python tshark2hashcat.py --tshark "C:\Program Files\Wireshark\tshark.exe"
+py tshark2hashcat.py doctor
 ```
 
-## Livrables
+```text
+Suite Wireshark     tshark = C:\Program Files\Wireshark\tshark.exe
+Dépendances Python  openpyxl = ok    rich = ok    tqdm = ok
+environnement opérationnel
+```
 
-Chaque analyse produit :
+Trois lumières vertes, tu roules.
 
-| Fichier | Contenu |
+`tshark introuvable` ? Réouvre le terminal après l’install Wireshark, ou pointe-le à la main :
+
+```powershell
+py tshark2hashcat.py --tshark "C:\Program Files\Wireshark\tshark.exe"
+```
+
+Tu peux aussi poser une variable d’environnement et n’y plus penser :
+
+```powershell
+setx T2H_TSHARK_PATH "C:\Program Files\Wireshark\tshark.exe"
+```
+
+### 5 — Hashcat (optionnel)
+
+Pour casser les hashes **après** l’extraction.
+
+```powershell
+winget install Hashcat.Hashcat
+```
+
+```bash
+# Linux
+sudo apt install -y hashcat
+# ou le binaire officiel : https://hashcat.net/hashcat/
+```
+
+---
+
+## Premier lancement
+
+```powershell
+py tshark2hashcat.py
+```
+
+```text
+    1.  Un fichier   →   Excel + txt Hashcat
+    2.  Un dossier   →   Excel + txt Hashcat (tous les pcap)
+    0.  Quitter
+
+  Votre choix :
+```
+
+Tape `1`, colle le chemin du pcap, Entrée.  
+Tape `2`, colle le dossier, Entrée — un seul Excel pour tout le tas.
+
+Pour les scripts / CI, sans menu :
+
+```bash
+python tshark2hashcat.py auto   capture.pcapng
+python tshark2hashcat.py folder ./captures/
+```
+
+---
+
+## Qu’est-ce qui sort ?
+
+À côté de ta capture :
+
+```text
+tshark2hashcat-rapport.xlsx     ← le livrable
+capture_m5600.txt               ← NetNTLMv2, prêt pour hashcat -m 5600
+capture_m18200.txt              ← AS-REP
+capture_m22000.txt              ← WPA
+… un .txt par mode réellement vu
+```
+
+Pas de CSV, pas de JSON, pas six Markdown. Excel + hashes. Point.
+
+### L’Excel, feuille par feuille
+
+| Feuille | Ce que tu y lis |
 |---|---|
-| `tshark2hashcat-rapport.xlsx` | Rapport d’audit (voir ci-dessous) |
-| `<préfixe>_m<mode>.txt` | Hashes validés, un fichier par mode Hashcat |
+| **Couverture** | le verdict, le score, la conclusion — la page qu’on ouvre en premier |
+| **Findings** | les fiches T2H-xx : preuve, impact, remédiation, MITRE |
+| **Expositions** | la version courte, pour la restitution |
+| **Cartographie** | domaine, DC, comptes, partages |
+| **MITRE** | uniquement ce que la capture étaye |
+| **Chemins** | comment un attaquant enchaîne, d’après le trafic |
+| **Écarts** | ce qui devrait être là / ce qui est vraiment là |
+| **OSINT** | gens, mails, tél, orgs, IP publiques |
+| **Identités** | comptes AD. Un `MACHINE$` n’est pas un humain |
+| **Secrets** | vrais secrets. Un cookie Cloudflare, ça ne compte pas |
+| **Hashes** | l’inventaire Hashcat |
+| **Paquets** | le volume, par famille |
 
-### Classeur Excel
-
-| Feuille | Contenu |
-|---|---|
-| Couverture | Verdict, score, périmètre, conclusion |
-| Findings | Fiches T2H-xx (gravité, preuve, impact, remédiation, MITRE) |
-| Expositions | Synthèse destinée à la restitution |
-| Cartographie | Domaine, DC, comptes, partages, hôtes |
-| MITRE | Techniques étayées par la capture |
-| Chemins | Scénarios d’attaque observés |
-| Écarts | Contrôle attendu / observé |
-| OSINT | Personnes, e-mails, téléphones, organisations, IP publiques |
-| Identités | Comptes AD / UPN |
-| Secrets | Identifiants et secrets extraits |
-| Hashes | Inventaire des lignes Hashcat |
-| Paquets | Volume par famille de protocoles |
-
-## Formats Hashcat
-
-| Authentification | Condition | Mode | Format |
-|---|---|:---:|---|
-| NetNTLMv2 | réponse NT > 24 octets | 5600 | `user::domain:challenge:NTProofStr:blob` |
-| NetNTLMv1 / ESS | réponses LM et NT = 24 octets | 5500 | `user::domain:LM:NT:challenge` |
-| Kerberos AS-REP RC4 | etype 23 | 18200 | `$krb5asrep$23$…` |
-| Kerberos AS-REP AES128 / AES256 | etype 17 / 18 | 32100 / 32200 | `$krb5asrep$17/18$…` |
-| Kerberos AS-REQ (PA-ENC-TIMESTAMP) | etype 23 / 17 / 18 | 7500 / 19800 / 19900 | `$krb5pa$…` |
-| Kerberos TGS-REP | etype 23 / 17 / 18 | 13100 / 19600 / 19700 | `$krb5tgs$…` |
-| APOP | bannière `<challenge>` + commande `APOP` | 20 | `digest:challenge` |
-| WPA/WPA2 PMKID et EAPOL | RSN IE / handshake M1+M2 | 22000 | `WPA*01*` / `WPA*02*` |
-| SNMPv3 USM | authentification USM | 25000–27300 | `$SNMPv3$…` |
-| SIP Digest | `Authorization: Digest` | 11400 | `$sip$…` |
-| JWT | `Bearer eyJ…` | 16500 | jeton JWT |
-| CRAM-MD5 / Dovecot | IMAP, SMTP | 10200 / 16400 | |
-| IKE-PSK | ISAKMP | 5300 / 5400 | |
-| IPMI2 RAKP | HMAC-SHA1 | 7300 | |
-| TACACS+ | | 16100 | |
-| iSCSI CHAP | | 4800 | |
-| PostgreSQL / MySQL CRAM | | 11100 / 11200 | |
-| XMPP SCRAM | | 23200 | |
-| AWS Signature V4 | | 28700 | |
-| MS SNTP | | 31300 | |
-
-Identifiants transmis en clair (FTP, Telnet, HTTP Basic, formulaires, `AUTH PLAIN` / `LOGIN`, community SNMPv1/v2c, jetons Bearer) : feuille **Secrets**, pas de fichier annexe.
-
-### Cassage
+### Casser ensuite
 
 ```bash
 hashcat -m 5600  capture_m5600.txt  wordlist.txt
 hashcat -m 18200 capture_m18200.txt wordlist.txt
 hashcat -m 19700 capture_m19700.txt wordlist.txt
 hashcat -m 22000 capture_m22000.txt wordlist.txt
-hashcat -m 25000 capture_m25000.txt wordlist.txt
-
-hashcat -m 5600 capture_m5600.txt --show
+hashcat -m 5600  capture_m5600.txt  --show
 ```
 
-Les lignes doivent rester telles quelles. Toute modification manuelle provoque `Separator unmatched`.
+Ne touche pas aux lignes. Hashcat est allergique aux espaces « améliorés ».
 
-## Règles d’analyse
+---
 
-Une ligne n’est écrite que si le validateur du mode Hashcat l’accepte. Les champs absents sont signalés, jamais interpolés.
+## Ce que l’outil extrait
 
-| Observation | Classification |
-|---|---|
-| Compte `MACHINE$` / `name$@REALM` | compte machine — exclu des personnes et des e-mails |
-| TGS `cifs/` `ldap/` `host/` `krbtgt` | accès Active Directory observé |
-| TGS demandé par un utilisateur humain vers un SPN non-machine | Kerberoasting (T1558.003) |
-| Cookies `__cf_bm`, `cf_clearance` | exclus des secrets |
-| Empreinte JA3 / JA3S | exclue des numéros de téléphone |
+<details>
+<summary><b>Formats Hashcat — cliquer pour déplier</b></summary>
 
-Le score d’audit est calculé par **famille** de findings (rendements décroissants 1.00 / 0.55 / 0.35 / 0.20), puis `max(8, 100 − malus)`. Il décrit la capture, pas la posture globale du SI.
+<br>
 
-## Surveillance temps réel
+| Auth | Condition | Mode |
+|---|---|:---:|
+| NetNTLMv2 | réponse NT > 24 o | `5600` |
+| NetNTLMv1 / ESS | LM + NT = 24 o | `5500` |
+| Kerberos AS-REP RC4 / AES | etype 23 / 17 / 18 | `18200` `32100` `32200` |
+| Kerberos AS-REQ (pré-auth) | PA-ENC-TIMESTAMP | `7500` `19800` `19900` |
+| Kerberos TGS-REP | etype 23 / 17 / 18 | `13100` `19600` `19700` |
+| APOP | bannière + commande `APOP` | `20` |
+| WPA/WPA2 PMKID + EAPOL | RSN / handshake M1+M2 | `22000` |
+| SNMPv3 USM | | `25000` → `27300` |
+| SIP Digest | | `11400` |
+| JWT | `Bearer eyJ…` | `16500` |
+| CRAM-MD5 / Dovecot | IMAP, SMTP | `10200` `16400` |
+| IKE-PSK | | `5300` `5400` |
+| IPMI2 RAKP | | `7300` |
+| TACACS+ | | `16100` |
+| iSCSI CHAP | | `4800` |
+| PostgreSQL / MySQL CRAM | | `11100` `11200` |
+| XMPP SCRAM | | `23200` |
+| AWS SigV4 | | `28700` |
+| MS SNTP | | `31300` |
 
-Script : [`tshark2hashcat-live.py`](tshark2hashcat-live.py)  
-Configuration : [`t2h-live.conf`](t2h-live.conf)  
-Dépend des mêmes paquets, plus la bibliothèque standard (`smtplib`, `email`).
+En clair, sans hash : FTP, Telnet, HTTP Basic, formulaires, `AUTH PLAIN` / `LOGIN`, community SNMP v1/v2c, tokens. Feuille **Secrets**.
 
-```bash
-python tshark2hashcat-live.py
+</details>
+
+L’outil est un peu maniaque, exprès :
+
+- un TGS `cifs/DC` ce n’est **pas** un Kerberoast — c’est juste l’AD qui vit ;
+- Kerberoast = un humain qui demande un SPN de service ;
+- `MACHINE$` n’est pas un e-mail, ni une personne ;
+- `__cf_bm` n’est pas un secret ;
+- un JA3 n’est pas un numéro de téléphone.
+
+Si un champ manque, la ligne n’est pas inventée. Tu le vois dans le rapport, pas dans Hashcat.
+
+---
+
+## Capture en direct
+
+Même dossier, autre script : `tshark2hashcat-live.py`.
+
+```powershell
+py tshark2hashcat-live.py
 ```
-
-| Choix | Action |
-|:---:|---|
-| `1` | capture cyclique, mise à jour du classeur |
-| `2` | sélection de l’interface |
-| `3` | envoi d’un message de test |
-| `4` | rejeu d’un pcap (alerte si non-conforme) |
-| `0` | quitter |
-
-Un courriel est émis uniquement si le niveau est `CRITIQUE` ou `ÉLEVÉ`, et uniquement lorsqu’un finding **nouveau** apparaît.
-
-Le mot de passe SMTP se lit dans `t2h-live.conf` ou dans `T2H_MAIL_PASS`. Ne pas le versionner. Sous Windows, lancer le processus en administrateur.
-
-## Architecture
 
 ```text
-.pcap / .pcapng / répertoire
-        │
-        ▼
- tshark -n -2 -r <fichier> -T json -x     ← appel unique
-        │
-        ├── champs disséqués (ntlmssp.*, kerberos.*, wlan.*, snmp.*, …)
-        └── octets bruts     (frame_raw, payload, *_raw)
-        │
-        ▼
- extracteurs + réassemblage TCP/UDP + validateurs Hashcat
-        │
-        ├── <préfixe>_m<mode>.txt
-        └── tshark2hashcat-rapport.xlsx
+    1.  Démarrer la surveillance
+    2.  Choisir l'interface
+    3.  Tester l'envoi du mail
+    4.  Rejouer un pcap
+    0.  Quitter
 ```
 
-1. Tshark décode la capture.
-2. Les champs structurés sont utilisés en priorité.
-3. Les octets bruts rattrapent NTLMSSP encapsulé, APOP, PA-ENC-TIMESTAMP, Base64 et JWT.
-4. Chaque candidat est validé avant écriture.
-5. Le rapport d’audit ne retient que les faits présents dans la capture.
+Ça capture par tranches, réécrit l’Excel, et n’envoie un mail **que** si le niveau passe `CRITIQUE` ou `ÉLEVÉ` — et seulement quand un **nouveau** finding apparaît. Pas un mail toutes les minutes.
 
-## Limites
+Config : `t2h-live.conf` (destinataire, SMTP). Mot de passe d’application Gmail, jamais dans le `.py`.  
+Windows : lance **en administrateur**, sinon l’interface reste muette.
 
-- Une authentification incomplète ou filtrée ne produit pas de hash.
-- L’appariement NTLM utilise d’abord le tuple adresse/port, puis l’ordre des trames.
-- PKINIT, FAST et les échanges Kerberos sans matériel cassable sont ignorés.
-- WPA/WPA2 exige les éléments du handshake et, selon le cas, le SSID.
-- OSPF n’a pas de mode Hashcat natif.
-- Le score porte sur le trafic observé, pas sur l’ensemble du système d’information.
+---
 
-## Diagnostic
+## Ça coince ?
 
-| Symptôme | Cause | Action |
-|---|---|---|
-| `tshark introuvable` | binaire absent du `PATH` | installer Wireshark, ou `--tshark` / `T2H_TSHARK_PATH` |
-| `openpyxl est requis` | paquet non installé | `python -m pip install -r requirements.txt` |
-| `find_tshark() missing 1 required positional argument` | `tshark2hashcat.py` antérieur à 2.7.0 | remplacer le module par la 2.7.0 |
-| `Separator unmatched` (Hashcat) | ligne altérée | reprendre le `.txt` généré |
-| capture live vide | privilèges insuffisants | Windows : administrateur — Linux : `cap_net_raw` ou root |
-| authentification SMTP refusée | mot de passe de compte au lieu d’un mot de passe d’application | Google Account → Mots de passe des applications |
+| Tu vois | Tu fais |
+|---|---|
+| `tshark introuvable` | réinstalle Wireshark, rouvre le terminal, ou `--tshark "C:\Program Files\Wireshark\tshark.exe"` |
+| `openpyxl est requis` | `py -m pip install -r requirements.txt` |
+| `py` n’est pas reconnu | installe Python en cochant PATH, ou tape `python` |
+| `find_tshark() missing … cli_path` | ton `tshark2hashcat.py` est trop vieux — remets la 2.7.0 à côté du live |
+| Hashcat : `Separator unmatched` | tu as touché au `.txt` — reprends celui de l’outil |
+| live : 0 paquet | pas admin / pas root |
+| mail SMTP refusé | ce n’est pas le mot de passe du compte Gmail, c’est un **mot de passe d’application** |
+
+---
 
 ## Licence
 
-[Apache License 2.0](LICENSE).
-
-Wireshark, Tshark et Hashcat restent la propriété de leurs auteurs respectifs. Ce projet n’est affilié ni à la Wireshark Foundation ni au projet Hashcat.
+[Apache 2.0](LICENSE).  
+Wireshark, Tshark et Hashcat appartiennent à leurs auteurs. On n’est affilié à personne — on s’assoit juste dessus.
