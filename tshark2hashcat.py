@@ -6,9 +6,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import csv
 import hashlib
+import hmac
+import io
+import itertools
 import json
+import multiprocessing
 import os
 import re
 import shutil
@@ -17,21 +22,22 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import defaultdict
+import zlib
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Optional, Sequence, TypeVar
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, TypeVar
 from urllib.parse import unquote_plus
 
-__version__ = "1.0.0"
-__author__ = "tshark2hashcat"
+__version__ = "1.2.0"
+__author__ = "thomas-thd"
 __license__ = "Apache-2.0"
 __app_name__ = "tshark2hashcat"
 __app_short__ = "t2h"
-__url__ = "https://github.com/tshark2hashcat/tshark2hashcat"
+__url__ = "https://github.com/thomas-thd/tshark_tools"
 
 SUPPORTED_HASHCAT_MODES: tuple[int, ...] = (
     20, 5500, 5600, 7500, 13100, 18200, 19600, 19700, 19800, 19900,
@@ -738,8 +744,8 @@ LOGO_SMALL: tuple[str, ...] = (
     r"   ╩ ╚═╝╩ ╩╩ ╩╩╚═╩ ╩  ╚═╝  HASHCAT",
 )
 
-TAGLINE_FR = "un fichier ou un dossier · tout dans Excel"
-TAGLINE_EN = "one file or one folder · everything in Excel"
+TAGLINE_FR = "moteur d'analyse · fichier, dossier ou projet · tout dans Excel + rapports"
+TAGLINE_EN = "analysis engine · file, folder or project · everything in Excel + reports"
 
 SUBTITLE_FR = "tshark2hashcat  ·  tous les protocoles, sécurisés ou non"
 SUBTITLE_EN = "tshark2hashcat  ·  every protocol, cleartext or encrypted"
@@ -893,6 +899,11 @@ def print_examples(lang: str = "fr") -> None:
         ("Paquets → Excel", "tshark2hashcat packets dump.pcap --filter http -o http.xlsx"),
         ("Objets HTTP", "tshark2hashcat objects capture.pcapng --proto http"),
         ("Follow TCP", "tshark2hashcat follow capture.pcapng --tcp 0"),
+        ("Pipeline complet + solveurs", "tshark2hashcat auto capture.pcapng"),
+        ("Solveurs : brute force complet", "tshark2hashcat auto capture.pcapng --deep"),
+        ("Moteur : projet dossier complet", "tshark2hashcat project DOSSIER/"),
+        ("Moteur : poursuivre un projet", "tshark2hashcat solve DOSSIER-projet -w wordlist.txt"),
+        ("PRO : inventaire exhaustif", "tshark2hashcat inventory capture.pcapng"),
         ("Menu interactif", "tshark2hashcat wizard"),
     ]
     examples_en = [
@@ -903,6 +914,11 @@ def print_examples(lang: str = "fr") -> None:
         ("Packets to Excel", "tshark2hashcat packets dump.pcap --filter http -o http.xlsx"),
         ("HTTP objects", "tshark2hashcat objects capture.pcapng --proto http"),
         ("Follow TCP", "tshark2hashcat follow capture.pcapng --tcp 0"),
+        ("Full pipeline + solvers", "tshark2hashcat auto capture.pcapng"),
+        ("Solvers: deep brute force", "tshark2hashcat auto capture.pcapng --deep"),
+        ("Engine: full folder project", "tshark2hashcat project FOLDER/"),
+        ("Engine: continue a project", "tshark2hashcat solve FOLDER-project -w wordlist.txt"),
+        ("PRO: exhaustive inventory", "tshark2hashcat inventory capture.pcapng"),
         ("Interactive menu", "tshark2hashcat wizard"),
     ]
     rows = examples_fr if lang == "fr" else examples_en
@@ -1336,7 +1352,10 @@ def _load_toml(path: Path) -> dict[str, Any]:
     return data
 
 def _load_json(path: Path) -> dict[str, Any]:
-    with path.open(encoding="utf-8") as f:
+    # errors="replace" : export retouché à la main (cp1252, octets
+    # invalides…) ne plante jamais l'analyse — run réel build 18695 :
+    # zéro exception Unicode, tout doit passer.
+    with path.open(encoding="utf-8", errors="replace") as f:
         data = json.load(f)
     if isinstance(data.get("t2h"), dict):
         return data["t2h"]
@@ -9028,6 +9047,12468 @@ def print_kv_panel(title: str, items: Sequence[tuple[str, Any]]) -> None:
         table.add_row(str(k), str(v))
     _console().print(Panel(table, title=f"[bold cyan]{title}[/]", border_style="blue"))
 
+# ============================================================================
+#  SOLVEURS INTÉGRÉS — cassage hors ligne automatique depuis la capture
+# ============================================================================
+#  Cette section intègre 4 anciens scripts standalone, désormais exécutés
+#  AUTOMATIQUEMENT par la commande `auto` (donc aussi par le menu interactif
+#  — option 1 — et par le mode legacy « tshark2hashcat.py capture.pcap ») :
+#
+#    1) auth   — auth_capture_solver.py : XMPP SASL (SCRAM-SHA-1/256/512,
+#       DIGEST-MD5, CRAM-MD5, PLAIN, LOGIN), HTTP Basic/Digest, POP3
+#       USER-PASS/APOP, IMAP LOGIN, SMTP AUTH, FTP USER/PASS, Telnet.
+#       Dictionnaire interne, variantes du login, wordlist, masque hashcat,
+#       brute force incrémental multiprocess, self-test RFC.
+#    2) wpa2e  — solveur WPA2-Enterprise/RADIUS : secret RADIUS (HMAC-MD5 sur
+#       Message-Authenticator, RFC 2869), PMK (MS-MPPE-Recv-Key, RFC 2548),
+#       handshake 4-way, PTK (PRF-512 IEEE 802.11i), vérification du MIC
+#       EAPOL M2, déchiffrement AES-CCMP pur Python, preuves textuelles.
+#    3) wep    — wep_crack_auto.py : WEP-40 automatique (clair connu
+#       LLC AA AA 03, alphabets en coût croissant, validation ICV/CRC32).
+#    4) sae    — auto-sae.py (WPA3-SAE v9) : récupération du PWE via le
+#       mask (PWE = inv(mask) * element, 2 parités de Y testées),
+#       vérification par le confirm SAE, dérivation KCK/PMK puis
+#       PTK/KEK/TK, unwrap RFC 3394 de la GTK, déchiffrement CCMP des
+#       trames de données (preuves textuelles extraites). Extraction via
+#       tshark (chemin d'origine) ou parseurs 802.11 purs Python du
+#       sous-code 2 en repli.
+#
+#  Ordre logique d'exécution (les résultats circulent d'une étape à l'autre) :
+#       auth → wpa2e → wep → sae
+#    Les mots de passe récupérés (en clair, cassés, ou déjà extraits par le
+#    pipeline principal) sont réinjectés automatiquement comme candidats du
+#    secret RADIUS.
+#
+#  Isolation : chaque solveur tourne dans son propre try/except et retourne
+#  un SolverOutcome ; une erreur est signalée explicitement et n'interrompt
+#  ni le pipeline principal ni les autres solveurs. Les sys.exit() des
+#  scripts originaux sont remplacés par des statuts explicites.
+#
+#  Sorties : les messages console d'origine sont conservés tels quels ;
+#  ils sont dupliqués (terminal + fichier) dans <rapport>-solve.txt via _Tee,
+#  et masqués sur le terminal en --quiet (le fichier les conserve).
+#
+#  Mode rapide (défaut) : budget temps par solveur (SOLVE_DEFAULT_BUDGET,
+#  réglable via --solve-timeout) + profondeurs de brute force bornées.
+#  Mode --deep : comportement intégral des scripts originaux, sans budget.
+# ============================================================================
+
+SOLVE_DEFAULT_BUDGET = 180      # secondes par solveur en mode rapide (0 = illimité)
+
+@dataclass
+class SolverOutcome:
+    """Résultat normalisé d'un solveur intégré."""
+
+    name: str
+    status: str                 # found | partial | ok | not_found | not_applicable | unavailable | error
+    summary: str = ""
+    findings: dict = field(default_factory=dict)
+    error: str = ""
+    elapsed: float = 0.0
+
+@dataclass
+class SolveReport:
+    """Rapport global de l'étape « solveurs intégrés » du pipeline auto."""
+
+    pcap: str
+    deep: bool = False
+    budget: int = 0
+    outcomes: list = field(default_factory=list)
+    artifact: str = ""
+    elapsed: float = 0.0
+
+    def found_any(self) -> bool:
+        return any(o.status in ("found", "partial") for o in self.outcomes)
+
+class _Tee:
+    """Duplique les écritures vers le terminal ET vers un tampon (rapport -solve.txt).
+
+    Utilisé avec contextlib.redirect_stdout autour des solveurs : leurs
+    print() d'origine sont conservés tels quels tout en étant archivés.
+    """
+
+    def __init__(self, stream, buf) -> None:
+        self._stream = stream
+        self._buf = buf
+
+    def write(self, s):
+        if self._stream is not None:
+            self._stream.write(s)
+        self._buf.write(s)
+        return len(s)
+
+    def flush(self) -> None:
+        if self._stream is not None:
+            self._stream.flush()
+
+def _solve_artifact_path(out: str) -> str:
+    """Chemin <base>-solve.txt à côté du rapport principal (même logique que _base())."""
+    p = Path(out)
+    if p.suffix.lower() in {".txt", ".csv", ".json", ".xlsx", ".html", ".htm", ".md"}:
+        p = p.with_suffix("")
+    return str(p.with_name(p.name + "-solve.txt"))
+
+def _solve_icon(status: str) -> str:
+    return {
+        "found": "✔", "ok": "✔", "partial": "◐", "not_found": "✘",
+        "not_applicable": "—", "unavailable": "⚠", "error": "!",
+    }.get(status, "?")
+
+
+# ==============================================================================================
+#  SOUS-CODE 1/4 — SOLVEUR D'AUTHENTIFICATIONS (intégré depuis auth_capture_solver.py)
+# ==============================================================================================
+"""
+auth_capture_solver.py — solveur générique de challenges « authentification réseau ».
+
+Aucune connaissance du challenge n'est supposée : le script travaille sur n'importe
+quelle capture similaire, sans indice, et retrouve les mots de passe par :
+
+  1. dictionnaire interne embarqué (~140 mots de passe universels FR/EN)
+  2. variantes dérivées du login (réutilisation login/mot de passe classique)
+  3. wordlist brute si fournie en argument
+  4. fragments du login (mots, préfixes >=3 car.) + 1..N caractères — motif humain
+     universel de dérivation, PAS un indice de challenge (désactivable : --no-login-parts)
+  5. brute force incrémental (profondeur adaptée au coût du mécanisme :
+     3 pour SCRAM/PBKDF2 [lent], 6 pour MD5 [rapide], multiprocessing tous cœurs)
+  6. hypothèse ciblée EN OPT-IN uniquement si l'utilisateur en décide :
+       --mask 'koma?l?l'   masque style hashcat (?l ?u ?d ?s ?a + littéraux)
+
+PROTOCOLES / MÉCANISMES DÉTECTÉS
+  XMPP (tcp/5222, stanzas SASL) :
+      SCRAM-SHA-1, SCRAM-SHA-256, SCRAM-SHA-512   -> crackage hors ligne (RFC 5802/7677)
+      DIGEST-MD5 (RFC 2831, qop auth, md5/md5-sess) -> crackage hors ligne
+      CRAM-MD5 (RFC 2195)                          -> crackage hors ligne
+      PLAIN / LOGIN                                -> identifiants en clair (Base64)
+  HTTP : Basic (clair), Digest (RFC 2617, MD5 & MD5-sess) -> crackage hors ligne
+  POP3 : USER/PASS (clair), APOP (crackage hors ligne)
+  IMAP : LOGIN (clair)   SMTP : AUTH PLAIN/LOGIN/CRAM-MD5   FTP : USER/PASS (clair)
+  Telnet : login/mot de passe frappés au clavier (heuristique keystrokes)
+
+USAGE
+  python3 auth_capture_solver.py capture.json [wordlist.txt]
+  python3 auth_capture_solver.py capture.pcap                  # via tshark
+  python3 auth_capture_solver.py capture.json rockyou.txt --filter admin
+  python3 auth_capture_solver.py capture.json --mask 'adm?l?l?d'
+  python3 auth_capture_solver.py capture.json --brute-len 5 --charset abcdefghij
+  python3 auth_capture_solver.py capture.json --list-only
+  python3 auth_capture_solver.py --selftest
+
+Dépendances : Python 3.8+ standard uniquement.
+"""
+
+
+# ===========================================================================
+# Utilitaires
+# ===========================================================================
+
+def b64d(s):
+    if not s:
+        return b""
+    try:
+        return base64.b64decode(s)
+    except Exception:
+        return b""
+
+
+def b64e(b):
+    return base64.b64encode(b).decode()
+
+
+def xor(a, b):
+    return bytes(x ^ y for x, y in zip(a, b))
+
+
+def H(name):
+    return getattr(hashlib, name.replace("-", "").lower())
+
+
+def hexdig(name, data):
+    return H(name)(data).hexdigest()
+
+
+def hdr(title):
+    print("\n" + "=" * 78 + "\n" + title + "\n" + "=" * 78)
+
+
+# NOTE intégration : le walk() du script standalone est volontairement supprimé
+# ici — tshark2hashcat définit un walk() strictement identique (récursion dict +
+# list, mêmes couples (clé, valeur)), réutilisé tel quel (déduplication).
+
+
+# ===========================================================================
+# Crypto : vérificateurs hors ligne par mécanisme
+# ===========================================================================
+
+def scram_compute(hash_name, password, cfb, sf, cfb_final):
+    """SCRAM (RFC 5802/7677) -> (client_proof, server_signature, salt, iters)."""
+    auth_message = ",".join([cfb, sf, cfb_final]).encode()
+    attrs = dict(kv.split("=", 1) for kv in sf.split(","))
+    salt, iters = b64d(attrs["s"]), int(attrs["i"])
+    dklen = H(hash_name)().digest_size
+    salted = hashlib.pbkdf2_hmac(hash_name.replace("-", "").lower(),
+                                 password.encode(), salt, iters, dklen=dklen)
+    ckey = hmac.new(salted, b"Client Key", H(hash_name)).digest()
+    skey = H(hash_name)(ckey).digest()
+    proof = xor(ckey, hmac.new(skey, auth_message, H(hash_name)).digest())
+    vkey = hmac.new(salted, b"Server Key", H(hash_name)).digest()
+    vsig = hmac.new(vkey, auth_message, H(hash_name)).digest()
+    return proof, vsig, salt, iters
+
+
+def parse_kv_quoted(s):
+    """Parse 'k=v, k2="v2",...' (challenges DIGEST-MD5 / en-têtes HTTP Digest)."""
+    out = {}
+    for m in re.finditer(r'([\w-]+)\s*=\s*(?:"([^"]*)"|([^\s,]+))', s):
+        out[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
+    return out
+
+
+# ===========================================================================
+# Modèle d'une tentative d'authentification
+# ===========================================================================
+
+class Attempt(object):
+    """Une tentative d'authentification observée dans la capture."""
+    def __init__(self, proto, mechanism, label, outcome="?", username=None):
+        self.proto = proto
+        self.mechanism = mechanism
+        self.label = label
+        self.outcome = outcome
+        self.username = username
+        self.data = {}
+        self.clear_password = None
+        self.extra = ""
+
+    def slow(self):
+        """True si la vérification d'un candidat est coûteuse (PBKDF2...)."""
+        return self.mechanism.startswith("SCRAM-")
+
+    # -- vérification hors ligne d'un candidat --
+    def verify(self, password):
+        d = self.data
+        m = self.mechanism
+        if m.startswith("SCRAM-"):
+            hn = m.replace("SCRAM-", "").replace("SHA", "SHA-")
+            proof, vsig, _, _ = scram_compute(hn, password, d["cfb"], d["sf"], d["cfinal"])
+            if d.get("vsig") is not None:
+                return vsig == d["vsig"], "ServerSignature v="
+            return proof == d["proof"], "ClientProof p="
+        if m == "CRAM-MD5":
+            calc = hmac.new(password.encode(), d["challenge"], hashlib.md5).hexdigest()
+            return calc.lower() == d["digest"].lower(), "HMAC-MD5"
+        if m == "DIGEST-MD5":
+            ok, how = digest_md5_check(password, d)
+            return ok, how
+        if m in ("HTTP-Digest",):
+            ok, how = http_digest_check(password, d)
+            return ok, how
+        if m == "APOP":
+            calc = hashlib.md5((d["timestamp"] + password).encode()).hexdigest()
+            return calc.lower() == d["digest"].lower(), "MD5(timestamp+pw)"
+        return False, "-"
+
+    def needs_crack(self):
+        return self.clear_password is None and self.mechanism in (
+            "SCRAM-SHA-1", "SCRAM-SHA-256", "SCRAM-SHA-512",
+            "DIGEST-MD5", "CRAM-MD5", "HTTP-Digest", "APOP")
+
+
+def digest_md5_check(password, d):
+    """RFC 2831 (SASL DIGEST-MD5, qop=auth)."""
+    u, r = d["username"], d["realm"]
+    ha1 = hexdig("md5", ("%s:%s:%s" % (u, r, password)).encode())
+    if d.get("algorithm", "md5").replace("-", "").lower() == "md5sess":
+        ha1 = hexdig("md5", ("%s:%s:%s" % (ha1, d["nonce"], d["cnonce"])).encode())
+    ha2 = hexdig("md5", ("AUTHENTICATE:" + d["digesturi"]).encode())
+    resp = hexdig("md5", ("%s:%s:%s:%s:%s:%s" % (
+        ha1, d["nonce"], d["nc"], d["cnonce"], d["qop"], ha2)).encode())
+    if resp.lower() == d["response"].lower():
+        return True, "response"
+    if d.get("rspauth"):
+        ha2s = hexdig("md5", (":" + d["digesturi"]).encode())
+        rsp = hexdig("md5", ("%s:%s:%s:%s:%s:%s" % (
+            ha1, d["nonce"], d["nc"], d["cnonce"], d["qop"], ha2s)).encode())
+        if rsp.lower() == d["rspauth"].lower():
+            return True, "rspauth"
+    return False, "-"
+
+
+def http_digest_check(password, d):
+    """RFC 2617 (HTTP Digest, qop=auth / RFC 2069 sans qop)."""
+    ha1 = hexdig("md5", ("%s:%s:%s" % (d["username"], d["realm"], password)).encode())
+    if d.get("algorithm", "MD5").lower().replace("-", "") == "md5sess":
+        ha1 = hexdig("md5", ("%s:%s:%s" % (ha1, d["nonce"], d["cnonce"])).encode())
+    ha2 = hexdig("md5", ("%s:%s" % (d["method"], d["uri"])).encode())
+    if d.get("qop"):
+        calc = hexdig("md5", ("%s:%s:%s:%s:%s:%s" % (
+            ha1, d["nonce"], d["nc"], d["cnonce"], d["qop"], ha2)).encode())
+    else:
+        calc = hexdig("md5", ("%s:%s:%s" % (ha1, d["nonce"], ha2)).encode())
+    return calc.lower() == d["response"].lower(), "response"
+
+
+# ===========================================================================
+# Lecture de la capture
+# ===========================================================================
+
+def _auth_load_capture(capture, tshark_path=None):
+    """Charge la capture pour le solveur d'authentification (sous-code 1).
+
+    - liste de paquets tshark JSON déjà chargés par le pipeline → réutilisée
+      telle quelle (évite un second appel à tshark) ;
+    - export .json → lu directement ;
+    - .pcap/.pcapng/.cap → converti via le load_packets() de tshark2hashcat,
+      qui bénéficie de sa découverte tshark complète (--tshark, variables
+      T2H_TSHARK_PATH / TSHARK, chemins usuels Windows/Linux/macOS).
+
+    Adaptation du load_packets() du script standalone auth_capture_solver.py
+    (qui appelait « tshark » nu et sys.exit) : lève TsharkError/OSError à la
+    place, afin que le pipeline isole et signale l'erreur sans s'interrompre.
+    """
+    if isinstance(capture, list):
+        return capture
+    return load_packets(str(capture), tshark_path)
+
+
+def pkt_layers(pkt):
+    return pkt.get("_source", {}).get("layers", {})
+
+
+SERVER_PORTS = (5222, 5223, 80, 443, 8080, 23, 21, 110, 143, 25, 993, 995, 587)
+
+
+def stream_of(layers):
+    tcp = layers.get("tcp", {})
+    st = tcp.get("tcp.stream")
+    if st:
+        return "s" + str(st)
+    sp = tcp.get("tcp.srcport")
+    dp = tcp.get("tcp.dstport")
+    try:
+        sp_i, dp_i = int(sp), int(dp)
+    except (TypeError, ValueError):
+        return "p?"
+    if dp_i in SERVER_PORTS and sp_i not in SERVER_PORTS:
+        return "p" + str(sp_i)
+    if sp_i in SERVER_PORTS and dp_i not in SERVER_PORTS:
+        return "p" + str(dp_i)
+    return "p" + str(min(sp_i, dp_i))
+
+
+def direction(layers):
+    tcp = layers.get("tcp", {})
+    sp, dp = int(tcp.get("tcp.srcport", 0) or 0), int(tcp.get("tcp.dstport", 0) or 0)
+    if dp in SERVER_PORTS and sp not in SERVER_PORTS:
+        return "C->S"
+    if sp in SERVER_PORTS and dp not in SERVER_PORTS:
+        return "S->C"
+    if dp < sp:
+        return "C->S"
+    return "S->C" if sp < dp else "?"
+
+
+# ===========================================================================
+# Détecteur XMPP / SASL (stanzas XML)
+# ===========================================================================
+
+STANZA_RE = re.compile(r"^<(auth|challenge|response|success|failure)[\s/>]")
+
+
+def detect_xmpp(packets):
+    events = {}
+    seen = set()
+    for pkt in packets:
+        layers = pkt_layers(pkt)
+        xmpp = layers.get("xmpp")
+        if xmpp is None:
+            continue
+        for k, v in walk(xmpp):
+            if k == "MECHANISM" and isinstance(v, dict) and v.get("xmpp.cdata"):
+                events.setdefault("_mechs", set()).add(v["xmpp.cdata"])
+        stanza, cdata, mech, reason = None, None, None, None
+        for _, v in walk(xmpp):
+            if isinstance(v, str) and v.startswith("<"):
+                m = STANZA_RE.match(v)
+                if m and stanza is None:
+                    stanza = m.group(1)
+                if v.startswith("<auth"):
+                    mm = re.search(r"mechanism='([^']+)'", v)
+                    if mm:
+                        mech = mm.group(1)
+                if stanza == "failure" and re.match(r"^<[a-z][\w-]*/>$", v) \
+                        and not v.startswith("<failure"):
+                    reason = v.strip("</>")
+        for k, v in walk(xmpp):
+            if k in ("xml.cdata", "xmpp.cdata") and isinstance(v, str) and v:
+                cdata = v
+                break
+        if stanza is None:
+            continue
+        key = (stream_of(layers), direction(layers), stanza, cdata)
+        if key in seen:
+            continue                      # retransmission TCP
+        seen.add(key)
+        events.setdefault(stream_of(layers), []).append(
+            (direction(layers), stanza, cdata, mech, reason))
+
+    attempts = []
+    for st, evts in sorted(events.items()):
+        if st == "_mechs":
+            continue
+        mech_used, failures = None, []
+        seq = []
+        for dirn, stanza, cdata, mech, reason in evts:
+            if mech:
+                mech_used = mech
+            if stanza == "failure":
+                failures.append(reason or "?")
+            dec = None
+            if cdata:
+                raw = b64d(cdata)
+                if raw:
+                    dec = raw.decode("utf-8", "replace")
+            seq.append((dirn, stanza, dec))
+        if not mech_used:
+            continue
+        a = Attempt("XMPP", mech_used, "flux %s" % st.replace("s", "tcp/"))
+        a.data["offered"] = sorted(events.get("_mechs", set()))
+        a.outcome = "success" if any(s == "success" for _, s, _ in seq) else \
+                    ("failure" if failures else "?")
+        a.extra = "échec : " + ",".join(failures) if failures else ""
+        _fill_sasl(a, mech_used, seq)
+        if a.username or a.clear_password or a.needs_crack():
+            attempts.append(a)
+    return attempts
+
+
+def _fill_sasl(a, mech, seq):
+    """Remplit Attempt.data / username / clear_password selon le mécanisme."""
+    client_lines = [d for dirn, s, d in seq if dirn == "C->S" and d]
+    server_lines = [d for dirn, s, d in seq if dirn == "S->C" and d]
+    if mech == "PLAIN":
+        # CDATA déjà décodé dans seq : authzid \x00 user \x00 password
+        txt = next((d for _, s, d in seq if s in ("response", "auth") and d), None)
+        if txt:
+            parts = txt.split("\x00")
+            if len(parts) == 3:
+                a.username = parts[1] or parts[0]
+                a.clear_password = parts[2]
+        return
+    if mech == "LOGIN":
+        if len(client_lines) >= 2:
+            a.username = client_lines[0]
+            a.clear_password = client_lines[1]
+        return
+    if mech == "CRAM-MD5":
+        chal = server_lines[0] if server_lines else None
+        resp = client_lines[0] if client_lines else None
+        if chal and resp and " " in resp:
+            user, digest = resp.rsplit(" ", 1)
+            a.username, a.data = user, {"challenge": chal.encode(), "digest": digest}
+        return
+    if mech == "DIGEST-MD5":
+        d = {}
+        for line in server_lines + client_lines:
+            d.update(parse_kv_quoted(line))
+        d.setdefault("nc", "00000001")
+        if "username" in d and "response" in d:
+            a.username = d["username"]
+            for k in ("username", "realm", "nonce", "cnonce", "qop", "nc",
+                      "response", "digesturi", "algorithm"):
+                d.setdefault(k, "")
+            d["digesturi"] = (d.get("digesturi") or d.get("digest-uri")
+                              or d.get("uri") or "")
+            for line in server_lines:
+                m = re.search(r"rspauth=([0-9a-fA-F]+)", line)
+                if m:
+                    d["rspauth"] = m.group(1)
+            a.data = d
+        return
+    if mech.startswith("SCRAM-"):
+        cfb = next((d for dirn, s, d in seq
+                    if dirn == "C->S" and d and re.match(r"^[nyp],,", d)), None)
+        sf = next((d for dirn, s, d in seq
+                   if dirn == "S->C" and d and re.match(r"^r=[^,]+,s=", d)), None)
+        cfin = next((d for dirn, s, d in seq
+                     if dirn == "C->S" and d and ",p=" in d), None)
+        vsig = next((d for dirn, s, d in seq
+                     if dirn == "S->C" and d and d.startswith("v=")), None)
+        if cfb and sf and cfin:
+            bare, p = cfin.rsplit(",p=", 1)
+            a.data = {"cfb": cfb.split(",,", 1)[1], "sf": sf,
+                      "cfinal": bare, "proof": b64d(p),
+                      "vsig": b64d(vsig[2:]) if vsig else None}
+            n = re.search(r"(?:^|,)n=([^,]+)", a.data["cfb"])
+            a.username = n and n.group(1)
+
+
+# ===========================================================================
+# Détecteur HTTP (Basic / Digest)
+# ===========================================================================
+
+def detect_http(packets):
+    attempts = []
+    for pkt in packets:
+        layers = pkt_layers(pkt)
+        http = layers.get("http")
+        if not http:
+            continue
+        auth = None
+        for k, v in walk(http):
+            if k == "http.authorization" and isinstance(v, str):
+                auth = v
+        if not auth:
+            continue
+        method, uri = "GET", "/"
+        for k, v in walk(http):
+            if k == "http.request.method" and isinstance(v, str):
+                method = v
+            if k == "http.request.uri" and isinstance(v, str):
+                uri = v
+        label = "%s %s" % (method, uri)
+        if auth.lower().startswith("basic"):
+            a = Attempt("HTTP", "Basic", label)
+            parts = auth.split(None, 1)
+            raw = b64d(parts[1] if len(parts) > 1 else "")
+            if b":" in raw:
+                a.username, a.clear_password = raw.decode("utf-8", "replace").split(":", 1)
+            attempts.append(a)
+        elif auth.lower().startswith("digest"):
+            parts = auth.split(None, 1)
+            d = parse_kv_quoted(parts[1] if len(parts) > 1 else "")
+            d = {k.lower(): v for k, v in d.items()}
+            if "response" in d:
+                a = Attempt("HTTP", "HTTP-Digest", label, username=d.get("username"))
+                d.setdefault("method", method)
+                d.setdefault("uri", d.get("uri", uri))
+                d.setdefault("algorithm", "MD5")
+                a.data = d
+                attempts.append(a)
+    return attempts
+
+
+# ===========================================================================
+# Détecteurs protocoles ligne : FTP / POP3 / IMAP / SMTP / TELNET
+# ===========================================================================
+
+def _events_lines(packets, layer_name, req_cmd_key, req_arg_key, resp_keys):
+    streams = {}
+    for pkt in packets:
+        layers = pkt_layers(pkt)
+        lay = layers.get(layer_name)
+        if not lay:
+            continue
+        st, dirn = stream_of(layers), direction(layers)
+        texts = []
+        if dirn == "C->S":
+            cmd = None
+            for k, v in walk(lay):
+                if k == req_cmd_key and isinstance(v, str):
+                    cmd = v
+            arg = None
+            for k, v in walk(lay):
+                if k == req_arg_key and isinstance(v, str):
+                    arg = v
+            if cmd:
+                texts.append(cmd + (" " + arg if arg else ""))
+        else:
+            for rk in resp_keys:
+                for k, v in walk(lay):
+                    if k == rk and isinstance(v, str):
+                        texts.append(v)
+        for t in texts:
+            streams.setdefault(st, []).append((dirn, t))
+    return streams
+
+
+def detect_ftp(packets):
+    attempts = []
+    for st, evs in _events_lines(packets, "ftp", "ftp.request.command",
+                                 "ftp.request.arg", ("ftp.response",)).items():
+        user = passw = None
+        for dirn, t in evs:
+            p = t.split(" ", 1)
+            cmd, arg = p[0].upper(), (p[1] if len(p) > 1 else "")
+            if cmd == "USER":
+                user = arg
+            elif cmd == "PASS":
+                passw = arg
+        if user and passw:
+            a = Attempt("FTP", "USER/PASS", "flux %s" % st.replace("s", "tcp/"),
+                        username=user)
+            a.clear_password = passw
+            attempts.append(a)
+    return attempts
+
+
+def detect_pop3(packets):
+    attempts = []
+    for st, evs in _events_lines(packets, "pop", "pop.request.command",
+                                 "pop.request.arg", ("pop.response",)).items():
+        user = passw = apop = None
+        greeting = ""
+        for dirn, t in evs:
+            if dirn == "S->C" and not greeting and t.startswith("+OK"):
+                greeting = t
+            p = t.split(" ", 1)
+            cmd, arg = p[0].upper(), (p[1] if len(p) > 1 else "")
+            if cmd == "USER":
+                user = arg
+            elif cmd == "PASS":
+                passw = arg
+            elif cmd == "APOP":
+                apop = arg
+        if user and passw:
+            a = Attempt("POP3", "USER/PASS", "flux %s" % st.replace("s", "tcp/"),
+                        username=user)
+            a.clear_password = passw
+            attempts.append(a)
+        elif apop:
+            m = re.match(r"(\S+)\s+([0-9a-fA-F]{32})$", apop)
+            ts = re.search(r"(<[^>]+>)", greeting)
+            if m and ts:
+                a = Attempt("POP3", "APOP", "flux %s" % st.replace("s", "tcp/"),
+                            username=m.group(1))
+                a.data = {"timestamp": ts.group(1), "digest": m.group(2)}
+                attempts.append(a)
+    return attempts
+
+
+def detect_imap(packets):
+    attempts = []
+    for pkt in packets:
+        layers = pkt_layers(pkt)
+        imap = layers.get("imap")
+        if not imap:
+            continue
+        for k, v in walk(imap):
+            if k == "imap.request" and isinstance(v, str):
+                m = re.search(r"\bLOGIN\s+(\S+)\s+(\S+)", v, re.I)
+                if m:
+                    a = Attempt("IMAP", "LOGIN",
+                                "flux %s" % stream_of(layers).replace("s", "tcp/"),
+                                username=m.group(1))
+                    a.clear_password = m.group(2)
+                    attempts.append(a)
+    return attempts
+
+
+def detect_smtp(packets):
+    attempts = []
+    for st, evs in _events_lines(packets, "smtp", "smtp.req_command",
+                                 "smtp.req_parameter",
+                                 ("smtp.response", "smtp.message")).items():
+        mode, user, chal = None, None, None
+        pending_chal = False
+        for dirn, t in evs:
+            if dirn == "S->C":
+                if t == "334" or t.startswith("334 "):
+                    b64 = t[3:].strip()
+                    if b64:
+                        chal = b64d(b64).decode("utf-8", "replace")
+                    else:
+                        pending_chal = True
+                    continue
+                if pending_chal:
+                    chal = b64d(t).decode("utf-8", "replace")
+                    pending_chal = False
+                continue
+            up = t.upper()
+            if up.startswith("AUTH PLAIN"):
+                blob = t.split(" ", 1)
+                if len(blob) > 1:
+                    dec = b64d(blob[1]).decode("utf-8", "replace")
+                    parts = dec.split("\x00")
+                    if len(parts) == 3:
+                        a = Attempt("SMTP", "AUTH PLAIN",
+                                    "flux %s" % st.replace("s", "tcp/"),
+                                    username=parts[1] or parts[0])
+                        a.clear_password = parts[2]
+                        attempts.append(a)
+                mode = "plain"
+            elif up.startswith("AUTH LOGIN"):
+                mode = "user"
+            elif up.startswith("AUTH CRAM-MD5"):
+                mode = "cram"
+            elif mode == "user":
+                user = b64d(t).decode("utf-8", "replace")
+                mode = "pass"
+            elif mode == "pass":
+                pw = b64d(t).decode("utf-8", "replace")
+                a = Attempt("SMTP", "AUTH LOGIN",
+                            "flux %s" % st.replace("s", "tcp/"), username=user)
+                a.clear_password = pw
+                attempts.append(a)
+                mode = None
+            elif mode == "cram" and " " in t:
+                dec = b64d(t).decode("utf-8", "replace")
+                u, dg = dec.rsplit(" ", 1)
+                a = Attempt("SMTP", "AUTH CRAM-MD5",
+                            "flux %s" % st.replace("s", "tcp/"), username=u)
+                a.data = {"challenge": chal.encode() if chal else b"",
+                          "digest": dg}
+                attempts.append(a)
+                mode = None
+            elif mode == "plain":
+                dec = b64d(t).decode("utf-8", "replace")
+                parts = dec.split("\x00")
+                if len(parts) == 3:
+                    a = Attempt("SMTP", "AUTH PLAIN",
+                                "flux %s" % st.replace("s", "tcp/"),
+                                username=parts[1] or parts[0])
+                    a.clear_password = parts[2]
+                    mode = None
+    return attempts
+
+
+def detect_telnet(packets):
+    attempts = []
+    streams = {}
+    for pkt in packets:
+        layers = pkt_layers(pkt)
+        tel = layers.get("telnet")
+        if not tel:
+            continue
+        st, dirn = stream_of(layers), direction(layers)
+        chunks = []
+        for k, v in walk(tel):
+            if k == "telnet.data":
+                if isinstance(v, list):
+                    chunks.extend([x for x in v if isinstance(x, str)])
+                elif isinstance(v, str):
+                    chunks.append(v)
+        if chunks:
+            streams.setdefault(st, []).append((dirn, "".join(chunks)))
+    for st, evs in streams.items():
+        mode, login, pw = None, [], []
+        for dirn, txt in evs:
+            low = txt.lower()
+            if dirn == "S->C":
+                if "password" in low or "mot de passe" in low or "passwd" in low:
+                    mode = "pw"
+                elif "login" in low or "username" in low or "utilisateur" in low \
+                        or "user" in low:
+                    mode = "login"
+                elif "incorrect" in low or "failed" in low or "échec" in low:
+                    mode = None
+            else:
+                clean = txt.replace("\r", "").replace("\n", "")
+                if not clean:
+                    continue
+                if mode == "login":
+                    login.append(clean)
+                elif mode == "pw":
+                    pw.append(clean)
+        if login and pw:
+            a = Attempt("TELNET", "login/password",
+                        "flux %s" % st.replace("s", "tcp/"),
+                        username="".join(login).strip())
+            a.clear_password = "".join(pw).strip()
+            attempts.append(a)
+    return attempts
+
+
+DETECTORS = [detect_xmpp, detect_http, detect_ftp, detect_pop3,
+             detect_imap, detect_smtp, detect_telnet]
+
+
+# ===========================================================================
+# Génération de candidats — AUCUNE hypothèse sur le challenge
+# ===========================================================================
+
+# Petit dictionnaire interne universel (FR/EN + classiques CTF/protocoles)
+BUILTIN_PW = [
+    "password", "password1", "password123", "passw0rd", "secret", "secret123",
+    "admin", "admin123", "administrator", "root", "root123", "toor", "adm1n",
+    "test", "test123", "guest", "guest123", "demo", "user", "user123",
+    "123456", "1234567", "12345678", "123456789", "1234567890", "123123",
+    "111111", "000000", "121212", "654321", "666666", "888888", "159753",
+    "azerty", "azerty123", "azertyuiop", "qwerty", "qwerty123", "qwertyuiop",
+    "motdepasse", "motdepasse1", "mot2passe", "mdp", "secret1234",
+    "letmein", "welcome", "welcome1", "monkey", "dragon", "sunshine",
+    "princess", "iloveyou", "trustno1", "shadow", "master", "jordan23",
+    "hunter2", "batman", "football", "baseball", "michael", "ninja",
+    "mustang", "access", "love", "whatever", "computer", "pokemon",
+    "charlie", "freedom", "passwort", "ciao", "soleil", "loulou",
+    "juju", "doudou", "chouchou", "mimi", "fifi", "lolo", "tata", "toto",
+    "toto123", "titi", "minet", "carotte", "chocolat", "fromage", "baguette",
+    "bonjour", "coucou", "salut", "internet", "societe", "entreprise",
+    "jabber", "xmpp", "chat", "chat123", "matrix", "neo", "trinity",
+    "morpheus", "agent", "smith", "sysadmin", "netadmin", "backup",
+    "changeme", "changemoi", "default", "arduino", "raspberry", "openwrt",
+    "oracle", "postgres", "mysql", "sa", "sa123", "service", "monitor",
+    "hallo", "hello", "hello123", "hi", "abcd1234", "aaaaaa", "abcdef",
+    "qazwsx", "zaq12wsx", "1q2w3e4r", "1q2w3e", "qwe123", "asd123",
+    "soleil1", "etudiante", "cours", "projet", "stage", "entreprise1",
+]
+
+
+def login_parts(login):
+    """Fragments significatifs du login : mots, préfixes (>=3 car.), formes collées."""
+    parts = set()
+    for w in re.split(r"[^A-Za-z0-9]+", (login or "").lower()):
+        if len(w) >= 3:
+            parts.add(w)
+            for n in range(3, len(w)):        # préfixes : kom, koma, tes, test...
+                parts.add(w[:n])
+    if login:
+        low = login.lower()
+        parts.add(low)
+        parts.add(low.replace("_", "").replace(".", "").replace("-", ""))
+    return sorted(p for p in parts if p)
+
+
+SUFFIXES = ("", "1", "12", "123", "1234", "12345", "123456", "!", "!!", "!!1",
+            "?", ".", "_", "-", "*", "01", "00", "69", "77", "99", "007",
+            "2020", "2021", "2022", "2023", "2024", "2025", "admin", "root",
+            "pass", "mdp", "x", "xx", "xyz")
+
+
+def login_derived(login):
+    """Variantes génériques de réutilisation login->mot de passe (pas un indice)."""
+    if not login:
+        return []
+    seen, out = set(), []
+    bases = {login, login.lower(), login.upper(), login.capitalize(),
+             login.lower().replace("_", "").replace(".", "").replace("-", ""),
+             login.lower().replace("_", "").replace(".", "").replace("-", "").upper()}
+    for b in sorted(bases):
+        for suf in SUFFIXES:
+            c = b + suf
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        c = b[::-1]
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+MASK_SETS = {
+    "?l": "abcdefghijklmnopqrstuvwxyz",
+    "?u": "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "?d": "0123456789",
+    "?s": "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
+    "?a": ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+           "0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"),
+}
+
+
+def parse_mask(mask):
+    """Convertit un masque hashcat-like en tuple de charsets par position."""
+    sets, i = [], 0
+    while i < len(mask):
+        if mask[i] == "?" and i + 1 < len(mask) and mask[i:i + 2] in MASK_SETS:
+            sets.append(MASK_SETS[mask[i:i + 2]])
+            i += 2
+        else:
+            sets.append(mask[i])
+            i += 1
+    return sets
+
+
+def gen_candidates(logins, args, wl_path=None):
+    """Pipeline SANS INDICE, du moins coûteux au plus coûteux :
+    builtin -> dérivés du login -> fragments du login -> wordlist -> masque -> brute.
+    Ainsi une wordlist énorme n'est consommée que si les étapes rapides échouent."""
+    seen = set()
+
+    def push(c):
+        if c and c not in seen:
+            seen.add(c)
+            return True
+        return False
+
+    # 1) dictionnaire interne universel
+    for w in BUILTIN_PW:
+        if push(w):
+            yield w
+    # 2) variantes dérivées du login (réutilisation classique)
+    for lg in logins:
+        for c in login_derived(lg):
+            if push(c):
+                yield c
+    # 3) fragments du login + N caractères (rapide et borné)
+    if args.login_parts:
+        all_parts = []
+        for lg in logins:
+            for p in login_parts(lg):
+                if p not in all_parts:
+                    all_parts.append(p)
+        for part in all_parts:
+            for n in range(1, args.parts_len + 1):
+                for tup in itertools.product(args.charset, repeat=n):
+                    c = part + "".join(tup)
+                    if push(c):
+                        yield c
+    # 4) wordlist brute (filtre UNIQUEMENT si --filter fourni)
+    if wl_path:
+        flt = args.filter or None
+        with open(wl_path, errors="ignore") as f:
+            for line in f:
+                w = line.rstrip("\r\n")
+                if not w:
+                    continue
+                if flt and flt.lower() not in w.lower():
+                    continue
+                if push(w):
+                    yield w
+    # 5) masque explicite fourni par l'UTILISATEUR (hypothèse ciblée)
+    if args.mask:
+        for tup in itertools.product(*parse_mask(args.mask)):
+            c = "".join(tup)
+            if push(c):
+                yield c
+    # 6) brute force incrémental sur tout l'espace (profondeur adaptée au coût)
+    if not args.no_brute:
+        for n in range(1, args.brute_len + 1):
+            for tup in itertools.product(args.charset, repeat=n):
+                c = "".join(tup)
+                if push(c):
+                    yield c
+
+
+# ===========================================================================
+# Crackage (multiprocessing)
+# ===========================================================================
+
+def _crack_chunk(payload):
+    """Worker : teste un lot de candidats contre une tentative. Retourne pw ou None."""
+    a, cands = payload
+    for c in cands:
+        try:
+            ok, _how = a.verify(c)
+        except Exception:
+            ok = False
+        if ok:
+            return c
+    return None
+
+
+def crack_attempt(a, args, wl_path, deadline=None):
+    logins = [a.username] if a.username else []
+    gen = gen_candidates(logins, args, wl_path)
+    jobs = args.jobs or multiprocessing.cpu_count()
+    tested = 0
+    t0 = time.time()
+
+    def _progress():
+        dt = time.time() - t0
+        rate = tested / dt if dt > 0 else 0.0
+        print("    ... %d candidats testés (%.0f cand/s)" % (tested, rate))
+
+    if jobs <= 1:
+        for c in gen:
+            tested += 1
+            pw = _crack_chunk((a, [c]))
+            if pw:
+                return pw, tested
+            if deadline is not None and time.time() > deadline:
+                print("    [!] budget temps atteint — arrêt du crackage "
+                      "(%d candidats testés). Utilisez --deep pour continuer." % tested)
+                return None, tested
+            if tested % 20000 == 0:
+                _progress()
+        return None, tested
+    chunk = []
+    with multiprocessing.Pool(jobs) as pool:
+        results = []
+
+        def batches():
+            for c in gen:
+                chunk.append(c)
+                if len(chunk) >= 200:
+                    yield (a, chunk[:])
+                    chunk.clear()
+            if chunk:
+                yield (a, chunk[:])
+
+        for batch in batches():
+            if deadline is not None and time.time() > deadline:
+                print("    [!] budget temps atteint — arrêt du crackage "
+                      "(%d candidats testés). Utilisez --deep pour continuer." % tested)
+                pool.terminate()
+                return None, tested
+            results.append(pool.apply_async(_crack_chunk, (batch,)))
+            tested += len(batch[1])
+            if len(results) >= jobs * 4:            # fenêtre glissante
+                pw = results.pop(0).get()
+                if pw:
+                    pool.terminate()
+                    return pw, tested
+            if tested % 50000 < 200:
+                _progress()
+        for r in results:
+            pw = r.get()
+            if pw:
+                pool.terminate()
+                return pw, tested
+    return None, tested
+
+
+def warn_wordlist_cost(path, targets):
+    """Prévient quand la wordlist représente des heures de vérification."""
+    try:
+        if os.path.getsize(path) < 5_000_000:
+            return
+        with open(path, "rb") as f:
+            n = sum(1 for _ in f)
+    except OSError:
+        return
+    slow = any(t.slow() for t in targets)
+    cores = multiprocessing.cpu_count()
+    rate = (2000 if slow else 5_000_000) * max(1, cores // 2)
+    est = n / rate
+    unit = ("%.1f h" % (est / 3600.0)) if est > 600 else ("%.0f min" % (est / 60.0))
+    print("  [!] Wordlist de %d entrées : ~%s de vérification%s — les étapes rapides "
+          "sont tentées d'abord ; envisagez --filter ou --jobs si besoin."
+          % (n, unit, " (PBKDF2 lent)" if slow else ""))
+
+
+# ===========================================================================
+# Self-test : vecteurs officiels RFC
+# ===========================================================================
+
+def selftest(verbose=True):
+    ok = True
+    emit = print if verbose else (lambda *a, **k: None)
+
+    def check(name, cond):
+        nonlocal ok
+        emit(("  [OK]   " if cond else "  [FAIL] ") + name)
+        ok = ok and cond
+
+    emit("Vecteurs RFC :")
+    p, v, _, _ = scram_compute("sha1", "pencil",
+                               "n=user,r=fyko+d2lbbFgONRv9qkxdawL",
+                               "r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,"
+                               "s=QSXCR+Q6sek8bf92,i=4096",
+                               "c=biws,r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j")
+    check("SCRAM-SHA-1 p= (RFC 5802)", b64e(p) == "v0X8v3Bz2T0CJGbJQyF0X+HI4Ts=")
+    check("SCRAM-SHA-1 v= (RFC 5802)", b64e(v) == "rmF9pqV8S7suAoZWja4dJRkFsKQ=")
+    p, v, _, _ = scram_compute("sha256", "pencil",
+                               "n=user,r=rOprNGfwEbeRWgbNEkqO",
+                               "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,"
+                               "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+                               "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0")
+    check("SCRAM-SHA-256 p= (RFC 7677)",
+          b64e(p) == "dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=")
+    check("SCRAM-SHA-256 v= (RFC 7677)",
+          b64e(v) == "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+    calc = hmac.new(b"tanstaaftanstaaf",
+                    b"<1896.697170952@postoffice.reston.mci.net>",
+                    hashlib.md5).hexdigest()
+    check("CRAM-MD5 (RFC 2195)", calc == "b913a602c7eda7a495b4e6e7334d3890")
+    d = {"username": "Mufasa", "realm": "testrealm@host.com",
+         "nonce": "dcd98b7102dd2f0e8b11d0f600bfb0c093", "nc": "00000001",
+         "cnonce": "0a4f113b", "qop": "auth", "method": "GET",
+         "uri": "/dir/index.html", "algorithm": "MD5",
+         "response": "6629fae49393a05397450978507c4ef1"}
+    okd, _ = http_digest_check("Circle Of Life", d)
+    check("HTTP Digest MD5 (RFC 2617)", okd)
+    dd = {"username": "chris", "realm": "elwood.innosoft.com",
+          "nonce": "OA6MG9tEQGm2hh", "cnonce": "OA6MHXhTg4GTNzg7",
+          "nc": "00000001", "qop": "auth",
+          "digesturi": "ldap/elwood.innosoft.com", "algorithm": "md5"}
+    ha1 = hexdig("md5", b"chris:elwood.innosoft.com:secret")
+    ha2 = hexdig("md5", b"AUTHENTICATE:ldap/elwood.innosoft.com")
+    dd["response"] = hexdig("md5", ("%s:%s:%s:%s:%s:%s" % (
+        ha1, dd["nonce"], dd["nc"], dd["cnonce"], dd["qop"], ha2)).encode())
+    okm, _ = digest_md5_check("secret", dd)
+    check("DIGEST-MD5 round-trip (RFC 2831)", okm)
+    da = {"timestamp": "<1896.697170952@postoffice.reston.mci.net>",
+          "digest": hashlib.md5(
+              b"<1896.697170952@postoffice.reston.mci.net>telnet").hexdigest()}
+    aa = Attempt("POP3", "APOP", "test")
+    aa.data = da
+    check("APOP round-trip", aa.verify("telnet")[0])
+    emit("\nSelf-test global : " + ("SUCCÈS" if ok else "ÉCHEC"))
+    return ok
+
+
+# ===========================================================================
+# Affichage — describe() puis API d'intégration run_auth_solver()
+# ===========================================================================
+
+def describe(a):
+    lines = ["  [%s] %s — %s" % (a.proto, a.mechanism, a.label)]
+    if a.username:
+        lines.append("    login      : " + a.username)
+    if a.outcome != "?":
+        lines.append("    issue      : " + a.outcome +
+                     (" (" + a.extra + ")" if a.extra else ""))
+    if a.data.get("offered"):
+        off = ", ".join(a.data["offered"])
+        lines.append("    annoncé    : " + off)
+    d = a.data
+    if a.mechanism.startswith("SCRAM-"):
+        lines.append("    sel/iters  : %s / %s" % (
+            re.search(r"s=([^,]+)", d["sf"]).group(1),
+            re.search(r"i=(\d+)", d["sf"]).group(1)))
+        lines.append("    preuve p=  : " + b64e(d["proof"]))
+        if d.get("vsig") is not None:
+            lines.append("    signature v= : " + b64e(d["vsig"]))
+    if a.mechanism == "CRAM-MD5":
+        chal = d["challenge"].decode("utf-8", "replace")
+        lines.append("    challenge  : " + chal)
+        lines.append("    digest     : " + d["digest"])
+    if a.mechanism in ("DIGEST-MD5", "HTTP-Digest"):
+        keep = ["realm", "nonce", "cnonce", "nc", "qop", "digesturi", "uri",
+                "algorithm", "response", "rspauth"]
+        kv = ["%s=%s" % (k, d[k]) for k in keep if d.get(k)]
+        lines.append("    données    : " + ", ".join(kv))
+    if a.mechanism == "APOP":
+        lines.append("    timestamp  : " + d["timestamp"])
+        lines.append("    digest     : " + d["digest"])
+    if a.clear_password is not None:
+        lines.append("    MOT DE PASSE EN CLAIR : " + a.clear_password)
+    return "\n".join(lines)
+
+
+class _AuthArgs:
+    """Paramètres de crackage du solveur d'authentification.
+
+    Remplace l'argparse du script standalone auth_capture_solver.py pour un
+    appel direct depuis le pipeline ; mêmes noms d'attributs et mêmes valeurs
+    par défaut que les options CLI d'origine (consommés par gen_candidates()
+    et crack_attempt(), inchangés).
+    """
+
+    def __init__(self, *, mask=None, login_parts=True, parts_len=2,
+                 charset="abcdefghijklmnopqrstuvwxyz0123456789",
+                 brute_len=None, no_brute=False, filter=None, jobs=None,
+                 list_only=False):
+        self.mask = mask
+        self.login_parts = login_parts
+        self.parts_len = parts_len
+        self.charset = charset
+        self.brute_len = brute_len
+        self.no_brute = no_brute
+        self.filter = filter
+        self.jobs = jobs
+        self.list_only = list_only
+
+def _hashcat_hint_auth(a):
+    """Cible auth NON résolue → conversion hashcat quand un mode natif existe.
+
+    Formats vérifiés sur la documentation hashcat :
+      - APOP     = MD5(timestamp || password) → -m 20 (md5($salt.$pass)),
+                   ligne « <digest>:<timestamp> » ;
+      - CRAM-MD5 = HMAC-MD5(password, challenge) → -m 10200, ligne
+                   « $cram_md5$<b64(challenge)>$<b64(user + ' ' + digest)> ».
+    SCRAM (chaîne StoredKey/ServerKey), DIGEST-MD5 et HTTP-Digest n'ont pas
+    de mode hashcat natif : la note + les paramètres bruts sont fournis pour
+    relancer le solveur avec --deep / une wordlist plus riche.
+    Retourne un dict sérialisable (findings + affichage PARTIE 2/2).
+    """
+    d = a.data or {}
+    hint = {"proto": a.proto, "mechanism": a.mechanism, "label": a.label,
+            "username": a.username, "outcome": a.outcome,
+            "hashcat_mode": None, "hashcat_line": None, "note": ""}
+    try:
+        if a.mechanism == "APOP" and d.get("digest") and d.get("timestamp"):
+            hint["hashcat_mode"] = 20
+            hint["hashcat_line"] = "%s:%s" % (d["digest"], d["timestamp"])
+        elif (a.mechanism == "AUTH CRAM-MD5" or a.mechanism == "CRAM-MD5") \
+                and d.get("challenge") is not None and d.get("digest"):
+            chal = d["challenge"]
+            if isinstance(chal, str):
+                chal = chal.encode("utf-8", "replace")
+            hint["hashcat_mode"] = 10200
+            hint["hashcat_line"] = "$cram_md5$%s$%s" % (
+                b64e(chal),
+                b64e(("%s %s" % (a.username or "", d["digest"])).encode()))
+        elif a.mechanism.startswith("SCRAM-"):
+            hint["note"] = ("pas de mode hashcat natif (chaîne StoredKey/"
+                            "ServerKey) — paramètres bruts : %s ; preuve p= : %s"
+                            % (d.get("sf", "?"), b64e(d.get("proof", b"") or b"")))
+        elif a.mechanism in ("DIGEST-MD5", "HTTP-Digest", "Digest"):
+            champs = ", ".join("%s=%s" % (k, d[k]) for k in
+                               ("realm", "nonce", "cnonce", "nc", "qop",
+                                "digesturi", "uri", "algorithm", "response")
+                               if d.get(k))
+            hint["note"] = ("pas de mode hashcat natif — champs : %s" %
+                            (champs or "?"))
+        else:
+            hint["note"] = "pas de conversion hashcat pour ce mécanisme"
+    except Exception as exc:  # noqa: BLE001 — l'indice ne doit jamais casser le solveur
+        hint["note"] = "indice hashcat indisponible (%s)" % exc
+    return hint
+
+
+def run_auth_solver(capture, wordlist=None, *, packets=None, tshark_path=None,
+                    deep=False, deadline=None, mask=None, filter_str=None,
+                    jobs=None, brute_len=None, parts_len=2, login_parts=True,
+                    no_brute=False, list_only=False,
+                    extra_passwords=()):
+    """Sous-code 1 — auth_capture_solver.py en fonction appelable.
+
+    Paramètres
+    ----------
+    capture : chemin .json (export tshark) ou .pcap/.pcapng/.cap ; ignoré si
+        ``packets`` est fourni.
+    packets : paquets tshark JSON déjà chargés par le pipeline principal
+        (réutilisation — pas de second appel à tshark).
+    wordlist : wordlist brute optionnelle (testée telle quelle, après les
+        étapes rapides, comme dans le script original).
+    deep : False → brute force borné (profondeur 3) + budget temps ;
+        True → comportement d'origine (profondeur auto 3/6, aucun budget).
+    deadline : instant (time.time()) limite du crackage ; None = illimité.
+    mask / filter_str / jobs / brute_len / parts_len / login_parts /
+    no_brute / list_only : équivalents des options CLI d'origine
+    (--mask, --filter, --jobs, --brute-len, --parts-len, --no-login-parts,
+    --no-brute, --list-only).
+
+    Retourne un SolverOutcome ; les sys.exit() d'origine deviennent des
+    statuts explicites. La sortie console (ÉTAPE 1..5) est conservée telle
+    quelle.
+    """
+    t_start = time.time()
+    fr = get_lang() == "fr"
+    if wordlist and not os.path.exists(wordlist):
+        wordlist = None
+
+    hdr("ÉTAPE 1 — Analyse de la capture")
+    pkts = _auth_load_capture(packets if packets is not None else capture, tshark_path)
+    src_label = capture if isinstance(capture, str) else "(paquets chargés par le pipeline)"
+    print("Fichier : %s   (%d paquets)" % (src_label, len(pkts)))
+
+    attempts = []
+    for det in DETECTORS:
+        try:
+            attempts.extend(det(pkts))
+        except Exception as e:
+            print("  [!] détecteur %s : %s" % (det.__name__.replace("detect_", ""), e))
+    if not attempts:
+        return SolverOutcome(
+            "auth", "not_applicable",
+            summary=("aucune authentification détectée" if fr
+                     else "no authentication detected"),
+            findings={"attempts": 0}, elapsed=time.time() - t_start)
+
+    args = _AuthArgs(mask=mask, login_parts=login_parts, parts_len=parts_len,
+                     brute_len=brute_len, no_brute=no_brute, filter=filter_str,
+                     jobs=jobs, list_only=list_only)
+    if not deep and args.brute_len is None and not args.no_brute:
+        args.brute_len = 3          # mode rapide : profondeur bornée (deep = auto 3/6)
+
+    hdr("ÉTAPE 2 — Authentifications détectées")
+    for a in attempts:
+        print(describe(a))
+        print()
+
+    clear_pw = [(a, a.clear_password) for a in attempts if a.clear_password is not None]
+    to_crack = [a for a in attempts if a.needs_crack()]
+
+    hdr("ÉTAPE 3 — Identifiants en clair")
+    for a, pw in clear_pw:
+        print("  %s / %s : %s / %s" % (a.proto, a.mechanism, a.username, pw))
+    if not clear_pw:
+        print("  (aucun)")
+
+    base_findings = {"attempts": len(attempts), "targets": len(to_crack)}
+    if args.list_only:
+        creds = [{"proto": a.proto, "mechanism": a.mechanism, "label": a.label,
+                  "username": a.username, "password": pw, "outcome": a.outcome}
+                 for a, pw in clear_pw]
+        return SolverOutcome("auth", "ok",
+                             summary=("list-only : analyse sans crackage" if fr
+                                      else "list-only: analysis without cracking"),
+                             findings=dict(base_findings, credentials=creds),
+                             elapsed=time.time() - t_start)
+
+    # profondeur brute force auto : SCRAM = PBKDF2 lent -> 3 ; MD5 rapide -> 6
+    if args.brute_len is None:
+        slow = any(a.slow() for a in to_crack)
+        args.brute_len = 3 if slow else 6
+
+    stages = ["dictionnaire interne (%d)" % len(BUILTIN_PW),
+              "variantes du login",
+              "fragments du login + <=%d car." % args.parts_len if args.login_parts
+              else "fragments du login — désactivés (--no-login-parts)",
+              "wordlist" + (" (%s)" % wordlist if wordlist else " — non fournie"),
+              "masque" + (" %s" % args.mask if args.mask else " — non fourni"),
+              "brute force len<=%d sur %d car." % (args.brute_len, len(args.charset))]
+    hdr("ÉTAPE 4 — Crackage hors ligne (%d cible(s))" % len(to_crack))
+    print("  Stages (sans indice) :")
+    for s_ in stages:
+        print("    - " + s_)
+    if wordlist and os.path.exists(wordlist):
+        warn_wordlist_cost(wordlist, to_crack)
+
+    found = {}
+    pending = list(to_crack)
+
+    def cross_try(pw):
+        """Réutilisation : un mot de passe trouvé peut déverrouiller d'autres flux."""
+        for c in list(pending):
+            try:
+                ok_, how = c.verify(pw)
+            except Exception:
+                continue
+            if ok_:
+                print("  Cible : [%s] %s — %s (issue: %s)" %
+                      (c.proto, c.mechanism, c.label, c.outcome))
+                print("    [+] TROUVÉ par réutilisation via %s : %r" % (how, pw))
+                found[c] = pw
+                pending.remove(c)
+
+    # 0) tenter d'abord les mots de passe déjà connus (captés en clair) sur les cibles
+    for _a, pw in clear_pw:
+        cross_try(pw)
+    # 0b) candidats externes (moteur : knowledge base, corrélations, §15) —
+    #     testés AVANT les stages wordlist/brute ; comportement inchangé quand
+    #     la liste est vide (appelants existants).
+    for pw in extra_passwords or ():
+        if pw and pending and pw not in {p for _a, p in clear_pw}:
+            cross_try(pw)
+    for a in list(pending):
+        print("\n  Cible : [%s] %s — %s (issue: %s)" %
+              (a.proto, a.mechanism, a.label, a.outcome))
+        pw, tested = crack_attempt(a, args, wordlist, deadline=deadline)
+        if pw:
+            _ok, how = a.verify(pw)
+            print("    [+] TROUVÉ via %s : %r   (%d candidats)" % (how, pw, tested))
+            found[a] = pw
+            pending.remove(a)
+            cross_try(pw)                     # réutilisation sur les autres cibles
+        else:
+            print("    [-] non trouvé (%d candidats). Pistes : wordlist plus riche "
+                  "(rockyou), --mask ciblé (ex. 'frag?l?l?l'), --parts-len plus grand, "
+                  "--brute-len plus grand, --charset étendu." % tested)
+        if not pending:
+            print("\n  [i] Toutes les cibles sont résolues — arrêt avant les stages "
+                  "restants (wordlist/brute force non consommés en totalité).")
+            break
+    print()
+
+    hdr("ÉTAPE 5 — Résultats (secrets confirmés)")
+    results = [(a, pw) for a, pw in clear_pw] + list(found.items())
+    creds = []
+    for a, pw in results:
+        print("  [%s/%s] %s — login=%s  mot de passe=%r  issue=%s" %
+              (a.proto, a.mechanism, a.label, a.username, pw, a.outcome))
+        creds.append({"proto": a.proto, "mechanism": a.mechanism, "label": a.label,
+                      "username": a.username, "password": pw, "outcome": a.outcome})
+    if not results:
+        print("  [-] Aucun mot de passe récupéré.")
+
+    if creds:
+        status = "found"
+        summary = ("%d identifiant(s) récupéré(s)" % len(creds) if fr
+                   else "%d credential(s) recovered" % len(creds))
+    else:
+        status = "not_found" if to_crack else "ok"
+        summary = ("aucun mot de passe récupéré" if fr else "no password recovered")
+        if not to_crack:
+            summary = ("identifiants en clair signalés" if fr
+                       else "cleartext credentials reported")
+    # Cibles non résolues → indices hashcat (PARTIE 2/2 de la synthèse).
+    # Y compris les mécanismes détectés mais jamais crackés par le sous-code
+    # (ex. SMTP « AUTH CRAM-MD5 », absent du tuple needs_crack d'origine) :
+    # le comportement de crackage reste inchangé, mais leur hash est exporté.
+    leftover = [a for a in attempts
+                if a.clear_password is None and not a.needs_crack()
+                and a not in found and (a.data or {}).get("digest")]
+    failed = ([_hashcat_hint_auth(a) for a in pending]
+              + [_hashcat_hint_auth(a) for a in leftover])
+    return SolverOutcome("auth", status, summary=summary,
+                         findings=dict(base_findings, credentials=creds,
+                                       failed_targets=failed),
+                         elapsed=time.time() - t_start)
+
+
+# ==============================================================================================
+#  SOUS-CODE 2/4 — SOLVEUR WPA2-ENTERPRISE / RADIUS (intégré depuis resolve.py)
+# ==============================================================================================
+"""
+====================================================================================================
+               SOLVEUR WPA2-ENTERPRISE (802.1X / RADIUS / EAP-TTLS) - 100% DEPUIS PCAP
+====================================================================================================
+AUCUNE VALEUR N'EST HARDCODÉE DANS CE SCRIPT.
+Toutes les informations (secrets, clés, MACs, nonces, trames, données) sont extraites
+et calculées dynamiquement et mathématiquement à partir des fichiers PCAP et de la wordlist.
+
+Fonctionnalités :
+1. Parseur universel PCAP/PCAPNG (Pur Python, support Ethernet, 802.11, RadioTap).
+2. Extraction des trames RADIUS (Access-Request et Access-Accept).
+3. Cassage du secret RADIUS par calcul HMAC-MD5 sur l'attribut Message-Authenticator (RFC 2869/3579).
+4. Déchiffrement RFC 2548 de l'attribut MS-MPPE-Recv-Key pour récupérer le PMK (Pairwise Master Key).
+5. Extraction du 4-way handshake 802.11 : AP MAC, Client MAC, ANonce, SNonce, EAPOL Message 2.
+6. Dérivation du PTK (KCK, KEK, TK) via la PRF-512 IEEE 802.11i.
+7. Vérification mathématique du MIC sur la trame EAPOL Message 2.
+8. Déchiffrement AES-CCMP (AES-128 en mode CTR) de toutes les trames de données 802.11 protégées.
+9. Décapsulation réseau (LLC/SNAP, IPv4, TCP, UDP) et extraction des chaînes imprimables (preuves textuelles).
+
+Compatibilité : Windows, Linux, macOS (Python 3.7+)
+====================================================================================================
+"""
+
+
+# ==================================================================================================
+# 1. PARSEUR DE CAPTURES PCAP / PCAPNG (PUR PYTHON)
+# ==================================================================================================
+
+class PacketRecord:
+    def __init__(self, ts_sec: int, ts_usec: int, data: bytes, orig_len: int, frame_num: int):
+        self.ts_sec = ts_sec
+        self.ts_usec = ts_usec
+        self.data = data
+        self.orig_len = orig_len
+        self.frame_num = frame_num
+
+def parse_pcap(filepath: str) -> Tuple[int, List[PacketRecord]]:
+    """Lit un fichier PCAP ou PCAPNG et retourne (link_type, paquets)."""
+    if not os.path.isfile(filepath):
+        raise FileNotFoundError(f"Fichier introuvable : {filepath}")
+
+    with open(filepath, "rb") as f:
+        magic = f.read(4)
+        if len(magic) < 4:
+            raise ValueError(f"Fichier vide : {filepath}")
+
+        # PCAP Classique (Little ou Big Endian)
+        if magic in (b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x4d\x3c\xb2\xa1", b"\xa1\xb2\x3c\x4d"):
+            endian = "<" if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1") else ">"
+            hdr = f.read(20)
+            if len(hdr) < 20:
+                raise ValueError("En-tête global PCAP incomplet")
+            v_maj, v_min, tz, sig, snaplen, link_type = struct.unpack(f"{endian}HHIIII", hdr)
+            
+            packets = []
+            frame_num = 1
+            while True:
+                rec_hdr = f.read(16)
+                if len(rec_hdr) < 16:
+                    break
+                ts_sec, ts_usec, incl_len, orig_len = struct.unpack(f"{endian}IIII", rec_hdr)
+                pkt_data = f.read(incl_len)
+                if len(pkt_data) < incl_len:
+                    break
+                packets.append(PacketRecord(ts_sec, ts_usec, pkt_data, orig_len, frame_num))
+                frame_num += 1
+            return link_type, packets
+
+        # PCAPNG
+        elif magic == b"\n\r\r\n":
+            f.seek(0)
+            packets = []
+            link_type = 105
+            frame_num = 1
+            endian = "<"
+            
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    break
+                b_type, b_len = struct.unpack(f"{endian}II", hdr)
+                if b_type == 0x0a0d0d0a:  # Section Header
+                    bom = f.read(4)
+                    endian = ">" if bom == b"\x1a\x2b\x3c\x4d" else "<"
+                    f.seek(b_len - 12, 1)
+                elif b_type == 0x00000001:  # Interface Description
+                    idb = f.read(b_len - 12)
+                    link_type = struct.unpack(f"{endian}H", idb[:2])[0]
+                    f.seek(4, 1)
+                elif b_type == 0x00000006:  # Enhanced Packet Block
+                    epb = f.read(b_len - 12)
+                    if len(epb) >= 20:
+                        if_id, ts_h, ts_l, cap_len, orig_len = struct.unpack(f"{endian}IIIII", epb[:20])
+                        pkt_data = epb[20:20 + cap_len]
+                        packets.append(PacketRecord(ts_h, ts_l, pkt_data, orig_len, frame_num))
+                        frame_num += 1
+                    f.seek(4, 1)
+                elif b_type == 0x00000003:  # Simple Packet Block
+                    spb = f.read(b_len - 12)
+                    if len(spb) >= 4:
+                        orig_len = struct.unpack(f"{endian}I", spb[:4])[0]
+                        cap_len = min(orig_len, b_len - 16)
+                        pkt_data = spb[4:4 + cap_len]
+                        packets.append(PacketRecord(0, 0, pkt_data, orig_len, frame_num))
+                        frame_num += 1
+                    f.seek(4, 1)
+                else:
+                    if b_len < 12:
+                        break
+                    f.seek(b_len - 8, 1)
+            return link_type, packets
+        else:
+            raise ValueError(f"Format de capture non supporté : {magic.hex()}")
+
+# ==================================================================================================
+# 2. ANALYSE DU PROTOCOLE RADIUS & CASSAGE DU SECRET PARTAGÉ (RFC 2865 / 2869 / 3579)
+# ==================================================================================================
+
+class RadiusAttribute:
+    def __init__(self, attr_type: int, raw_value: bytes):
+        self.type = attr_type
+        self.raw_value = raw_value
+
+class ParsedRadiusFrame:
+    def __init__(self, code: int, identifier: int, length: int, authenticator: bytes,
+                 attributes: List[RadiusAttribute], raw_bytes: bytes, frame_num: int):
+        self.code = code
+        self.identifier = identifier
+        self.length = length
+        self.authenticator = authenticator
+        self.attributes = attributes
+        self.raw_bytes = raw_bytes
+        self.frame_num = frame_num
+
+    @property
+    def code_name(self) -> str:
+        names = {1: "Access-Request", 2: "Access-Accept", 3: "Access-Reject", 11: "Access-Challenge"}
+        return names.get(self.code, f"Code-{self.code}")
+
+def extract_radius_packets_from_pcap(filepath: str) -> List[ParsedRadiusFrame]:
+    """Scanne et extrait tous les paquets RADIUS UDP d'une capture PCAP."""
+    link_type, packets = parse_pcap(filepath)
+    radius_list = []
+
+    for pkt in packets:
+        data = pkt.data
+        if link_type == 1:  # Ethernet
+            if len(data) < 14:
+                continue
+            eth_type = struct.unpack("!H", data[12:14])[0]
+            offset = 14
+            if eth_type == 0x8100:  # VLAN
+                eth_type = struct.unpack("!H", data[16:18])[0]
+                offset = 18
+            if eth_type != 0x0800:
+                continue
+            ip_data = data[offset:]
+        elif link_type == 113:  # SLL Linux Cooked
+            if len(data) < 16 or struct.unpack("!H", data[14:16])[0] != 0x0800:
+                continue
+            ip_data = data[16:]
+        else:
+            ip_data = data
+
+        if len(ip_data) < 20:
+            continue
+        ihl = (ip_data[0] & 0x0f) * 4
+        if ip_data[9] != 17:  # UDP
+            continue
+        udp_data = ip_data[ihl:]
+        if len(udp_data) < 8:
+            continue
+        src_port, dst_port, udp_len = struct.unpack("!HHH", udp_data[:6])
+        if src_port in (1812, 1813, 1645, 1646) or dst_port in (1812, 1813, 1645, 1646):
+            payload = udp_data[8:udp_len]
+            if len(payload) >= 20:
+                code, ident, length = struct.unpack("!BBH", payload[:4])
+                if length <= len(payload) and length >= 20:
+                    auth = payload[4:20]
+                    attr_data = payload[20:length]
+                    attrs = []
+                    off = 0
+                    while off + 2 <= len(attr_data):
+                        t, l = attr_data[off], attr_data[off + 1]
+                        if l < 2 or off + l > len(attr_data):
+                            break
+                        attrs.append(RadiusAttribute(t, attr_data[off + 2 : off + l]))
+                        off += l
+                    radius_list.append(ParsedRadiusFrame(code, ident, length, auth, attrs, payload[:length], pkt.frame_num))
+
+    return radius_list
+
+def crack_radius_secret_from_capture(radius_frames: List[ParsedRadiusFrame], wordlist_paths: List[str],
+                                     extra_candidates: Iterable[str] = (),
+                                     deadline: Optional[float] = None) -> str:
+    """
+    Casse le secret RADIUS en calculant à la volée le HMAC-MD5 sur l'Access-Request (RFC 2869).
+    Message-Authenticator = HMAC-MD5(Secret, Packet_avec_MA_a_0)
+    """
+    req_frame = None
+    ma_offset = -1
+    captured_ma = None
+
+    for req in radius_frames:
+        if req.code == 1:  # Access-Request
+            offset = 20
+            while offset + 2 <= len(req.raw_bytes):
+                t, l = req.raw_bytes[offset], req.raw_bytes[offset + 1]
+                if l < 2 or offset + l > len(req.raw_bytes):
+                    break
+                if t == 80 and l == 18:  # Message-Authenticator
+                    req_frame = req
+                    ma_offset = offset + 2
+                    captured_ma = req.raw_bytes[ma_offset : ma_offset + 16]
+                    break
+                offset += l
+            if captured_ma:
+                break
+
+    if not captured_ma:
+        raise ValueError("Attribut Message-Authenticator (Type 80) introuvable dans la capture RADIUS.")
+
+    # Mettre à zéro les 16 octets de l'attribut Message-Authenticator
+    zeroed_pkt = bytearray(req_frame.raw_bytes)
+    zeroed_pkt[ma_offset : ma_offset + 16] = b"\x00" * 16
+
+    print(f"    [*] Message-Authenticator extrait (Trame #{req_frame.frame_num}) : {captured_ma.hex()}")
+    print("    [*] Démarrage de l'attaque par dictionnaire...")
+
+    tested = 0
+
+    def _try_secret(candidate: str) -> bool:
+        nonlocal tested
+        tested += 1
+        try:
+            secret_bytes = candidate.encode("latin-1")
+        except UnicodeEncodeError:
+            # Candidat hors latin-1 (connaissance externe UTF-8, thaï, emoji…)
+            # : octets UTF-8 fidèles au lieu de planter — consigne du run réel
+            # build 18695 : aucune exception Unicode ne doit tuer un solveur.
+            # (Un secret RADIUS non-ASCII est testé sous sa forme UTF-8,
+            # l'autre interprétation octets-fidèle possible.)
+            secret_bytes = candidate.encode("utf-8")
+        if hmac.new(secret_bytes, zeroed_pkt, hashlib.md5).digest() == captured_ma:
+            print(f"    [+] Secret RADIUS cassé avec succès : '{candidate}' (après {tested:,} essais)")
+            return True
+        if tested % 500000 == 0:
+            print(f"        ... {tested:,} mots de passe testés")
+        return False
+
+    # 1) candidats transmis automatiquement par les étapes précédentes du
+    #    pipeline (mots de passe déjà découverts — réutilisation classique)
+    extras = [c for c in extra_candidates if c]
+    if extras:
+        print(f"    [*] {len(extras)} candidat(s) issu(s) des étapes précédentes du pipeline")
+        for candidate in extras:
+            if _try_secret(candidate):
+                return candidate
+        if deadline is not None and time.time() > deadline:
+            print("    [!] Budget temps atteint — arrêt du cassage du secret "
+                  f"({tested:,} essais). Utilisez --deep pour continuer.")
+            raise ValueError("Budget temps atteint avant la fin des dictionnaires.")
+
+    # 2) wordlists (comportement du script original)
+    for wpath in wordlist_paths:
+        if not os.path.isfile(wpath):
+            continue
+        print(f"    [*] Lecture de la wordlist : {wpath}")
+        with open(wpath, "r", encoding="latin-1", errors="ignore") as f:
+            for line in f:
+                candidate = line.rstrip("\r\n")
+                if not candidate:
+                    continue
+                if _try_secret(candidate):
+                    return candidate
+                if deadline is not None and tested % 1000 == 0 and time.time() > deadline:
+                    print("    [!] Budget temps atteint — arrêt du cassage du secret "
+                          f"({tested:,} essais). Utilisez --deep pour continuer.")
+                    raise ValueError("Budget temps atteint avant la fin des dictionnaires.")
+
+    raise ValueError("Échec du cassage : le secret RADIUS ne figure pas dans les dictionnaires fournis.")
+
+# ==================================================================================================
+# 3. DÉCHIFFREMENT DES ATTRIBUTS MS-MPPE SELON LA RFC 2548 (EXTRACTION DU PMK)
+# ==================================================================================================
+
+def decrypt_mppe_attribute_rfc2548(encrypted_value: bytes, secret: bytes, req_authenticator: bytes) -> bytes:
+    """
+    Déchiffre un attribut Microsoft Vendor-Specific (MS-MPPE-Recv-Key / MS-MPPE-Send-Key).
+    RFC 2548 section 2.4.2 :
+    b(1) = MD5(Secret + Request-Authenticator + Salt)
+    p(1) = C_1 XOR b(1)
+    b(i) = MD5(Secret + C_(i-1))
+    p(i) = C_i XOR b(i)
+    Plaintext = Key-Length (1 octet) || Key || Padding (zeros)
+    """
+    if len(encrypted_value) < 18:
+        raise ValueError("Attribut MPPE trop court (< 18 octets)")
+    salt = encrypted_value[:2]
+    c_data = encrypted_value[2:]
+    
+    if len(c_data) % 16 != 0:
+        raise ValueError("Données chiffrées MPPE non alignées sur 16 octets")
+        
+    p = bytearray()
+    b_curr = hashlib.md5(secret + req_authenticator + salt).digest()
+    p.extend(bytes(x ^ y for x, y in zip(c_data[:16], b_curr)))
+    
+    for i in range(1, len(c_data) // 16):
+        c_prev = c_data[(i - 1) * 16 : i * 16]
+        c_curr = c_data[i * 16 : (i + 1) * 16]
+        b_curr = hashlib.md5(secret + c_prev).digest()
+        p.extend(bytes(x ^ y for x, y in zip(c_curr, b_curr)))
+        
+    key_len = p[0]
+    return bytes(p[1 : 1 + key_len])
+
+def extract_pmk_from_radius(radius_frames: List[ParsedRadiusFrame], secret_str: str) -> Tuple[bytes, Optional[bytes]]:
+    """Extrait et déchiffre le MS-MPPE-Recv-Key (PMK) et MS-MPPE-Send-Key depuis l'Access-Accept."""
+    secret_bytes = secret_str.encode("latin-1")
+    
+    # Identifier l'Access-Accept (Code 2)
+    acc_frame = next((p for p in reversed(radius_frames) if p.code == 2), None)
+    if not acc_frame:
+        raise ValueError("Aucune trame Access-Accept trouvée dans la capture RADIUS.")
+        
+    # Identifier l'Access-Request correspondant par identifiant
+    req_frame = next((p for p in radius_frames if p.code == 1 and p.identifier == acc_frame.identifier), None)
+    req_auth = req_frame.authenticator if req_frame else b"\x00" * 16
+
+    recv_key = None
+    send_key = None
+
+    for attr in acc_frame.attributes:
+        if attr.type == 26:  # Vendor-Specific
+            v_val = attr.raw_value
+            if len(v_val) >= 6:
+                vendor_id = struct.unpack("!I", v_val[:4])[0]
+                if vendor_id == 311:  # Microsoft Vendor-ID
+                    v_type = v_val[4]
+                    v_len = v_val[5]
+                    v_data = v_val[6 : 6 + v_len - 2]
+                    if v_type == 17:  # MS-MPPE-Recv-Key = PMK en 802.1X (RFC 5216)
+                        recv_key = decrypt_mppe_attribute_rfc2548(v_data, secret_bytes, req_auth)
+                    elif v_type == 16:  # MS-MPPE-Send-Key
+                        send_key = decrypt_mppe_attribute_rfc2548(v_data, secret_bytes, req_auth)
+
+    if not recv_key:
+        raise ValueError("Attribut MS-MPPE-Recv-Key (Type 17) introuvable dans la trame Access-Accept.")
+
+    return recv_key, send_key
+
+# ==================================================================================================
+# 4. HANDSHAKE 802.11, DÉRIVATION DU PTK & VÉRIFICATION DU MIC (IEEE 802.11i)
+# ==================================================================================================
+
+def prf512(key: bytes, label: str, data: bytes) -> bytes:
+    """
+    Fonction Pseudo-Aléatoire IEEE 802.11i PRF-512 :
+    R = HMAC-SHA1(K, Label || 0x00 || Data || 0) || HMAC-SHA1(K, Label || 0x00 || Data || 1) || ...
+    """
+    r = b""
+    prefix = label.encode("ascii") + b"\x00" + data
+    for i in range(4):
+        msg = prefix + bytes([i])
+        r += hmac.new(key, msg, hashlib.sha1).digest()
+    return r[:64]
+
+class EAPOLMessageExtracted:
+    def __init__(self, frame_num: int, src_mac: bytes, dst_mac: bytes,
+                 raw_eapol: bytes, key_info: int, replay: int,
+                 nonce: bytes, mic: bytes, key_data: bytes, msg_num: int):
+        self.frame_num = frame_num
+        self.src_mac = src_mac
+        self.dst_mac = dst_mac
+        self.raw_eapol = raw_eapol
+        self.key_info = key_info
+        self.replay = replay
+        self.nonce = nonce
+        self.mic = mic
+        self.key_data = key_data
+        self.msg_num = msg_num
+
+def strip_radiotap(data: bytes) -> bytes:
+    if len(data) >= 4 and data[0] == 0:
+        rt_len = struct.unpack("<H", data[2:4])[0]
+        if rt_len < len(data):
+            return data[rt_len:]
+    return data
+
+def parse_80211(data: bytes, frame_num: int) -> Optional[Dict[str, Any]]:
+    raw = strip_radiotap(data)
+    if len(raw) < 24:
+        return None
+
+    fc0, fc1 = raw[0], raw[1]
+    frame_type = (fc0 >> 2) & 0x03
+    frame_subtype = (fc0 >> 4) & 0x0f
+    to_ds = (fc1 & 0x01) != 0
+    from_ds = (fc1 & 0x02) != 0
+    is_protected = (fc1 & 0x40) != 0
+
+    addr1 = raw[4:10]
+    addr2 = raw[10:16]
+    addr3 = raw[16:22]
+
+    hdr_len = 30 if (to_ds and from_ds) else 24
+    is_qos = (frame_type == 2) and (frame_subtype & 0x08 != 0)
+    if is_qos:
+        hdr_len += 2
+
+    if len(raw) < hdr_len:
+        return None
+
+    return {
+        "frame_num": frame_num,
+        "type": frame_type,
+        "subtype": frame_subtype,
+        "to_ds": to_ds,
+        "from_ds": from_ds,
+        "is_protected": is_protected,
+        "is_qos": is_qos,
+        "addr1": addr1,
+        "addr2": addr2,
+        "addr3": addr3,
+        "hdr_len": hdr_len,
+        "raw_80211": raw,
+        "payload": raw[hdr_len:]
+    }
+
+def extract_handshake_from_pcap(filepath: str) -> Tuple[bytes, bytes, Dict[int, EAPOLMessageExtracted]]:
+    """Extrait dynamiquement l'AP MAC, Client MAC et les 4 messages EAPOL du handshake."""
+    link_type, packets = parse_pcap(filepath)
+    handshake = {}
+    ap_mac = None
+    client_mac = None
+
+    for pkt in packets:
+        parsed = parse_80211(pkt.data, pkt.frame_num)
+        if not parsed:
+            continue
+
+        payload = parsed["payload"]
+        # Détection SNAP Header EtherType 0x888E (802.1X EAPOL)
+        eapol_offset = payload.find(b"\xaa\xaa\x03\x00\x00\x00\x88\x8e")
+        if eapol_offset != -1:
+            eapol_start = eapol_offset + 8
+            eapol_data = payload[eapol_start:]
+            if len(eapol_data) < 4:
+                continue
+            eapol_ver, eapol_type, eapol_body_len = struct.unpack("!BBH", eapol_data[:4])
+            if eapol_type != 3:  # EAPOL-Key
+                continue
+            full_eapol = eapol_data[:4 + eapol_body_len]
+            if len(full_eapol) < 4 + 95:
+                continue
+
+            key_info = struct.unpack("!H", full_eapol[5:7])[0]
+            replay = struct.unpack("!Q", full_eapol[9:17])[0]
+            nonce = full_eapol[17:49]
+            mic = full_eapol[81:97]
+            key_data_len = struct.unpack("!H", full_eapol[97:99])[0]
+            key_data = full_eapol[99:99 + key_data_len]
+
+            key_ack = (key_info & 0x0080) != 0
+            key_mic = (key_info & 0x0100) != 0
+            key_secure = (key_info & 0x0200) != 0
+
+            msg_num = 0
+            if key_ack and not key_mic:
+                msg_num = 1
+                ap_mac = parsed["addr2"]
+                client_mac = parsed["addr1"]
+            elif not key_ack and key_mic and not key_secure:
+                msg_num = 2
+                client_mac = parsed["addr2"]
+                ap_mac = parsed["addr1"]
+            elif key_ack and key_mic:
+                msg_num = 3
+                ap_mac = parsed["addr2"]
+                client_mac = parsed["addr1"]
+            elif not key_ack and key_mic and key_secure:
+                msg_num = 4
+                client_mac = parsed["addr2"]
+                ap_mac = parsed["addr1"]
+
+            if msg_num != 0:
+                handshake[msg_num] = EAPOLMessageExtracted(
+                    pkt.frame_num, parsed["addr2"], parsed["addr1"],
+                    full_eapol, key_info, replay,
+                    nonce, mic, key_data, msg_num
+                )
+
+    if not ap_mac or not client_mac or 2 not in handshake:
+        raise ValueError("Impossible de reconstituer le handshake Wi-Fi depuis la capture.")
+
+    return ap_mac, client_mac, handshake
+
+def compute_ptk_and_verify_eapol_mic(pmk: bytes, ap_mac: bytes, client_mac: bytes,
+                                     anonce: bytes, snonce: bytes,
+                                     msg2_eapol: bytes) -> Tuple[bool, bytes, bytes, bytes, bytes]:
+    """
+    Dérive le PTK selon IEEE 802.11i et vérifie le MIC sur Message 2.
+    """
+    macs = min(ap_mac, client_mac) + max(ap_mac, client_mac)
+    nonces = min(anonce, snonce) + max(anonce, snonce)
+    ptk = prf512(pmk, "Pairwise key expansion", macs + nonces)
+    kck = ptk[:16]
+    kek = ptk[16:32]
+    tk = ptk[32:48]
+
+    # Mettre à zéro les 16 octets du MIC (offset 81)
+    zeroed_eapol = msg2_eapol[:81] + b"\x00" * 16 + msg2_eapol[81 + 16:]
+    computed_mic = hmac.new(kck, zeroed_eapol, hashlib.sha1).digest()[:16]
+    captured_mic = msg2_eapol[81 : 81 + 16]
+
+    return (computed_mic == captured_mic), ptk, kck, kek, tk
+
+# ==================================================================================================
+# 5. DÉCHIFFREMENT AES-CCMP EN PUR PYTHON (IEEE 802.11i / 802.11-2016)
+# ==================================================================================================
+
+SBOX = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
+]
+RCON = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
+
+def xtime(a: int) -> int:
+    return ((a << 1) ^ 0x1b) & 0xff if (a & 0x80) else (a << 1)
+
+def aes_key_expansion(key: bytes) -> List[int]:
+    w = list(key)
+    for i in range(4, 44):
+        temp = w[(i - 1) * 4 : i * 4]
+        if i % 4 == 0:
+            temp = [SBOX[temp[1]], SBOX[temp[2]], SBOX[temp[3]], SBOX[temp[0]]]
+            temp[0] ^= RCON[i // 4]
+        for j in range(4):
+            w.append(w[(i - 4) * 4 + j] ^ temp[j])
+    return w
+
+def aes_encrypt_block(block: bytes, round_keys: List[int]) -> bytes:
+    state = list(block)
+    for j in range(16):
+        state[j] ^= round_keys[j]
+    for r in range(1, 10):
+        state = [SBOX[b] for b in state]
+        state = [
+            state[0], state[5], state[10], state[15],
+            state[4], state[9], state[14], state[3],
+            state[8], state[13], state[2], state[7],
+            state[12], state[1], state[6], state[11]
+        ]
+        new_state = [0] * 16
+        for c in range(4):
+            i = c * 4
+            s0, s1, s2, s3 = state[i], state[i + 1], state[i + 2], state[i + 3]
+            new_state[i]     = xtime(s0) ^ xtime(s1) ^ s1 ^ s2 ^ s3
+            new_state[i + 1] = s0 ^ xtime(s1) ^ xtime(s2) ^ s2 ^ s3
+            new_state[i + 2] = s0 ^ s1 ^ xtime(s2) ^ xtime(s3) ^ s3
+            new_state[i + 3] = xtime(s0) ^ s0 ^ s1 ^ s2 ^ xtime(s3)
+        state = new_state
+        rk = round_keys[r * 16 : (r + 1) * 16]
+        for j in range(16):
+            state[j] ^= rk[j]
+    # Round 10
+    state = [SBOX[b] for b in state]
+    state = [
+        state[0], state[5], state[10], state[15],
+        state[4], state[9], state[14], state[3],
+        state[8], state[13], state[2], state[7],
+        state[12], state[1], state[6], state[11]
+    ]
+    rk = round_keys[160:176]
+    for j in range(16):
+        state[j] ^= rk[j]
+    return bytes(state)
+
+def decrypt_ccmp_frame(tk: bytes, addr2: bytes, payload: bytes, priority: int = 0) -> bytes:
+    """Déchiffre le payload CCMP d'une trame 802.11 protégée en mode AES-CTR."""
+    if len(payload) < 16:
+        return b""
+    ccmp_hdr = payload[:8]
+    cipher_and_mic = payload[8:]
+    if len(cipher_and_mic) < 8:
+        return b""
+    ciphertext = cipher_and_mic[:-8]  # Retrait du MIC CCMP (8 octets)
+    
+    pn0, pn1, res, keyid, pn2, pn3, pn4, pn5 = ccmp_hdr
+    pn_bytes = bytes([pn5, pn4, pn3, pn2, pn1, pn0])
+    nonce = bytes([priority & 0x0f]) + addr2 + pn_bytes
+    
+    round_keys = aes_key_expansion(tk)
+    plaintext = bytearray()
+    
+    total_blocks = (len(ciphertext) + 15) // 16
+    for block_idx in range(1, total_blocks + 1):
+        ctr_block = bytes([0x01]) + nonce + struct.pack(">H", block_idx)
+        keystream = aes_encrypt_block(ctr_block, round_keys)
+        start = (block_idx - 1) * 16
+        end = min(start + 16, len(ciphertext))
+        for k in range(start, end):
+            plaintext.append(ciphertext[k] ^ keystream[k - start])
+            
+    return bytes(plaintext)
+
+def decrypt_all_protected_data(filepath: str, tk: bytes) -> List[Tuple[int, bytes]]:
+    """Déchiffre l'ensemble des trames de données protégées dans le PCAP."""
+    link_type, packets = parse_pcap(filepath)
+    decrypted = []
+
+    for pkt in packets:
+        parsed = parse_80211(pkt.data, pkt.frame_num)
+        if not parsed:
+            continue
+        if parsed["type"] == 2 and parsed["is_protected"]:  # Data chiffrée
+            addr2 = parsed["addr2"]
+            payload = parsed["payload"]
+            priority = 0
+            if parsed["is_qos"] and len(parsed["raw_80211"]) >= parsed["hdr_len"]:
+                qos_ctrl = struct.unpack("<H", parsed["raw_80211"][parsed["hdr_len"] - 2 : parsed["hdr_len"]])[0]
+                priority = qos_ctrl & 0x07
+            plain = decrypt_ccmp_frame(tk, addr2, payload, priority)
+            if plain:
+                decrypted.append((pkt.frame_num, plain))
+
+    return decrypted
+
+# ==================================================================================================
+# 7. ORCHESTRATEUR PRINCIPAL DU SOLVEUR
+# ==================================================================================================
+
+def locate_files(directory: str) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """Localise automatiquement les fichiers RADIUS, Wi-Fi et les wordlists."""
+    rad_file = None
+    wifi_file = None
+    wordlists = []
+
+    for root, _, files in os.walk(directory):
+        for f in files:
+            full = os.path.join(root, f)
+            lower = f.lower()
+            if lower.endswith((".pcap", ".pcapng", ".cap")):
+                try:
+                    r = extract_radius_packets_from_pcap(full)
+                    if len(r) > 0:
+                        rad_file = full
+                        continue
+                except Exception:
+                    pass
+                try:
+                    ap, cli, hs = extract_handshake_from_pcap(full)
+                    if len(hs) > 0:
+                        wifi_file = full
+                        continue
+                except Exception:
+                    pass
+            elif lower.endswith(".txt") or "rockyou" in lower or "radius" in lower:
+                wordlists.append(full)
+
+    return rad_file, wifi_file, wordlists
+
+
+def run_wpa2e_solver(*, rad=None, wifi=None, directory=None, wordlists=None,
+                     deep=False, budget_s=None, extra_candidates=()):
+    """Sous-code 2 — solveur WPA2-Enterprise/RADIUS en fonction appelable.
+
+    Enchaînement d'origine (100 % dynamique, aucune valeur codée en dur) :
+    trames RADIUS → secret partagé (HMAC-MD5 sur Message-Authenticator) →
+    PMK (MS-MPPE-Recv-Key, RFC 2548) → handshake 4-way (AP/client/ANonce/
+    SNonce) → PTK (PRF-512) + vérification du MIC M2 → déchiffrement
+    AES-CCMP → preuves textuelles (chaînes imprimables du trafic déchiffré).
+
+    Paramètres
+    ----------
+    rad / wifi : captures RADIUS et Wi-Fi (le pipeline passe la même capture ;
+        ce sont deux fichiers distincts dans le cas d'origine).
+    directory  : dossier à sonder via locate_files() — mode deep uniquement
+        (comportement du script standalone : découvre une capture RADIUS ou
+        Wi-Fi voisine et les wordlists du dossier).
+    wordlists  : dictionnaires pour le secret RADIUS (filtrés : existants).
+    extra_candidates : candidats testés AVANT les dictionnaires (mots de
+        passe transmis par les étapes précédentes du pipeline).
+    deep       : False → budget temps sur le cassage du secret ;
+        True → aucun budget + wordlists système usuels (rockyou…) + sondage
+        du dossier, comme le script original.
+
+    Les sys.exit()/arrêts brutaux d'origine sont remplacés par des statuts
+    explicites dans SolverOutcome (found / partial / not_found /
+    not_applicable / error) ; le pipeline n'est jamais interrompu.
+    """
+    t_start = time.time()
+    fr = get_lang() == "fr"
+    deadline = None if deep else (t_start + (budget_s or SOLVE_DEFAULT_BUDGET))
+    wordlists = [w for w in (wordlists or []) if w and os.path.isfile(w)]
+    findings: Dict[str, Any] = {}
+
+    print("=" * 80)
+    print("      SOLVEUR UNIVERSEL WPA2-ENTERPRISE / RADIUS (100% DYNAMIQUE)")
+    print("=" * 80)
+
+    rad_pcap = rad if (rad and os.path.isfile(rad)) else None
+    wifi_pcap = wifi if (wifi and os.path.isfile(wifi)) else None
+
+    # --- Détection d'applicabilité (pas de sys.exit : statuts explicites) ---
+    rad_frames: List[ParsedRadiusFrame] = []
+    if rad_pcap:
+        try:
+            rad_frames = extract_radius_packets_from_pcap(rad_pcap)
+        except (ValueError, OSError) as exc:
+            findings["radius_parse_error"] = str(exc)
+
+    hs_info = None
+    if wifi_pcap:
+        try:
+            hs_info = extract_handshake_from_pcap(wifi_pcap)
+        except ValueError:
+            hs_info = None
+        except OSError as exc:
+            findings["wifi_parse_error"] = str(exc)
+
+    # Mode profond + dossier connu : découverte des captures voisines
+    # (locate_files, comme le script standalone lancé sur un dossier).
+    if deep and directory and (not rad_frames or hs_info is None):
+        auto_rad, auto_wifi, auto_words = locate_files(directory)
+        for w in auto_words:
+            if w not in wordlists:
+                wordlists.append(w)
+        if not rad_frames and auto_rad:
+            rad_pcap = auto_rad
+            try:
+                rad_frames = extract_radius_packets_from_pcap(rad_pcap)
+            except (ValueError, OSError):
+                rad_frames = []
+        if hs_info is None and auto_wifi:
+            wifi_pcap = auto_wifi
+            try:
+                hs_info = extract_handshake_from_pcap(wifi_pcap)
+            except (ValueError, OSError):
+                hs_info = None
+
+    if not rad_frames and hs_info is None:
+        return SolverOutcome(
+            "wpa2e", "not_applicable",
+            summary=("aucune trame RADIUS ni handshake EAPOL 4-way dans la capture"
+                     if fr else "no RADIUS frame nor EAPOL 4-way handshake in capture"),
+            findings=findings, elapsed=time.time() - t_start)
+
+    # Mode profond : wordlists système usuels (liste d'origine du script)
+    if deep:
+        base_dir = directory or os.path.dirname(
+            os.path.abspath(rad_pcap or wifi_pcap or ".")) or "."
+        for sl in (os.path.join(base_dir, "rockyou.txt"),
+                   os.path.join(base_dir, "radius.txt"),
+                   "/usr/share/wordlists/rockyou.txt",
+                   "C:\\rockyou.txt"):
+            if os.path.isfile(sl) and sl not in wordlists:
+                wordlists.append(sl)
+
+    print("\n[1] Fichiers utilisés :")
+    print(f"    - Capture RADIUS : {rad_pcap if rad_frames else 'NON TROUVÉE'}")
+    print(f"    - Capture Wi-Fi  : {wifi_pcap if hs_info is not None else 'NON TROUVÉE'}")
+    print(f"    - Wordlists      : {len(wordlists)} wordlist(s) détectée(s)")
+    extras = [c for c in extra_candidates if c]
+    if extras:
+        print(f"    - Candidats transmis par les étapes précédentes : {len(extras)}")
+
+    # --- 1. RADIUS : cassage du secret partagé ---
+    secret = None
+    if not rad_frames:
+        print("\n[!] Aucune trame RADIUS dans cette capture — étapes secret/PMK ignorées.")
+    else:
+        print(f"\n[2] Analyse dynamique du trafic RADIUS ({os.path.basename(rad_pcap)})...")
+        print(f"    [+] {len(rad_frames)} trames RADIUS extraites.")
+        for p in rad_frames:
+            print(f"        * Trame #{p.frame_num:2d} : {p.code_name} (ID: {p.identifier}, {p.length} octets)")
+        print("\n[3] Cassage du secret partagé RADIUS via Message-Authenticator...")
+        try:
+            secret = crack_radius_secret_from_capture(
+                rad_frames, wordlists,
+                extra_candidates=extra_candidates, deadline=deadline)
+            findings["radius_secret"] = secret
+        except ValueError as exc:
+            findings["radius_secret_error"] = str(exc)
+            print(f"    [-] {exc}")
+
+    # --- 2. Déchiffrement RFC 2548 (MS-MPPE-Recv-Key / PMK) ---
+    pmk = None
+    if secret:
+        print("\n[4] Déchiffrement des attributs MS-MPPE selon la RFC 2548...")
+        try:
+            recv_key, send_key = extract_pmk_from_radius(rad_frames, secret)
+            pmk = recv_key
+            findings["pmk"] = pmk.hex()
+            print(f"    [+] MS-MPPE-Recv-Key (PMK) : {pmk.hex()}")
+            if send_key:
+                findings["send_key"] = send_key.hex()
+                print(f"    [+] MS-MPPE-Send-Key      : {send_key.hex()}")
+        except ValueError as exc:
+            findings["pmk_error"] = str(exc)
+            print(f"    [-] {exc}")
+
+    # --- 3..6. Handshake / PTK / MIC / AES-CCMP ---
+    mic_ok = False
+    decrypted_count = 0
+    evidence = []
+    if hs_info is None:
+        print("\n[!] Aucun handshake 4-way exploitable — étapes PTK/CCMP ignorées.")
+    elif pmk is None:
+        print("\n[!] PMK indisponible (secret RADIUS non cassé ou MS-MPPE absent) — étapes PTK/CCMP ignorées.")
+    else:
+        ap_mac, client_mac, handshake = hs_info
+        print(f"\n[5] Analyse dynamique de la capture Wi-Fi ({os.path.basename(wifi_pcap)})...")
+        print(f"    [+] AP MAC     : {':'.join(f'{b:02x}' for b in ap_mac)}")
+        print(f"    [+] Client MAC : {':'.join(f'{b:02x}' for b in client_mac)}")
+        print(f"    [+] Messages 4-way handshake identifiés : {list(handshake.keys())}")
+
+        anonce = None
+        if 1 in handshake:
+            anonce = handshake[1].nonce
+        elif 3 in handshake:
+            anonce = handshake[3].nonce
+        if anonce is None or 2 not in handshake:
+            print("    [-] ANonce (message 1/3) ou message 2 manquant — étapes PTK/CCMP ignorées.")
+            findings["handshake_incomplete"] = sorted(handshake.keys())
+        else:
+            snonce = handshake[2].nonce
+            msg2_raw = handshake[2].raw_eapol
+            print(f"    [+] ANonce : {anonce.hex()}")
+            print(f"    [+] SNonce : {snonce.hex()}")
+
+            print("\n[6] Dérivation du PTK (PRF-512 IEEE 802.11i) et validation du MIC...")
+            mic_ok, ptk, kck, kek, tk = compute_ptk_and_verify_eapol_mic(
+                pmk, ap_mac, client_mac, anonce, snonce, msg2_raw)
+            print(f"    [+] KCK : {kck.hex()}")
+            print(f"    [+] KEK : {kek.hex()}")
+            print(f"    [+] TK  : {tk.hex()}")
+            print(f"    [+] MIC Verification : {'VALIDE (OK)' if mic_ok else 'ÉCHEC'}")
+            findings.update({
+                "ap_mac": ":".join(f"{b:02x}" for b in ap_mac),
+                "client_mac": ":".join(f"{b:02x}" for b in client_mac),
+                "anonce": anonce.hex(),
+                "snonce": snonce.hex(),
+                "kck": kck.hex(),
+                "kek": kek.hex(),
+                "tk": tk.hex(),
+                "mic_ok": mic_ok,
+            })
+
+            if mic_ok:
+                print("\n[7] Déchiffrement des trames de données Wi-Fi (AES-CCMP en pur Python)...")
+                decrypted_frames = decrypt_all_protected_data(wifi_pcap, tk)
+                decrypted_count = len(decrypted_frames)
+                findings["decrypted_frames"] = decrypted_count
+                print(f"    [+] {decrypted_count} trames protégées déchiffrées avec succès.")
+
+                all_payloads = [pl for _, pl in decrypted_frames]
+
+                print("\n[8] Extraction des preuves textuelles dans le trafic décapsulé...")
+                for _pl in all_payloads:
+                    for _s in engine_extract_strings(_pl):
+                        if _s not in evidence:
+                            evidence.append(_s)
+                evidence = evidence[:200]
+                print(f"    [+] {len(evidence)} chaîne(s) imprimable(s) extraite(s).")
+            else:
+                # §42 (run réel v1.0) : MIC en échec = le PMK ne correspond
+                # pas à CE handshake — le « déchiffrement » CCMP ne produirait
+                # que du bruit. Aucune donnée n'est affirmée sans clé vérifiée.
+                print("\n[7] MIC NON vérifié — le PMK ne valide pas ce handshake :")
+                print("    déchiffrement NON effectué (§42 : rien n'est affirmé "
+                      "sans clé vérifiée cryptographiquement).")
+
+    # --- Rapport final (bloc d'origine) ---
+    print("\n" + "=" * 80)
+    print("                     RAPPORT FINAL DE RÉSOLUTION")
+    print("=" * 80)
+    if secret:
+        print(f"[+] RADIUS secret: {secret}")
+    if pmk is not None:
+        print(f"[+] PMK: {pmk.hex()}")
+    for k, label in (("ap_mac", "AP"), ("client_mac", "Client"), ("anonce", "ANonce"),
+                     ("snonce", "SNonce"), ("kck", "KCK"), ("kek", "KEK"), ("tk", "TK")):
+        if k in findings:
+            print(f"[+] {label}: {findings[k]}")
+    if "mic_ok" in findings:
+        print(f"[+] MIC verification: {'VERIFIED (OK)' if findings['mic_ok'] else 'FAILED'}")
+    if evidence:
+        findings["evidence_strings"] = evidence
+        print(f"[+] Preuves textuelles : {len(evidence)} chaîne(s) dans les trames déchiffrées")
+        for _s in evidence[:5]:
+            print(f"    | {_s[:100]}")
+    elif decrypted_count:
+        print("[*] Aucune chaîne imprimable exploitable dans les trames déchiffrées.")
+    print("=" * 80)
+
+    # --- Statut structuré ---
+    if mic_ok:
+        status = "found"
+        summary = (("PMK validé (MIC OK) — %d trame(s) déchiffrée(s)" % decrypted_count) if fr
+                   else ("PMK verified (MIC OK) — %d frame(s) decrypted" % decrypted_count))
+    elif secret or pmk is not None:
+        status = "partial"
+        summary = (("secret RADIUS cassé mais handshake/PMK inexploitable"
+                    if secret and pmk is None else
+                    "secret RADIUS cassé, MIC non vérifié") if fr
+                   else ("RADIUS secret cracked but handshake/PMK unusable"
+                         if secret and pmk is None else
+                         "RADIUS secret cracked, MIC not verified"))
+    else:
+        status = "not_found"
+        summary = (("secret RADIUS non cassé (dictionnaires épuisés ou budget atteint)"
+                    if rad_frames else "handshake présent mais PMK indisponible") if fr
+                   else ("RADIUS secret not cracked (dictionaries exhausted or budget reached)"
+                         if rad_frames else "handshake present but PMK unavailable"))
+    return SolverOutcome("wpa2e", status, summary=summary, findings=findings,
+                         elapsed=time.time() - t_start)
+
+
+# ==============================================================================================
+#  SOUS-CODE 3/4 — CASSEUR WEP-40 AUTOMATIQUE (intégré depuis wep_crack_auto.py)
+# ==============================================================================================
+"""
+================================================================================
+ wep_crack_auto.py  -  Cassage WEP-40 100 % AUTOMATIQUE a partir d'un seul .cap
+================================================================================
+
+Usage (Windows) :
+    py wep_crack_auto.py ch10.cap
+
+Aucune dependance (bibliotheque standard Python uniquement), aucun aircrack,
+aucun dictionnaire obligatoire.
+
+Principe (pourquoi ca marche la ou FMS/KoreK/PTW et rockyou echouent)
+--------------------------------------------------------------------------------
+Toute trame de donnees 802.11 WEP commence par l'en-tete LLC/SNAP :
+
+    octet 0 = 0xAA,  octet 1 = 0xAA,  octet 2 = 0x03      (CLAIR CONNU)
+
+On connait donc, pour CHAQUE IV, les 3 premiers octets du keystream RC4 :
+
+    ks[0] = cipher[0] XOR 0xAA
+    ks[1] = cipher[1] XOR 0xAA
+    ks[2] = cipher[2] XOR 0x03
+
+Tester une cle candidate de 5 octets = executer RC4( IV || cle ) et comparer
+ces 3 octets. Une fausse cle passe avec une probabilite 1/256^3 (~6e-8) ; la
+cle correcte est ensuite CONFIRMEE par verification de l'ICV (CRC32) sur de
+nombreuses trames a IV distincts (probabilite de fausse positive ~2^-32 par
+trame : impossible d'annoncer une mauvaise cle).
+
+Le script :
+  1. parse le pcap (linktype 105, et 119/Prism, 127/Radiotap) ;
+  2. extrait les trames data WEP, choisit le reseau (BSSID) principal ;
+  3. prend l'IV le plus frequent (requete ARP rejouee, plaintext constant)
+     comme filtre rapide ;
+  4. force brute les cles sur des alphabets reduits, du plus petit/ probable
+     au plus grand, en multiprocessement (Windows-safe) ;
+  5. valide par ICV/CRC32 et affiche la cle ASCII + HEX.
+
+Alphabets testes automatiquement (ordre de cout croissant) :
+  chiffres -> hex -> MINUSCULES -> MAJUSCULES -> min+chiffres -> MAJ+chiffres
+  -> lettres mixtes -> alphanumerique complet.
+================================================================================
+"""
+
+
+# ------------------------------------------------------------------ constantes
+LLC = b"\xAA\xAA\x03"          # 3 premiers octets de clair CONNUS
+
+ALPHABETS = [
+    ("chiffres (0-9)",                    b"0123456789"),
+    ("hexadecimal (0-9a-f)",              b"0123456789abcdef"),
+    ("MINUSCULES (a-z)",                  b"abcdefghijklmnopqrstuvwxyz"),
+    ("MAJUSCULES (A-Z)",                  b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    ("minuscules + chiffres",             b"abcdefghijklmnopqrstuvwxyz0123456789"),
+    ("MAJUSCULES + chiffres",             b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
+    ("lettres min+MAJ",                   b"abcdefghijklmnopqrstuvwxyz"
+                                          b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+    ("alphanumerique complet",            b"abcdefghijklmnopqrstuvwxyz"
+                                          b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
+]
+
+PCAP_MAGICS = {
+    b"\xD4\xC3\xB2\xA1": "<",
+    b"\xA1\xB2\xC3\xD4": ">",
+    b"\x4D\x3C\xB2\xA1": "<",
+    b"\xA1\xB2\x3C\x4D": ">",
+}
+
+
+# ============================================================ parsing du pcap
+def lire_pcap(chemin):
+    with open(chemin, "rb") as f:
+        data = f.read()
+    if len(data) < 24:
+        raise ValueError("Fichier trop petit pour un pcap.")
+    magic = bytes(data[:4])
+    if magic == b"\x0A\x0D\x0D\x0A":
+        raise ValueError("pcapng non supporte (convertir en pcap classique).")
+    if magic not in PCAP_MAGICS:
+        raise ValueError("Magic PCAP inconnu : %r" % magic)
+    endian = PCAP_MAGICS[magic]
+    (_m, _vmaj, _vmin, _tz, _sf, _snap, linktype) = struct.unpack(
+        endian + "IHHIIII", data[:24])
+    off, n, paquets = 24, len(data), []
+    while off + 16 <= n:
+        _ts, _tu, incl, _orig = struct.unpack(endian + "IIII", data[off:off + 16])
+        off += 16
+        paquets.append((linktype, bytes(data[off:off + incl])))
+        off += incl
+    return paquets
+
+
+def enlever_entete_radio(linktype, pkt):
+    if linktype == 105:
+        return pkt
+    if linktype == 119 and len(pkt) >= 8:           # Prism
+        h = struct.unpack("<I", pkt[4:8])[0]
+        return pkt[h:] if 0 < h <= len(pkt) else pkt
+    if linktype == 127 and len(pkt) >= 4:           # Radiotap
+        h = struct.unpack("<H", pkt[2:4])[0]
+        return pkt[h:] if 0 < h <= len(pkt) else pkt
+    return pkt
+
+
+def extraire_trame_wep(frame):
+    """Retourne (iv, flux_chiffre) si trame data WEP exploitable, sinon None.
+    flux_chiffre = RC4( plaintext || ICV )  (le corps apres IV + octet KeyID)."""
+    if len(frame) < 24:
+        return None
+    fc = struct.unpack("<H", frame[0:2])[0]
+    if ((fc >> 2) & 3) != 2:            # type data
+        return None
+    if not ((fc >> 14) & 1):            # bit Protected (WEP)
+        return None
+    tods, fromds = (fc >> 8) & 1, (fc >> 9) & 1
+    hdrlen = 30 if (tods and fromds) else 24
+    if ((fc >> 4) & 0xF) in (8, 12):    # QoS Data / QoS Null
+        hdrlen += 2
+    # Adressage 802.11 : Addr1=4:10, Addr2=10:16, Addr3=16:22.
+    #   ToDS=1,FromDS=0 (station->AP) : BSSID = Addr1
+    #   ToDS=0,FromDS=1 (AP->station) : BSSID = Addr2
+    #   WDS / IBDS                     : BSSID = Addr3
+    if tods and not fromds:
+        bssid = frame[4:10]
+    elif fromds and not tods:
+        bssid = frame[10:16]
+    else:
+        bssid = frame[16:22]
+    body = frame[hdrlen:]
+    if len(body) < 8:
+        return None
+    if body[3] & 0x20:                  # ExtIV=1 → TKIP/CCMP, jamais WEP.
+        return None                     # Intégration : anti faux positifs WPA
+    iv = bytes(body[0:3])               # (brute force RC4 inutile sur CCMP).
+    flux = bytes(body[4:])              # RC4(plaintext || ICV)
+    if len(flux) < 8:
+        return None
+    return iv, flux, bssid
+
+
+# ============================================================ RC4 / CRC
+def ksa_et_3_octets(cle8, c0, c1, c2):
+    """RC4 KSA(cle de 8 octets) puis 3 tours PRGA -> (z0,z1,z2).
+    Entierement inline pour la performance (appel pour chaque candidate)."""
+    S = list(range(256))
+    j = 0
+    k0, k1, k2, k3, k4, k5, k6, k7 = cle8
+    K = (k0, k1, k2, k3, k4, k5, k6, k7)
+    for i in range(256):
+        j = (j + S[i] + K[i & 7]) & 0xFF
+        S[i], S[j] = S[j], S[i]
+    # PRGA tour 1
+    j = S[1]
+    S[1], S[j] = S[j], S[1]
+    z0 = S[(S[1] + S[j]) & 0xFF]
+    if z0 != c0:
+        return None
+    # tour 2
+    j = (j + S[2]) & 0xFF
+    S[2], S[j] = S[j], S[2]
+    z1 = S[(S[2] + S[j]) & 0xFF]
+    if z1 != c1:
+        return None
+    # tour 3
+    j = (j + S[3]) & 0xFF
+    S[3], S[j] = S[j], S[3]
+    z2 = S[(S[3] + S[j]) & 0xFF]
+    if z2 != c2:
+        return None
+    return (z0, z1, z2)
+
+
+def rc4_ksa(cle):
+    S = list(range(256))
+    j = 0
+    L = len(cle)
+    for i in range(256):
+        j = (j + S[i] + cle[i % L]) & 0xFF
+        S[i], S[j] = S[j], S[i]
+    return S
+
+
+def rc4_flux(S, n):
+    S = S[:]
+    i = j = 0
+    out = bytearray(n)
+    for t in range(n):
+        i = (i + 1) & 0xFF
+        j = (j + S[i]) & 0xFF
+        S[i], S[j] = S[j], S[i]
+        out[t] = S[(S[i] + S[j]) & 0xFF]
+    return bytes(out)
+
+
+def valider_cle(cle, trames, maxi=80):
+    """Verifie la cle : ICV/CRC32 sur de nombreuses trames a IV distincts."""
+    n_icv = 0
+    vus = set()
+    testees = 0
+    for item in trames:
+        iv, flux = item[0], item[1]
+        if iv in vus:
+            continue
+        vus.add(iv)
+        testees += 1
+        if testees > maxi:
+            break
+        blob = bytes(a ^ b for a, b in zip(flux, rc4_flux(rc4_ksa(iv + cle),
+                                                          len(flux))))
+        plain, icv = blob[:-4], struct.unpack("<I", blob[-4:])[0]
+        if (zlib.crc32(plain) & 0xFFFFFFFF) == icv:
+            n_icv += 1
+    return n_icv, testees
+
+
+# ============================================================ worker brute
+def _worker(tache):
+    (iv0, iv1, iv2, z0, z1, z2, alpha, premiers) = tache
+    A = [b for b in alpha]
+    n = len(A)
+    cle8 = [iv0, iv1, iv2, 0, 0, 0, 0, 0]
+    trouves = []
+    for i0 in premiers:
+        cle8[3] = i0
+        for p1 in range(n):
+            cle8[4] = A[p1]
+            for p2 in range(n):
+                cle8[5] = A[p2]
+                for p3 in range(n):
+                    cle8[6] = A[p3]
+                    for p4 in range(n):
+                        cle8[7] = A[p4]
+                        if ksa_et_3_octets(cle8, z0, z1, z2) is not None:
+                            trouves.append(bytes((i0, A[p1], A[p2], A[p3], A[p4])))
+    return trouves
+
+
+# ============================================================ pipeline auto
+def _wep_prepare(chemin):
+    """Parse le pcap, choisit le réseau (BSSID) principal et l'IV dominant.
+
+    Retourne (t0, trames, bssid, reseau, iv_dom, flux_dom, freq), ou None si
+    aucune trame WEP exploitable. Première moitié de casser() — découpage
+    sans aucun changement de comportement ni de messages.
+    """
+    print("=" * 70)
+    print(" WEP-40 AUTOMATIQUE  -  %s" % os.path.basename(chemin))
+    print("=" * 70)
+    t0 = time.time()
+
+    paquets = lire_pcap(chemin)
+    print("[+] Paquets lus : %d" % len(paquets))
+
+    trames = []
+    for linktype, pkt in paquets:
+        w = extraire_trame_wep(enlever_entete_radio(linktype, pkt))
+        if w:
+            trames.append(w)
+    print("[+] Trames WEP data : %d" % len(trames))
+    if not trames:
+        print("[-] Aucune trame WEP exploitable.")
+        return None
+
+    # Reseau (BSSID) principal
+    par_bssid = defaultdict(list)
+    for iv, flux, bssid in trames:
+        par_bssid[bssid].append((iv, flux))
+    bssid, reseau = max(par_bssid.items(), key=lambda kv: len(kv[1]))
+
+    # IV le plus frequent : requete ARP rejouee (plaintext LLC constant).
+    freq = Counter(iv for iv, _ in reseau)
+    iv_dom = freq.most_common(1)[0][0]
+    flux_dom = next(f for iv, f in reseau if iv == iv_dom)
+    print("[+] Reseau BSSID : %s | IV dominant : %s (%d trames)"
+          % (":".join("%02X" % x for x in bssid),
+             iv_dom.hex().upper(), freq[iv_dom]))
+    return t0, trames, bssid, reseau, iv_dom, flux_dom, freq
+
+def _wep_affiche_found(cle, n_icv, testees, t0):
+    """Bloc « WEP KEY FOUND » du script original — factorisé tel quel :
+    l'échelle d'alphabets et le niveau wordlist l'affichent à l'identique."""
+    dt = time.time() - t0
+    print("\n" + "=" * 70)
+    print(" WEP KEY FOUND")
+    print("=" * 70)
+    ascii_ok = all(32 <= b < 127 for b in cle)
+    print("[+] Key ASCII : %s" % (cle.decode("latin-1")
+                                 if ascii_ok else "(non affichable)"))
+    print("[+] Key HEX   : %s" % " ".join("%02X" % b for b in cle))
+    print("[+] Key HEX compact : %s" % cle.hex().upper())
+    print("[+] Valid frames : %d / %d (ICV CRC32)" % (n_icv, testees))
+    print("[+] Confidence : HIGH")
+    print("[+] Trouvee en %.1f s" % dt)
+
+def _wep_attack(chemin, prep, alphabets, deadline=None, cores=None):
+    """Force brute (alphabets donnés, coût croissant) + validation ICV.
+
+    Seconde moitié de casser() — messages et logique identiques. Ajouts pour
+    le pipeline : ``deadline`` (instant time.time() limite du mode rapide ;
+    None = aucune limite, comportement du script original) et ``cores``
+    (nombre de cœurs CPU ; None = tous, comportement historique).
+    Retourne la cle (bytes) ou None.
+    """
+    t0, trames, bssid, reseau, iv_dom, flux_dom, freq = prep
+
+    # 3 octets de keystream CONNUS sur l'IV dominant (LLC = AA AA 03).
+    z0 = flux_dom[0] ^ 0xAA
+    z1 = flux_dom[1] ^ 0xAA
+    z2 = flux_dom[2] ^ 0x03
+
+    try:
+        nproc = max(1, int(cores or 0) or (os.cpu_count() or 2))
+    except (TypeError, ValueError):
+        nproc = max(1, (os.cpu_count() or 2))
+    print("[+] Coeurs utilises : %d" % nproc)
+
+    for nom, alpha in alphabets:
+        if deadline is not None and time.time() > deadline:
+            print("\n[!] Budget temps atteint avant l'alphabet '%s' — arrêt."
+                  " Relancez avec --deep (aucune limite)." % nom)
+            return None
+        nA = len(alpha)
+        total = nA ** 5
+        print("\n[+] Alphabet : %-28s (%d^5 = %d cles)" % (nom, nA, total))
+        chars = list(alpha)
+        # Repartition par le 1er octet de cle entre les coeurs.
+        parts = [chars[i::nproc] for i in range(nproc)]
+        taches = [(iv_dom[0], iv_dom[1], iv_dom[2], z0, z1, z2,
+                   alpha, part) for part in parts if part]
+        tb = time.time()
+        candidats = []
+        try:
+            import multiprocessing as mp
+            ctx = mp.get_context("spawn")     # Windows-safe
+            with ctx.Pool(processes=nproc) as pool:
+                nfaits = 0
+                for res in pool.imap_unordered(_worker, taches):
+                    candidats.extend(res)
+                    nfaits += 1
+                    pct = 100.0 * nfaits / len(taches)
+                    vit = (pct / 100.0) * total / max(1e-9, time.time() - tb)
+                    print("\r    progression %5.1f %%  (~%d cles/s)      "
+                          % (pct, vit), end="", flush=True)
+                    if deadline is not None and time.time() > deadline:
+                        print("\n[!] Budget temps atteint (~%d cles/s) — arrêt."
+                              " Relancez avec --deep." % vit)
+                        pool.terminate()
+                        return None
+        except Exception as e:
+            print("    (multiprocessing indisponible : %s -> mode sequentiel)" % e)
+            for t in taches:
+                candidats.extend(_worker(t))
+                if deadline is not None and time.time() > deadline:
+                    print("\n[!] Budget temps atteint — arrêt (mode séquentiel)."
+                          " Relancez avec --deep.")
+                    return None
+        print("")
+
+        # Validation ICV de chaque candidate ayant passe le filtre 3 octets.
+        for cle in candidats:
+            n_icv, testees = valider_cle(cle, reseau)
+            if n_icv >= 3:
+                _wep_affiche_found(cle, n_icv, testees, t0)
+                return cle
+        print("    -> aucune (%d candidates au filtre, %.0f cles/s)"
+              % (len(candidats), total / max(1e-9, time.time() - tb)))
+
+    print("\n[-] Aucune cle WEP-40 dans les alphabets reduits.")
+    print("    Pour une cle ASCII quelconque (95^5), lancer avec PyPy :")
+    print("      pypy wep_crack_auto.py %s   (plus long)" % chemin)
+    return None
+
+def _wep_wl_worker(tache):
+    """Ouvrier du niveau wordlist (v1.1) : filtre 3 octets (keystream LLC
+    connu sur l'IV dominant) sur un bloc de clés candidates. Top-level pour
+    être picklable (contexte spawn, Windows-safe)."""
+    iv0, iv1, iv2, z0, z1, z2, cles = tache
+    cle8_prefix = bytes((iv0, iv1, iv2))
+    ok = []
+    for cle in cles:
+        if ksa_et_3_octets(cle8_prefix + cle, z0, z1, z2) is not None:
+            ok.append(cle)
+    return ok
+
+
+def _wep_attack_wordlist(prep, wordlist_path, deadline=None, cores=None):
+    """Niveau wordlist (intégration v3) : teste les clés candidates d'un
+    fichier AVANT l'échelle d'alphabets du sous-code — celle-ci reste
+    inchangée et n'est lancée que si ce niveau échoue.
+
+    Entrées acceptées : 5 caractères ASCII imprimables (= clé WEP-40 telle
+    quelle) ou 10 chiffres hexadécimaux. Validation identique au sous-code :
+    filtre 3 octets (ksa_et_3_octets sur l'IV dominant, LLC AA AA 03) puis
+    ICV CRC32 (valider_cle, >= 3 trames). Retourne la clé (bytes) ou None.
+    """
+    t0, trames, bssid, reseau, iv_dom, flux_dom, freq = prep
+    # Bug du run réel Windows n°2 (build 18695, ch10.cap) :
+    #   ValueError: not enough values to unpack (expected 8, got 7)
+    # Cause : bytes.fromhex() ignore les espaces ASCII depuis Python 3.7 —
+    # une entrée rockyou de 10 caractères avec espaces internes (ex.
+    # « 12 34 5678 ») donnait 4 octets au lieu de 5 → cle8 = 7 octets →
+    # crash du déballage k0..k7 dans ksa_et_3_octets. Garde stricte : seuls
+    # 10 caractères 100 % hexadécimaux (sans espace) sont acceptés, et un
+    # filtre final impose exactement 5 octets par candidate.
+    # Lecture en BINAIRE + latin-1 : fidèle aux octets du fichier, aucune
+    # entrée exotique (UTF-8 invalide, thaï, accents…) ne peut lever
+    # d'exception de décodage ou d'encodage (§30 : ignoré proprement).
+    try:
+        with open(wordlist_path, "rb") as f:
+            entrees = [l.decode("latin-1").strip() for l in f if l.strip()]
+    except OSError as exc:
+        print("    (wordlist illisible : %s)" % exc)
+        return None
+    hexchars = set("0123456789abcdefABCDEF")
+    cles = []
+    for e in entrees:
+        if len(e) == 5:
+            b = e.encode("latin-1")   # lecture latin-1 → ré-encodage sans échec
+            if all(32 <= x < 127 for x in b):
+                cles.append(b)
+        elif len(e) == 10 and all(c in hexchars for c in e):
+            cles.append(bytes.fromhex(e))     # toujours 5 octets (hex pur)
+    cles = [c for c in cles if len(c) == 5]   # garde absolue : WEP-40 = 5 octets
+    print("\n[+] Niveau wordlist : %s (%d entrees, %d cles WEP-40 candidates)"
+          % (os.path.basename(wordlist_path), len(entrees), len(cles)))
+    if not cles:
+        print("    -> aucune cle candidate au format WEP-40 (5 car. ASCII ou 10 hex)")
+        return None
+    z0 = flux_dom[0] ^ 0xAA
+    z1 = flux_dom[1] ^ 0xAA
+    z2 = flux_dom[2] ^ 0x03
+    tb = time.time()
+    # v1.1 — optimisation temps (demande utilisateur) : le filtre 3 octets
+    # est parallélisé sur les cœurs demandés (blocs CONTIGUS + pool.map :
+    # ordre du fichier conservé, résultat déterministe §35). La validation
+    # ICV finale reste séquentielle (peu de candidates). Repli séquentiel
+    # identique à l'historique si multiprocessing indisponible.
+    try:
+        nproc = max(1, int(cores or 0) or (os.cpu_count() or 2))
+    except (TypeError, ValueError):
+        nproc = max(1, (os.cpu_count() or 2))
+    candidats = None
+    if nproc > 1 and len(cles) > 4000:
+        try:
+            import multiprocessing as mp
+            ctx = mp.get_context("spawn")     # Windows-safe
+            sz = -(-len(cles) // nproc)       # blocs contigus (ceil)
+            taches = [(iv_dom[0], iv_dom[1], iv_dom[2], z0, z1, z2,
+                       cles[i:i + sz]) for i in range(0, len(cles), sz)]
+            with ctx.Pool(processes=nproc) as pool:
+                candidats = []
+                for res in pool.map(_wep_wl_worker, taches):
+                    candidats.extend(res)
+            print("    filtre 3 octets : %d candidate(s) sur %d cles "
+                  "(%d coeurs, %.1f s)"
+                  % (len(candidats), len(cles), nproc, time.time() - tb))
+        except Exception as e:
+            print("    (multiprocessing indisponible : %s -> mode sequentiel)" % e)
+            candidats = None
+    if candidats is None:
+        candidats = []
+        for i, cle in enumerate(cles):
+            if deadline is not None and time.time() > deadline:
+                print("\n[!] Budget temps atteint (niveau wordlist) — arrêt."
+                      " Relancez avec --deep.")
+                return None
+            cle8 = bytes(iv_dom) + cle
+            if ksa_et_3_octets(cle8, z0, z1, z2) is not None:
+                candidats.append(cle)
+            if (i + 1) % 2000 == 0:
+                vit = (i + 1) / max(1e-9, time.time() - tb)
+                print("\r    wordlist %5.1f %%  (~%d cles/s)      "
+                      % (100.0 * (i + 1) / len(cles), vit), end="", flush=True)
+    if deadline is not None and time.time() > deadline:
+        print("\n[!] Budget temps atteint (niveau wordlist) — arrêt."
+              " Relancez avec --deep.")
+        return None
+    for cle in candidats:
+        n_icv, testees = valider_cle(cle, reseau)
+        if n_icv >= 3:
+            _wep_affiche_found(cle, n_icv, testees, t0)
+            return cle
+    print("    -> aucune cle de la wordlist validee (%d cles, %.1f s)"
+          % (len(cles), time.time() - tb))
+    return None
+
+def casser(chemin, cores=None):
+    """Point d'entrée historique du script standalone wep_crack_auto.py.
+
+    Comportement strictement identique à l'original (tous les alphabets en
+    coût croissant, aucun budget temps). ``cores`` (v1.1) : nombre de cœurs
+    CPU ; None = tous (comportement historique). Retourne la cle (bytes) ou None.
+    """
+    prep = _wep_prepare(chemin)
+    if prep is None:
+        return None
+    return _wep_attack(chemin, prep, ALPHABETS, cores=cores)
+
+
+def run_wep_solver(chemin, *, deep=False, budget_s=None, wordlist=None,
+                   cores=None):
+    """Sous-code 3 — wep_crack_auto.py en fonction appelable.
+
+    deep=False : même échelle d'alphabets (coût croissant) mais dans la
+    limite du budget temps (défaut SOLVE_DEFAULT_BUDGET).
+    deep=True  : identique au script original (aucune limite).
+
+    wordlist (intégration v3) : fichier de clés candidates testé en niveau 0
+    (avant l'échelle d'alphabets, inchangée). Entrées : 5 caractères ASCII
+    ou 10 hex. None/inexistant → comportement strictement identique à avant.
+
+    Préparation automatique des données : une capture pcapng (non lue par
+    lire_pcap) est convertie en pcap classique via editcap quand il est
+    disponible. Retourne un SolverOutcome ; les messages console d'origine
+    sont conservés.
+    """
+    t_start = time.time()
+    fr = get_lang() == "fr"
+    deadline = None if deep else (t_start + (budget_s or SOLVE_DEFAULT_BUDGET))
+    target = str(chemin)
+    tmp_path = None
+    try:
+        try:
+            prep = _wep_prepare(target)
+        except ValueError as exc:
+            if "pcapng" not in str(exc).lower():
+                raise
+            # pcapng → pcap classique via editcap (suite Wireshark)
+            edit = find_editcap()
+            if not edit:
+                return SolverOutcome(
+                    "wep", "error",
+                    error=(f"{exc} — editcap introuvable pour la conversion" if fr
+                           else f"{exc} — editcap not found for conversion"),
+                    elapsed=time.time() - t_start)
+            fd, tmp_path = tempfile.mkstemp(suffix=".pcap")
+            os.close(fd)
+            print(f"[*] Conversion pcapng → pcap via {os.path.basename(edit)} …")
+            subprocess.run([edit, "-F", "pcap", target, tmp_path],
+                           check=True, capture_output=True, timeout=600)
+            target = tmp_path
+            prep = _wep_prepare(target)
+        if prep is None:
+            return SolverOutcome(
+                "wep", "not_applicable",
+                summary=("aucune trame de données WEP" if fr else "no WEP data frame"),
+                elapsed=time.time() - t_start)
+        cle, cle_via = None, "alphabets"
+        if wordlist and os.path.isfile(wordlist):
+            cle = _wep_attack_wordlist(prep, wordlist, deadline=deadline,
+                                       cores=cores)
+            if cle is not None:
+                cle_via = "wordlist"
+        if cle is None:
+            cle = _wep_attack(target, prep, ALPHABETS, deadline=deadline,
+                              cores=cores)
+    except subprocess.CalledProcessError as exc:
+        raw = exc.stderr if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
+        detail = raw.decode("utf-8", "replace")[:200] if isinstance(raw, bytes) else raw[:200]
+        return SolverOutcome(
+            "wep", "error",
+            error=(f"conversion editcap échouée : {detail}" if fr
+                   else f"editcap conversion failed: {detail}"),
+            elapsed=time.time() - t_start)
+    except (OSError, ValueError) as exc:
+        return SolverOutcome("wep", "error", error=f"{type(exc).__name__}: {exc}",
+                             elapsed=time.time() - t_start)
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    if cle:
+        ascii_ok = all(32 <= b < 127 for b in cle)
+        key_ascii = cle.decode("latin-1") if ascii_ok else None
+        return SolverOutcome(
+            "wep", "found",
+            summary=(f"clé WEP-40 trouvée : {key_ascii or cle.hex().upper()}" if fr
+                     else f"WEP-40 key found: {key_ascii or cle.hex().upper()}"),
+            findings={"key_hex": cle.hex().upper(),
+                      "key_hex_spaced": " ".join("%02X" % b for b in cle),
+                      "key_ascii": key_ascii, "found_via": cle_via},
+            elapsed=time.time() - t_start)
+    if not deep and deadline is not None:
+        summary = ("clé non trouvée dans le budget temps (relancer avec --deep)" if fr
+                   else "key not found within time budget (rerun with --deep)")
+    else:
+        summary = ("clé non trouvée dans les alphabets réduits" if fr
+                   else "key not found in reduced alphabets")
+    return SolverOutcome("wep", "not_found", summary=summary,
+                         elapsed=time.time() - t_start)
+
+
+# ==============================================================================================
+#  SOUS-CODE 4/4 — SOLVEUR WPA3-SAE (intégré depuis auto-sae.py v9)
+# ==============================================================================================
+# NOTE intégration : shebang, imports et garde pycryptodome du script
+# standalone supprimés — les modules requis (os, sys, binascii, hashlib,
+# hmac, subprocess, shutil, re, json, struct, time) sont importés par
+# l'en-tête principal, et AES/CCM purs Python remplacent pycryptodome
+# (aes_decrypt_block / _sae_aes_ecb_decrypt / ccmp_decrypt_verify ci-après).
+# Constantes de courbe p/a/b/n → SAE_P/SAE_A/SAE_B/SAE_N (renommage
+# mécanique, calculs strictement inchangés).
+
+
+SAE_P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+SAE_A = SAE_P - 3
+SAE_B = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
+SAE_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+
+def inv_mod(k, mod): return pow(k, -1, mod)
+def point_add(P,Q):
+    if P is None: return Q
+    if Q is None: return P
+    x1,y1=P; x2,y2=Q
+    if x1==x2 and y1!=y2: return None
+    if P==Q: s=(3*x1*x1+SAE_A)*inv_mod(2*y1,SAE_P)%SAE_P
+    else: s=(y2-y1)*inv_mod((x2-x1)%SAE_P,SAE_P)%SAE_P
+    x3=(s*s-x1-x2)%SAE_P
+    y3=(s*(x1-x3)-y1)%SAE_P
+    return (x3,y3)
+def point_neg(P):
+    if P is None: return None
+    return (P[0], (-P[1])%SAE_P)
+def scalar_mul(P,k):
+    if k%SAE_N==0 or P is None: return None
+    R=None; Q=P
+    while k:
+        if k&1: R=point_add(R,Q)
+        Q=point_add(Q,Q)
+        k>>=1
+    return R
+def sha256_prf_bits(key,label,data,bits):
+    out=b""; counter=1
+    len_le=bits.to_bytes(2,'little')
+    lb=label.encode()
+    while len(out)*8 < bits:
+        out+=hmac.new(key, counter.to_bytes(2,'little')+lb+data+len_le, hashlib.sha256).digest()
+        counter+=1
+    return out[:(bits+7)//8]
+def sha256_prf(k,l,d,bl): return sha256_prf_bits(k,l,d,bl*8)
+def aes_unwrap(kek,wrapped):
+    if len(wrapped)%8!=0: return None
+    nblocks=len(wrapped)//8-1
+    A=wrapped[:8]
+    R=[None]+[wrapped[i*8:(i+1)*8] for i in range(1,nblocks+1)]
+    for j in range(5,-1,-1):
+        for i in range(nblocks,0,-1):
+            t=nblocks*j+i
+            At=(int.from_bytes(A,'big')^t).to_bytes(8,'big')
+            B=_sae_aes_ecb_decrypt(kek,At+R[i])
+            A=B[:8]; R[i]=B[8:]
+    if A!=b"\xA6"*8: return None
+    return b"".join(R[1:])
+def ccmp_decrypt(key,nonce,aad,enc_hex):
+    try:
+        enc=binascii.unhexlify(enc_hex.strip())
+        ct,mic=enc[:-8],enc[-8:]
+        # Intégration : pycryptodome MODE_CCM → ccmp_decrypt_verify (AES-CCMP
+        # pur Python, même sémantique : clair si MIC valide, None sinon).
+        return ccmp_decrypt_verify(key,nonce,aad,ct,mic)
+    except: return None
+
+# NOTE intégration : find_tshark() du script standalone supprimé — le
+# programme principal définit déjà find_tshark(cli_path) (variables
+# d'environnement T2H_TSHARK_PATH/TSHARK + chemins Windows + PATH),
+# réutilisé tel quel par run_sae_solver().
+
+def extract_sae_fields(tshark_bin, pcap_path, scalar_field="wlan.fixed.scalar",
+                       element_field="wlan.fixed.finite_field_element"):
+    # Intégration : noms de champs paramétrables (défaut = script d'origine) ;
+    # les tshark récents renomment ces champs wlan.fixed.sae.* — la variante
+    # est tentée par run_sae_solver() si l'appel d'origine ne remonte rien.
+    cmd=[tshark_bin,"-r",pcap_path,"-Y","wlan.fixed.auth.alg==3","-T","fields","-e","wlan.sa","-e",scalar_field,"-e",element_field,"-E","separator=|"]
+    res=subprocess.run(cmd,capture_output=True,text=True,timeout=60)
+    commits=[]
+    for line in res.stdout.splitlines():
+        parts=line.split("|")
+        if len(parts)<3: continue
+        sa,scalar,element=parts[0],parts[1],parts[2]
+        scalar=scalar.replace(":","").replace(" ","").strip()
+        element=element.replace(":","").replace(" ","").strip()
+        if len(scalar)==64 and len(element)>=128:
+            commits.append({"sa":sa,"scalar":scalar,"element":element})
+    return commits
+
+def extract_eapol_hex(tshark_bin, pcap_path):
+    cmd=[tshark_bin,"-r",pcap_path,"-Y","eapol","-x"]
+    res=subprocess.run(cmd,capture_output=True,text=True,timeout=60,encoding='utf-8',errors='ignore')
+    out=res.stdout
+    hex_bytes=[]
+    # On parse hex dump brut pour trouver nonces et wrapped
+    # Méthode : on extrait toutes les lignes hex et on cherche EAPOL
+    # Plus simple : on cherche directement les nonces connus via regex sur le dump
+    # Mais on va parser comme avant
+    packets = re.split(r"Frame \d+:", out)
+    nonces=[]
+    wrapped=None
+    for pkt in packets:
+        # extrait hex
+        hb=[]
+        for line in pkt.splitlines():
+            m=re.match(r"^[0-9a-f]{4}\s+((?:[0-9a-f]{2}\s+)+)", line, re.IGNORECASE)
+            if m:
+                hb.extend(m.group(1).split())
+        if not hb:
+            continue
+        try:
+            raw=binascii.unhexlify("".join(hb))
+        except:
+            continue
+        idx=raw.find(b"\x88\x8e")
+        if idx==-1:
+            continue
+        if len(raw) >= idx+49 and raw[idx+2]==0x03:
+            nonce_cand=raw[idx+17:idx+49]
+            if len(nonce_cand)==32 and nonce_cand!=b"\x00"*32:
+                nonces.append(nonce_cand.hex())
+            if len(raw) >= idx+99:
+                data_len=int.from_bytes(raw[idx+97:idx+99],'big')
+                if data_len>=56 and len(raw)>=idx+99+data_len:
+                    data_cand=raw[idx+99:idx+99+data_len]
+                    if len(data_cand)>=56:
+                        wrapped=data_cand.hex()
+    uniq=[]
+    for n in nonces:
+        if n not in uniq:
+            uniq.append(n)
+    anonce=uniq[0] if len(uniq)>=1 else None
+    snonce=uniq[1] if len(uniq)>=2 else None
+    if anonce==snonce and len(uniq)>=3:
+        snonce=uniq[2]
+    return anonce,snonce,wrapped
+
+
+# ---------------------------------------------------------------------------
+# Primitives crypto pures Python du solveur SAE (remplacement pycryptodome)
+# ---------------------------------------------------------------------------
+# Le script auto-sae d'origine exigeait pycryptodome (AES-ECB pour le unwrap
+# RFC 3394 et AES-CCM pour CCMP). Le programme principal contient déjà un
+# AES-128 pur Python (sous-code 2 : aes_key_expansion / aes_encrypt_block,
+# validé par les tests WPA2-Enterprise). On le complète ici avec :
+#   - aes_decrypt_block        : chiffrement inverse (FIPS-197),
+#   - _sae_aes_ecb_decrypt     : ECB déchiffrement multi-blocs (pour aes_unwrap),
+#   - ccmp_decrypt_verify      : AES-CCMP avec vérification du MIC (8 octets),
+#   - sae_crypto_selfcheck     : KAT FIPS-197 (aller/retour) — garde-fou.
+# Aucune dépendance externe ; aucune modification du code AES existant.
+
+INV_SBOX = [0] * 256
+for _sae_i, _sae_v in enumerate(SBOX):
+    INV_SBOX[_sae_v] = _sae_i
+
+_AES_INV_SHIFT = [0, 13, 10, 7, 4, 1, 14, 11, 8, 5, 2, 15, 12, 9, 6, 3]
+
+def _sae_gmul(a: int, b: int) -> int:
+    """Multiplication GF(2^8) (polynôme 0x11B) — pour InvMixColumns."""
+    r = 0
+    for _ in range(8):
+        if b & 1:
+            r ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xFF
+        if hi:
+            a ^= 0x1B
+        b >>= 1
+    return r
+
+def aes_decrypt_block(block: bytes, round_keys: List[int]) -> bytes:
+    """Déchiffre un bloc AES-128 (inverse exact de aes_encrypt_block).
+
+    Même convention d'état que le sous-code 2 : round_keys = sortie plate de
+    aes_key_expansion (176 octets), état colonne par colonne.
+    """
+    state = list(block)
+    rk = round_keys[160:176]
+    for j in range(16):
+        state[j] ^= rk[j]
+    for r in range(9, 0, -1):
+        state = [state[_AES_INV_SHIFT[i]] for i in range(16)]
+        state = [INV_SBOX[x] for x in state]
+        rk = round_keys[r * 16:(r + 1) * 16]
+        for j in range(16):
+            state[j] ^= rk[j]
+        new_state = [0] * 16
+        for c in range(4):
+            i = c * 4
+            s0, s1, s2, s3 = state[i], state[i + 1], state[i + 2], state[i + 3]
+            new_state[i]     = _sae_gmul(s0, 14) ^ _sae_gmul(s1, 11) ^ _sae_gmul(s2, 13) ^ _sae_gmul(s3, 9)
+            new_state[i + 1] = _sae_gmul(s0, 9)  ^ _sae_gmul(s1, 14) ^ _sae_gmul(s2, 11) ^ _sae_gmul(s3, 13)
+            new_state[i + 2] = _sae_gmul(s0, 13) ^ _sae_gmul(s1, 9)  ^ _sae_gmul(s2, 14) ^ _sae_gmul(s3, 11)
+            new_state[i + 3] = _sae_gmul(s0, 11) ^ _sae_gmul(s1, 13) ^ _sae_gmul(s2, 9)  ^ _sae_gmul(s3, 14)
+        state = new_state
+    state = [state[_AES_INV_SHIFT[i]] for i in range(16)]
+    state = [INV_SBOX[x] for x in state]
+    for j in range(16):
+        state[j] ^= round_keys[j]
+    return bytes(state)
+
+def _sae_aes_ecb_decrypt(key: bytes, data: bytes) -> bytes:
+    """ECB déchiffrement (autant de blocs de 16 octets que nécessaire).
+
+    Remplace ``AES.new(key, AES.MODE_ECB).decrypt(data)`` de pycryptodome
+    dans aes_unwrap (RFC 3394).
+    """
+    rk = aes_key_expansion(key)
+    out = bytearray()
+    for i in range(0, len(data) - len(data) % 16, 16):
+        out += aes_decrypt_block(data[i:i + 16], rk)
+    return bytes(out)
+
+def ccmp_decrypt_verify(key: bytes, nonce13: bytes, aad: bytes,
+                        ct: bytes, mic: bytes) -> Optional[bytes]:
+    """AES-CCMP : déchiffrement CTR + vérification du MIC CBC-MAC (8 octets).
+
+    Équivalent pur Python de ``AES.new(key, MODE_CCM, nonce=..., mac_len=8)``
+    + ``decrypt_and_verify`` : retourne le clair, ou None si le MIC est
+    invalide. Nonce 13 octets (priorité || A2 || PN), compteurs CTR et B0
+    conformes IEEE 802.11i (mêmes blocs de compteur que decrypt_ccmp_frame
+    du sous-code 2).
+    """
+    rk = aes_key_expansion(key)
+    # --- déchiffrement CTR (blocs 0x01 || nonce || i, i = 1..) ---
+    plain = bytearray()
+    total_blocks = (len(ct) + 15) // 16
+    for i in range(1, total_blocks + 1):
+        keystream = aes_encrypt_block(bytes([0x01]) + nonce13 + struct.pack(">H", i), rk)
+        blk = ct[(i - 1) * 16:i * 16]
+        plain.extend(x ^ y for x, y in zip(blk, keystream))
+    plain = bytes(plain)
+    # --- CBC-MAC : B0 = 0x59 || nonce || len(ct), puis AAD puis clair ---
+    x = aes_encrypt_block(bytes([0x59]) + nonce13 + struct.pack(">H", len(ct)), rk)
+
+    def _cbc(block: bytes) -> None:
+        nonlocal x
+        x = aes_encrypt_block(bytes(u ^ v for u, v in zip(x, block)), rk)
+
+    aad_blk = struct.pack(">H", len(aad)) + aad
+    aad_blk += b"\x00" * ((16 - len(aad_blk) % 16) % 16)
+    for i in range(0, len(aad_blk), 16):
+        _cbc(aad_blk[i:i + 16])
+    for i in range(0, len(plain), 16):
+        blk = plain[i:i + 16]
+        if len(blk) < 16:
+            blk += b"\x00" * (16 - len(blk))
+        _cbc(blk)
+    s0 = aes_encrypt_block(bytes([0x01]) + nonce13 + b"\x00\x00", rk)
+    calc = bytes(u ^ v for u, v in zip(x[:8], s0[:8]))
+    return plain if calc == mic else None
+
+def sae_crypto_selfcheck() -> bool:
+    """KAT FIPS-197 (AES-128) aller/retour sur l'implémentation pure Python."""
+    key = bytes(range(16))
+    pt = bytes.fromhex("00112233445566778899aabbccddeeff")
+    ct = bytes.fromhex("69c4e0d86a7b0430d8cdb78070b4c55a")
+    rk = aes_key_expansion(key)
+    return aes_encrypt_block(pt, rk) == ct and aes_decrypt_block(ct, rk) == pt
+
+
+def detect_sae_frames(path: str) -> int:
+    """Compte les trames SAE (commit/confirm) — WPA3-Personal.
+
+    Critères : management subtype 0xB (authentification) ET algorithme SAE
+    (3, little-endian) ET séquence 1 ou 2. Les authentifications « open »
+    (algorithme 0) des captures WPA2 — elles aussi en subtype 0xB — ne sont
+    donc plus comptées. Réutilise le parseur 802.11 pur Python du sous-code
+    WPA2-Enterprise (parse_pcap / parse_80211) : aucune dépendance ajoutée.
+    """
+    try:
+        link_type, packets = parse_pcap(str(path))
+    except (ValueError, OSError):
+        return 0
+    if link_type not in (105, 119, 127):
+        return 0
+    n = 0
+    for pkt in packets:
+        parsed = parse_80211(pkt.data, pkt.frame_num)
+        if not parsed or parsed["type"] != 0 or parsed["subtype"] != 0xB:
+            continue
+        body = parsed["payload"]
+        if (len(body) >= 4 and int.from_bytes(body[0:2], "little") == 3
+                and int.from_bytes(body[2:4], "little") in (1, 2)):
+            n += 1
+    return n
+
+# ---------------------------------------------------------------------------
+# Constantes d'origine du script auto-sae (v9) — captures cibles
+# ---------------------------------------------------------------------------
+# Mask par défaut proposé par le script interactif d'origine.
+SAE_DEFAULT_MASK = "37afd012e0ad30e00e21ffaad188f5966a6c21ec88b49259d5567a3d333d8b29"
+# Confirm attendu de la capture d'origine du script : utilisé UNIQUEMENT si
+# aucun confirm n'a pu être extrait de la capture analysée (comportement
+# d'origine). Sur toute autre capture, le confirm est extrait des trames SAE.
+SAE_DEFAULT_CONFIRM = "aca5ea4ffc46dae147e6f15514f1b61ea8c8f7bb4ae36ac90361c888b98c2491"
+# Valeurs EAPOL « connues » de la capture d'origine (fallback du chemin
+# tshark, exactement comme dans le script : « Echec hex, fallback valeurs
+# connues »). Sans effet quand l'extraction réussit.
+SAE_FALLBACK_ANONCE = "5f8a345bf9965a15a8855c3b59fd3b64885888f6ec30cc295a4694e66429fe5a"
+SAE_FALLBACK_SNONCE = "e5c47b67157cd8f67768b1ac4b7a39851a95498cf2886016432208e2f3e40261"
+SAE_FALLBACK_WRAPPED = ("0138746c0c44def452295a52d53121598e51f55976ef20fc63bed8dede3718d3"
+                        "14c55174817d8195fb4576f2c5bfbbd75fa612345e8b02a9")
+
+def _sae_confirm(kck: bytes, sc: int, s1: int, e1, s2: int, e2) -> bytes:
+    """Confirm SAE (HMAC-SHA256) — def compute_confirm() imbriquée dans le
+    main() d'origine, remontée au niveau module sans aucun changement de
+    calcul : sc(2 LE) || scalar1 || elem1.x || elem1.y || scalar2 || elem2..."""
+    data = (sc.to_bytes(2, 'little')
+            + s1.to_bytes(32, 'big') + e1[0].to_bytes(32, 'big') + e1[1].to_bytes(32, 'big')
+            + s2.to_bytes(32, 'big') + e2[0].to_bytes(32, 'big') + e2[1].to_bytes(32, 'big'))
+    return hmac.new(kck, data, hashlib.sha256).digest()
+
+def _sae_parse_elem(h: str):
+    """parse_elem() imbriqué dans le main() d'origine (x, y big-endian 32 o)."""
+    b = binascii.unhexlify(h[:128])
+    return (int.from_bytes(b[:32], 'big'), int.from_bytes(b[32:], 'big'))
+
+# ---------------------------------------------------------------------------
+# Extraction 802.11 pure Python (fallback quand tshark est absent)
+# ---------------------------------------------------------------------------
+def _sae_hexmac(b: bytes) -> str:
+    return ":".join("%02x" % x for x in b)
+
+def _sae_extract_sae_pure(pcap_path: str):
+    """Commits + confirms SAE lus directement dans le pcap (sans tshark).
+
+    Retourne (commits, confirms) au MÊME format que extract_sae_fields() :
+    commits = [{"sa": "aa:bb:..", "scalar": hex64, "element": hex>=128}].
+    confirms = [{"sa": .., "confirm": hex64}] (trames seq 2).
+    Trame d'authentification SAE : algo(2 LE)=3, seq(2 LE), puis
+    scalar(32 BE) + element(64 BE) pour seq 1, confirm(32 BE) pour seq 2.
+    """
+    commits, confirms = [], []
+    link_type, packets = parse_pcap(pcap_path)
+    if link_type not in (105, 119, 127):
+        return commits, confirms
+    for pkt in packets:
+        parsed = parse_80211(pkt.data, pkt.frame_num)
+        if not parsed or parsed["type"] != 0 or parsed["subtype"] != 0xB:
+            continue
+        body = parsed["payload"]
+        if len(body) < 4:
+            continue
+        algo = int.from_bytes(body[0:2], "little")
+        seq = int.from_bytes(body[2:4], "little")
+        if algo != 3:
+            continue
+        sa = _sae_hexmac(parsed["addr2"])
+        if seq == 1 and len(body) >= 4 + 32 + 64:
+            commits.append({"sa": sa,
+                            "scalar": body[4:36].hex(),
+                            "element": body[36:100].hex()})
+        elif seq == 2 and len(body) >= 4 + 32:
+            # Trames RÉELLES : un code statut (2 octets, généralement 0x0000)
+            # précède le confirm — parfois suivi d'autres champs — alors que
+            # les fixtures historiques enchaînent directement algo+seq+confirm.
+            # Les 3 alignements plausibles sont extraits ; c'est le match du
+            # HMAC-SHA256 (32 octets) dans le solveur qui tranche (§42).
+            alts = []
+            if len(body) >= 6 + 32:
+                alts.append(body[6:38].hex())
+            if len(body) >= 8 + 32:
+                alts.append(body[8:40].hex())
+            confirms.append({"sa": sa, "confirm": body[4:36].hex(),
+                             "confirm_alts": alts})
+    return commits, confirms
+
+def _sae_extract_eapol_pure(pcap_path: str):
+    """ANonce/SNonce/clé GTK wrappée via le parseur EAPOL du sous-code 2.
+
+    Retourne (anonce_hex, snonce_hex, wrapped_hex) — wrapped_hex = key_data
+    du message M3 (>= 56 octets, comme le filtre du script d'origine), ou
+    None. Lève ValueError si le handshake est absent (message d'origine du
+    sous-code 2).
+    """
+    _ap, _cli, hs = extract_handshake_from_pcap(pcap_path)
+    anonce = hs[1].nonce if 1 in hs else (hs[3].nonce if 3 in hs else None)
+    snonce = hs[2].nonce if 2 in hs else None
+    wrapped = None
+    for num in (3, 4, 2):
+        msg = hs.get(num)
+        if msg is not None and msg.key_data and len(msg.key_data) >= 56:
+            wrapped = msg.key_data
+            break
+    return (anonce.hex() if anonce and anonce != b"\x00" * 32 else None,
+            snonce.hex() if snonce and snonce != b"\x00" * 32 else None,
+            wrapped.hex() if wrapped else None)
+
+def _sae_extract_confirm_tshark(tshark_bin: str, pcap_path: str):
+    """Confirm STA via tshark — champ selon la version (sae.confirm / confirm).
+
+    Additif par rapport au script d'origine (qui n'utilisait que sa constante)
+    : le confirm extrait de la capture est prioritaire ; la constante
+    SAE_DEFAULT_CONFIRM ne sert que de repli. Toute erreur → None.
+    """
+    for field in ("wlan.fixed.sae.confirm", "wlan.fixed.confirm"):
+        try:
+            cmd = [tshark_bin, "-r", pcap_path, "-Y", "wlan.fixed.auth.alg==3",
+                   "-T", "fields", "-e", "wlan.sa", "-e", field]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            for line in res.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    conf = parts[1].replace(":", "").replace(" ", "").strip()
+                    if len(conf) == 64:
+                        return conf.lower()
+        except Exception:
+            continue
+    return None
+
+# ---------------------------------------------------------------------------
+# Solveur SAE — adaptateur du main() interactif d'origine
+# ---------------------------------------------------------------------------
+def run_sae_solver(pcap, *, wordlists=None, deep=False, budget_s=None,
+                   extra_candidates=(), mask=None, tshark_path=None):
+    """Sous-code 4 — auto-sae (WPA3-SAE v9) en fonction appelable.
+
+    Reprise fidèle du main() d'origine (mêmes calculs, mêmes messages) :
+    PWE = inv(mask) * element_sta avec les 2 parités de Y testées, vérification
+    par le confirm SAE, KCK/PMK (KDF « SAE KCK and PMK »), PTK/KEK/TK
+    (« Pairwise key expansion »), unwrap RFC 3394 de la GTK, déchiffrement
+    CCMP des trames de données (preuves textuelles extraites).
+
+    Adaptations d'intégration (documentées, sans changement de comportement
+    sur la capture d'origine) :
+      - prompts input() → paramètres (mask, chemin pcap) ;
+      - pycryptodome → AES/CCMP purs Python (sous-code 2 + helpers SAE) ;
+      - extraction tshark d'origine conservée ; si tshark est absent, repli
+        sur les parseurs 802.11/EAPOL purs Python du sous-code 2 ;
+      - confirm attendu : extrait de la capture (généralisation), sinon la
+        constante d'origine du script ;
+      - filtre MAC du déchiffrement : préfixes OUI codés en dur dans le
+        script (« c4:e9:84 » / « 18:d0:a7 ») → les MAC STA/AP réels des
+        commits (identiques sur la capture d'origine, génériques ailleurs) ;
+      - écriture de « data.txt » dans le CWD supprimée (effet de bord à
+        chemin codé en dur ; le contenu est archivé dans -solve.txt) ;
+      - retour SolverOutcome au lieu de return/sys.exit ; budget temps
+        honoré comme les autres solveurs.
+
+    ``wordlists`` / ``extra_candidates`` sont acceptés pour l'uniformité de
+    l'orchestrateur mais inutilisés : la récupération de PWE repose sur le
+    mask, pas sur un dictionnaire.
+    """
+    t_start = time.time()
+    deadline = (t_start + budget_s) if budget_s else None
+    fr = get_lang() == "fr"
+
+    def _over():
+        return deadline is not None and time.time() > deadline
+
+    print("WPA3-SAE AUTO v9 - fix PWE=inv(mask)*element")
+
+    # --- mask (prompt d'origine → paramètre ; défaut = valeur du script) ---
+    mask_hex = (mask or SAE_DEFAULT_MASK).strip().replace("0x", "").replace(" ", "")
+    try:
+        mask_int = int(mask_hex, 16)
+        inv_mask = pow(mask_int, -1, SAE_N)
+    except (ValueError, ZeroDivisionError) as exc:
+        return SolverOutcome("sae", "error", error=f"--sae-mask invalide : {exc}",
+                             elapsed=time.time() - t_start)
+    print(f"Mask: {mask_int:064x}")
+    print(f"InvMask: {inv_mask:064x}")
+
+    # --- chemin (normalisation d'origine : répertoire → sae.pcap / 1er .pcap) ---
+    pcap_path = os.path.normpath(str(pcap).replace("\\", "/"))
+    if os.path.isdir(pcap_path):
+        cand = os.path.join(pcap_path, "sae.pcap")
+        if os.path.exists(cand):
+            pcap_path = cand
+        else:
+            files = [f for f in os.listdir(pcap_path) if f.lower().endswith(".pcap")]
+            if files:
+                pcap_path = os.path.join(pcap_path, files[0])
+    if not os.path.exists(pcap_path):
+        print("Fichier non trouve: " + pcap_path)
+        return SolverOutcome("sae", "error", error=f"fichier introuvable : {pcap_path}",
+                             elapsed=time.time() - t_start)
+
+    n_sae = detect_sae_frames(pcap_path)
+    if n_sae == 0:
+        return SolverOutcome(
+            "sae", "not_applicable",
+            summary=("aucune trame SAE (WPA3) détectée" if fr
+                     else "no SAE (WPA3) frame detected"),
+            elapsed=time.time() - t_start)
+
+    tshark_bin = find_tshark(tshark_path)
+
+    # --- commits (+ confirms) : champs tshark d'origine → variante récente
+    #     (wlan.fixed.sae.*, tshark >= 3.x) → parseur 802.11 pur Python ---
+    print("\nExtraction SAE...")
+    commits, confirms = [], []
+    if tshark_bin:
+        print("tshark: " + tshark_bin)
+        try:
+            commits = extract_sae_fields(tshark_bin, pcap_path)
+            if not commits:
+                commits = extract_sae_fields(
+                    tshark_bin, pcap_path,
+                    scalar_field="wlan.fixed.sae.scalar",
+                    element_field="wlan.fixed.sae.finite_field_element")
+        except Exception as exc:
+            print(f"échec tshark ({exc})")
+            commits = []
+    if not commits:
+        print("champs tshark muets — repli parseur 802.11 pur Python"
+              if tshark_bin else
+              "tshark indisponible — parseur 802.11 pur Python (sous-code 2)")
+        commits, confirms = _sae_extract_sae_pure(pcap_path)
+    print("pcap: " + pcap_path)
+    print(f"Commits: {len(commits)}")
+    if len(commits) < 2:
+        msg = ("Pas assez" if not fr else
+               "Pas assez de commits SAE valides (2 attendus : STA + AP)")
+        print(msg)
+        hint = (" — un handshake/PMKID extrait par ailleurs reste cassable "
+                "via hashcat -m 22000.")
+        return SolverOutcome(
+            "sae", "not_found",
+            summary=(f"{n_sae} trame(s) SAE détectée(s) mais {len(commits)} "
+                     f"commit(s) exploitable(s)" + hint),
+            findings={"sae_frames": n_sae, "commits": len(commits)},
+            elapsed=time.time() - t_start)
+    commit_sta = commits[0]
+    commit_ap = commits[1]
+    if commit_sta["sa"] == commit_ap["sa"] and len(commits) >= 3:
+        commit_ap = commits[2]
+    scalar_sta = int(commit_sta["scalar"], 16)
+    scalar_ap = int(commit_ap["scalar"], 16)
+    elem_sta = _sae_parse_elem(commit_sta["element"])
+    elem_ap = _sae_parse_elem(commit_ap["element"])
+    mac_sta = binascii.unhexlify(commit_sta["sa"].replace(":", ""))
+    mac_ap = binascii.unhexlify(commit_ap["sa"].replace(":", ""))
+    print("STA=" + commit_sta["sa"] + " AP=" + commit_ap["sa"])
+
+    # --- confirm attendu : capture d'abord (PLUSIEURS offsets d'extraction,
+    #     les trames réelles portant un code statut avant le confirm), puis
+    #     tshark, puis la constante d'origine du script v9 EN FILET — chaque
+    #     candidat est testé ; un match HMAC-SHA256 de 32 octets reste une
+    #     preuve cryptographique quel que soit l'alignement (§42). Bug du run
+    #     réel : le confirm extrait décalé de 4 octets ne matchait jamais le
+    #     confirm calculé alors que le PWE était bon. ---
+    confirm_cands = []
+    if not confirms:
+        try:                            # trames confirm lues en pur Python
+            _, confirms = _sae_extract_sae_pure(pcap_path)
+        except Exception:
+            confirms = []
+    if confirms:
+        c_sel = None
+        for c in confirms:
+            if c["sa"] == commit_sta["sa"]:
+                c_sel = c
+                break
+        c_sel = c_sel or confirms[0]
+        for h in [c_sel.get("confirm")] + list(c_sel.get("confirm_alts") or []):
+            if h and h not in confirm_cands:
+                confirm_cands.append(h)
+    if not confirm_cands and tshark_bin:
+        h = _sae_extract_confirm_tshark(tshark_bin, pcap_path)
+        if h:
+            confirm_cands.append(h)
+    n_cands_capture = len(confirm_cands)
+    confirm_source = "capture" if n_cands_capture else "constante-d-origine"
+    if SAE_DEFAULT_CONFIRM not in confirm_cands:
+        confirm_cands.append(SAE_DEFAULT_CONFIRM)   # filet du script d'origine
+    confirm_hex = confirm_cands[0]
+    print("Confirm attendu : " + confirm_source + " (" + confirm_hex[:20] + "...)")
+    if len(confirm_cands) > 1:
+        print("  (%d confirm(s) candidats : %d extrait(s) de la capture "
+              "(alignements multiples) + constante d'origine — chacun sera "
+              "testé contre le HMAC calculé)"
+              % (len(confirm_cands), n_cands_capture))
+
+    # --- EAPOL : chemin tshark d'origine (hex dump), sinon parseur sous-code 2 ---
+    print("\nExtraction EAPOL via hex..." if tshark_bin
+          else "\nExtraction EAPOL (parseur pur Python)...")
+    anonce_hex = snonce_hex = wrapped_hex = None
+    if tshark_bin:
+        try:
+            anonce_hex, snonce_hex, wrapped_hex = extract_eapol_hex(tshark_bin, pcap_path)
+        except Exception as exc:
+            print(f"échec tshark ({exc})")
+        if not anonce_hex:
+            # Intégration : avant le repli sur les « valeurs connues » du
+            # script d'origine (constantes de SA capture), tentative via le
+            # parseur EAPOL pur Python du sous-code 2 (offsets standard).
+            try:
+                anonce_hex, snonce_hex, wrapped_hex = _sae_extract_eapol_pure(pcap_path)
+                if anonce_hex:
+                    print("hex muet — nonces obtenus via parseur pur Python")
+            except ValueError:
+                anonce_hex = None
+        if not anonce_hex:
+            print("Echec hex, fallback valeurs connues")
+            anonce_hex = SAE_FALLBACK_ANONCE
+            snonce_hex = SAE_FALLBACK_SNONCE
+            wrapped_hex = SAE_FALLBACK_WRAPPED
+    else:
+        try:
+            anonce_hex, snonce_hex, wrapped_hex = _sae_extract_eapol_pure(pcap_path)
+        except ValueError as exc:
+            anonce_hex = None
+            print(f"handshake absent ({exc})")
+    if not anonce_hex or not snonce_hex:
+        return SolverOutcome(
+            "sae", "partial",
+            summary=("commits SAE lus mais handshake 4-way introuvable "
+                     "(ANonce/SNonce manquants)" if fr else
+                     "SAE commits read but no 4-way handshake (ANonce/SNonce missing)"),
+            findings={"sae_frames": n_sae, "sta": commit_sta["sa"],
+                      "ap": commit_ap["sa"]},
+            elapsed=time.time() - t_start)
+    print(f"ANonce={anonce_hex[:20]}...")
+    print(f"SNonce={snonce_hex[:20]}...")
+    if wrapped_hex:
+        print(f"Wrapped={wrapped_hex[:20]}...")
+    else:
+        print("Wrapped=absent (key_data < 56 octets)")
+    anonce = binascii.unhexlify(anonce_hex)
+    snonce = binascii.unhexlify(snonce_hex)
+
+    # --- PWE = inv(mask) * element_sta (2 parités Y testées) ---
+    print("\nCalcul PWE = inv(mask) * element_sta (2 parites Y testees)...")
+    PWE_candidates = []
+    base = scalar_mul(elem_sta, inv_mask)
+    PWE_candidates.append(base)
+    PWE_candidates.append(point_neg(base))
+
+    PMK = None
+    KCK = None
+    pwe_idx = -1
+    for idx, PWE in enumerate(PWE_candidates):
+        if _over():
+            print("[!] budget temps atteint — arrêt avant dérivation complète")
+            break
+        if PWE is None:                 # garde-fou intégration : point à l'infini
+            continue
+        print(f"  Test PWE {idx} x={PWE[0]:064x} y={PWE[1]:064x}")
+        rand_sta = (scalar_sta - mask_int) % SAE_N
+        tmp = scalar_mul(PWE, scalar_ap)
+        tmp = point_add(tmp, elem_ap)
+        K = scalar_mul(tmp, rand_sta)
+        if K is None:
+            continue
+        Kx = K[0].to_bytes(32, 'big')
+        keyseed = hmac.new(b"\x00" * 32, Kx, hashlib.sha256).digest()
+        val = (scalar_sta + scalar_ap) % SAE_N
+        keys = sha256_prf(keyseed, "SAE KCK and PMK", val.to_bytes(32, 'big'), 64)
+        pmk_cand = keys[32:]
+        kck_cand = keys[:32]
+        conf_sta = _sae_confirm(kck_cand, 1, scalar_sta, elem_sta, scalar_ap, elem_ap)
+        match_i = -1
+        for _mi, _mh in enumerate(confirm_cands):
+            if conf_sta.hex() == _mh:
+                match_i = _mi
+                break
+        if match_i >= 0:
+            via = (confirm_source if match_i < n_cands_capture
+                   else "constante-d-origine")
+            print(f"    -> Confirm STA match ({via} — candidat "
+                  f"{match_i + 1}/{len(confirm_cands)}) ! PWE {idx} est bon")
+            PMK = pmk_cand
+            KCK = kck_cand
+            pwe_idx = idx
+            break
+        else:
+            print(f"    conf={conf_sta.hex()[:20]}...")
+
+    if not PMK:
+        print("[!] Aucun PWE ne match les confirms")
+        return SolverOutcome(
+            "sae", "not_found",
+            summary=("aucun PWE ne vérifie le confirm SAE (mask inadapté ? "
+                     "essayez --sae-mask)" if fr else
+                     "no PWE matches the SAE confirm (wrong mask? try --sae-mask)"),
+            findings={"sae_frames": n_sae, "sta": commit_sta["sa"],
+                      "ap": commit_ap["sa"], "confirm_source": confirm_source},
+            elapsed=time.time() - t_start)
+    print(f"PMK={PMK.hex()}")
+
+    # --- PTK / KEK / TK (KDF d'origine du script) ---
+    print("\nDerivation PTK...")
+    min_mac, max_mac = (mac_ap, mac_sta) if mac_ap < mac_sta else (mac_sta, mac_ap)
+    min_nonce, max_nonce = (anonce, snonce) if anonce < snonce else (snonce, anonce)
+    data_ptk = min_mac + max_mac + min_nonce + max_nonce
+    PTK = sha256_prf(PMK, "Pairwise key expansion", data_ptk, 48)
+    KEK = PTK[16:32]
+    TK = PTK[32:48]
+    print(f"KEK={KEK.hex()}")
+    print(f"TK={TK.hex()}")
+
+    findings = {
+        "sae_frames": n_sae, "sta": commit_sta["sa"], "ap": commit_ap["sa"],
+        "mask": f"{mask_int:064x}", "pwe_parity": pwe_idx,
+        "confirm_source": confirm_source,
+        "kck": KCK.hex(), "pmk": PMK.hex(), "kek": KEK.hex(), "tk": TK.hex(),
+        "anonce": anonce_hex, "snonce": snonce_hex,
+    }
+
+    # --- unwrap RFC 3394 de la GTK (AES-ECB pur Python) ---
+    GTK = None
+    if wrapped_hex:
+        if not sae_crypto_selfcheck():
+            return SolverOutcome(
+                "sae", "error",
+                error="self-check AES (KAT FIPS-197) en échec — déchiffrement refusé",
+                findings=findings, elapsed=time.time() - t_start)
+        wrapped = binascii.unhexlify(wrapped_hex)
+        unwrapped = aes_unwrap(KEK, wrapped)
+        if not unwrapped:
+            print("Unwrap echoue")
+            findings["gtk_unwrap"] = "échec (intégrité RFC 3394)"
+        elif len(unwrapped) >= 35:
+            GTK = unwrapped[19:35]
+            print(f"GTK={GTK.hex()}")
+            findings["gtk"] = GTK.hex()
+    else:
+        print("Pas de clé wrappée à dérouler (key_data absente)")
+
+    if _over():
+        return SolverOutcome(
+            "sae", "partial",
+            summary="clés SAE dérivées — budget temps atteint avant déchiffrement",
+            findings=findings, elapsed=time.time() - t_start)
+
+    # --- déchiffrement des trames de données + preuves textuelles ---
+    evidence = []          # (n° trame, chaîne imprimable extraite)
+    n_dec = 0
+    if tshark_bin:
+        # Chemin d'origine (tshark -T fields), filtre MAC généralisé aux
+        # STA/AP des commits (OUI codés en dur dans le script d'origine).
+        print("\nExtraction data...")
+        mac_sta_s, mac_ap_s = _sae_hexmac(mac_sta), _sae_hexmac(mac_ap)
+        try:
+            cmd = [tshark_bin, "-r", pcap_path, "-Y", "wlan.fc.type==2",
+                   "-T", "fields", "-e", "frame.number", "-e", "wlan.sa",
+                   "-e", "wlan.da", "-e", "wlan.ccmp.extiv", "-e", "data",
+                   "-E", "separator=|"]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except Exception as exc:
+            res = None
+            print(f"échec tshark ({exc})")
+        print("Dechiffrement...")
+        for line in (res.stdout.splitlines() if res else []):
+            parts = line.strip().split("|")
+            if len(parts) < 5:
+                continue
+            num, sa_str, da_str, pn_str, data_hex = parts[:5]
+            if len(data_hex) < 40:
+                continue
+            sa_l, da_l = sa_str.lower(), da_str.lower()
+            if sa_l not in (mac_sta_s, mac_ap_s) or da_l not in (mac_sta_s, mac_ap_s):
+                continue
+            try:
+                pn = binascii.unhexlify(pn_str.replace("0x", "").zfill(12))
+                if sa_l == mac_sta_s:
+                    A1 = mac_ap; A2 = mac_sta; A3 = binascii.unhexlify(da_str.replace(":", ""))
+                    fc = binascii.unhexlify("0841")
+                    nonce = b"\x00" + mac_sta + pn
+                else:
+                    A1 = binascii.unhexlify(da_str.replace(":", "")); A2 = mac_ap
+                    A3 = binascii.unhexlify(sa_str.replace(":", ""))
+                    fc = binascii.unhexlify("0842")
+                    nonce = b"\x00" + mac_ap + pn
+                aad = fc + A1 + A2 + A3 + b"\x00\x00"
+                pt = ccmp_decrypt(TK, nonce, aad, data_hex)
+                if pt:
+                    n_dec += 1
+                    for _s in engine_extract_strings(pt):
+                        if len(evidence) < 400:
+                            evidence.append((num, _s))
+            except Exception:
+                pass
+        findings["decrypted_frames"] = n_dec
+        if evidence:
+            print("\nPreuves textuelles dans les trames déchiffrées :")
+            for _n, _s in evidence[:5]:
+                print("  Trame " + str(_n) + " : " + _s[:100])
+    else:
+        # Repli pur Python : decrypt_all_protected_data (sous-code 2) puis
+        # extraction des chaînes imprimables (preuves textuelles).
+        print("\nDechiffrement CCMP (parseur pur Python)...")
+        decrypted = decrypt_all_protected_data(pcap_path, TK)
+        findings["decrypted_frames"] = len(decrypted)
+        n_dec = len(decrypted)
+        for num, pt in decrypted:
+            for _s in engine_extract_strings(pt):
+                if len(evidence) < 400:
+                    evidence.append((str(num), _s))
+        if evidence:
+            print("\nPreuves textuelles dans les trames déchiffrées :")
+            for _n, _s in evidence[:5]:
+                print("  Trame " + _n + " : " + _s[:100])
+    print("Fini.")
+
+    if evidence:
+        findings["evidence_strings"] = [x for _, x in evidence[:200]]
+    if n_dec:
+        return SolverOutcome(
+            "sae", "found",
+            summary=(f"PMK dérivée (PWE parité {pwe_idx}), GTK déroulée, "
+                     f"{n_dec} trame(s) de données déchiffrée(s)" if fr else
+                     f"PMK derived (PWE parity {pwe_idx}), GTK unwrapped, "
+                     f"{n_dec} data frame(s) decrypted"),
+            findings=findings, elapsed=time.time() - t_start)
+    return SolverOutcome(
+        "sae", "partial",
+        summary=("PMK/KEK/TK dérivées et confirm vérifié, mais aucune trame "
+                 "de données déchiffrée" if fr else
+                 "PMK/KEK/TK derived and confirm verified, but no data frame "
+                 "decrypted"),
+        findings=findings, elapsed=time.time() - t_start)
+
+
+# ==============================================================================================
+#  ORCHESTRATEUR DES SOLVEURS INTÉGRÉS (appelé automatiquement par cmd_auto)
+# ==============================================================================================
+SOLVER_LABELS = {
+    "auth": ("auth (XMPP/HTTP/POP3/IMAP/SMTP/FTP/Telnet)",
+             "auth (XMPP/HTTP/POP3/IMAP/SMTP/FTP/Telnet)"),
+    "wpa2e": ("WPA2-Enterprise / RADIUS", "WPA2-Enterprise / RADIUS"),
+    "wep": ("WEP-40", "WEP-40"),
+    "sae": ("WPA3-SAE", "WPA3-SAE"),
+}
+
+def _solve_summary_line(oc: "SolverOutcome") -> str:
+    fr = get_lang() == "fr"
+    label = SOLVER_LABELS.get(oc.name, (oc.name, oc.name))[0 if fr else 1]
+    icon = _solve_icon(oc.status)
+    line = f"  {icon} {label} : {oc.status}"
+    if oc.status == "error":
+        line += f" — {oc.error}"
+    elif oc.summary:
+        line += f" — {oc.summary}"
+    if oc.elapsed:
+        line += f"  ({oc.elapsed:.1f}s)"
+    return line
+
+def _write_solve_artifact(path: str, report: "SolveReport", log_text: str) -> None:
+    """Écrit <base>-solve.txt : statuts, trouvailles (JSON) et sortie complète."""
+    ensure_parent(path)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# tshark2hashcat — rapport des solveurs intégrés\n")
+        f.write(f"# capture   : {report.pcap}\n")
+        f.write(f"# date      : {now_iso()}\n")
+        f.write("# mode      : %s\n" % ("profond (--deep)" if report.deep else "rapide"))
+        f.write("# budget    : %s\n" % ("illimité" if not report.budget
+                                        else f"{report.budget} s/solveur"))
+        f.write(f"# durée     : {report.elapsed:.2f} s\n#\n")
+        f.write("# statuts :\n")
+        for oc in report.outcomes:
+            f.write(f"#   {oc.name:<6} {oc.status:<15} {oc.summary or oc.error}\n")
+        f.write("\n# ===== trouvailles (JSON) =====\n")
+        payload = {
+            oc.name: {
+                "status": oc.status,
+                "summary": oc.summary,
+                "error": oc.error,
+                "elapsed": round(oc.elapsed, 3),
+                "findings": oc.findings,
+            }
+            for oc in report.outcomes
+        }
+        f.write(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        f.write("\n\n# ===== sortie complète des solveurs =====\n")
+        f.write(log_text)
+        if log_text and not log_text.endswith("\n"):
+            f.write("\n")
+
+def _solve_preflight(pcap, packets, result, is_json, tshark_path, show=True,
+                     scan=None):
+    """Détection préalable étendue (intégration v3) : inventaire ciblé, PAR
+    PROTOCOLE, de ce qui est réellement attaquable dans la capture :
+
+      - auth     : protocoles applicatifs présents (scan léger des couches
+                   JSON : xmpp/http/ftp/pop/imap/smtp/telnet) ;
+      - RADIUS   : trames + attribut Message-Authenticator (type 80) présent
+                   → le secret partagé est cassable hors ligne (RFC 2869) ;
+      - EAPOL    : messages du 4-way handshake disponibles ;
+      - WEP      : trames data + réutilisation d'IV (force de l'attaque) ;
+      - SAE/WPA3 : trames commit/confirm (algo 3) ;
+      - hashcat  : lignes déjà extraites par le pipeline principal — elles
+                   sont AFFICHÉES (« le hash est rendu ») avant les questions.
+
+    Réutilise les parseurs déjà intégrés ; toute erreur est ignorée :
+    détection partielle plutôt qu'échec. `pertinents` liste les solveurs
+    annoncés (tous sont lancés comme avant — les non pertinents rendent
+    « not_applicable », comportement inchangé). Retourne un dict.
+
+    show : affiche le panneau ; scan : force les parseurs pcap même sans
+    affichage (défaut = show ; la batterie appelle show=False, scan=True).
+    """
+    det = {"is_json": bool(is_json),
+           "packets": len(packets) if packets else 0,
+           "auth_protos": {}, "sae_frames": 0, "eapol": None,
+           "radius": 0, "radius_msgauth": False,
+           "wep_frames": 0, "wep_iv_reuse": 0,
+           "hashcat_modes": {}, "hashcat_lines": [], "pertinents": []}
+    if packets:
+        protos = ("xmpp", "http", "ftp", "pop", "imap", "smtp", "telnet")
+        for pkt in packets:
+            try:
+                lay = pkt_layers(pkt)
+            except Exception:
+                continue
+            for p in protos:
+                if p in lay:
+                    det["auth_protos"][p] = det["auth_protos"].get(p, 0) + 1
+    if result is not None:
+        try:
+            for mode, line in result.all_lines():
+                det["hashcat_modes"][int(mode)] = \
+                    det["hashcat_modes"].get(int(mode), 0) + 1
+                if len(det["hashcat_lines"]) < 12:
+                    det["hashcat_lines"].append((int(mode), line))
+        except Exception:
+            pass
+    if (show if scan is None else scan) \
+            and not is_json and pcap and os.path.isfile(str(pcap)):
+        try:
+            det["sae_frames"] = int(detect_sae_frames(str(pcap)))
+        except Exception:
+            pass
+        try:
+            frames = extract_radius_packets_from_pcap(str(pcap))
+            det["radius"] = len(frames)
+            det["radius_msgauth"] = any(
+                getattr(a, "type", None) == 80
+                for f in frames for a in getattr(f, "attributes", ()))
+        except Exception:
+            pass
+        try:
+            _ap, _cli, hs = extract_handshake_from_pcap(str(pcap))
+            det["eapol"] = sorted(hs.keys()) if hs else None
+        except Exception:
+            det["eapol"] = None
+        try:
+            n, ivs = 0, set()
+            for linktype, brut in lire_pcap(str(pcap)):
+                tr = extraire_trame_wep(enlever_entete_radio(linktype, brut))
+                if tr:
+                    n += 1
+                    ivs.add(tr[0])
+            det["wep_frames"] = n
+            det["wep_iv_reuse"] = max(0, n - len(ivs))
+        except Exception:
+            pass
+    rel = []
+    if det["auth_protos"] or det["packets"] or (not is_json and tshark_path):
+        rel.append("auth")
+    if det["radius"] or det["eapol"]:
+        rel.append("wpa2e")
+    if det["wep_frames"]:
+        rel.append("wep")
+    if det["sae_frames"]:
+        rel.append("sae")
+    det["pertinents"] = rel
+    if show:
+        fr_ = get_lang() == "fr"
+        protos_s = ", ".join("%s×%d" % (p, c)
+                             for p, c in sorted(det["auth_protos"].items()))
+        print("  Détection préalable :" if fr_ else "  Preflight detection:")
+        if is_json:
+            print("    export tshark JSON  : %d paquet(s) — protocoles auth : %s"
+                  % (det["packets"], protos_s or "?"))
+            print("    WPA2-E / WEP / SAE  : non applicables (export JSON)")
+        else:
+            if det["packets"]:
+                auth_s = "%d paquet(s) chargé(s)" % det["packets"]
+            elif tshark_path:
+                auth_s = ("tshark disponible → export JSON à la volée" if fr_
+                          else "tshark available → JSON export on the fly")
+            else:
+                auth_s = ("pcap brut sans tshark → solveur auth indisponible "
+                          "(installez tshark ou passez un export « tshark -T json »)"
+                          if fr_ else
+                          "raw pcap without tshark → auth solver unavailable "
+                          "(install tshark or pass a « tshark -T json » export)")
+            if protos_s:
+                auth_s += " — " + protos_s
+            eapol_s = (("handshake 4-way présent (%s)"
+                        % ",".join("M%d" % m for m in det["eapol"]))
+                       if det["eapol"] else
+                       ("aucun handshake EAPOL" if fr_ else "no EAPOL handshake"))
+            rad_s = "%d trame(s)" % det["radius"]
+            if det["radius"]:
+                rad_s += (" — Message-Authenticator : OUI → secret cassable "
+                          "hors ligne" if det["radius_msgauth"] else
+                          " — Message-Authenticator absent")
+            if det["wep_frames"]:
+                wep_s = ("%d trame(s) data — réutilisation d'IV : %d (%s)"
+                         % (det["wep_frames"], det["wep_iv_reuse"],
+                            "attaque favorable" if det["wep_iv_reuse"] > 0
+                            else "aucun IV réutilisé"))
+            else:
+                wep_s = "0 trame(s) data"
+            print("    auth applicative    : %s" % auth_s)
+            print("    RADIUS              : %s" % rad_s)
+            print("    EAPOL               : %s" % eapol_s)
+            print("    WEP                 : %s" % wep_s)
+            print("    SAE / WPA3          : %d trame(s) commit/confirm"
+                  % det["sae_frames"])
+        if det["hashcat_modes"]:
+            ms = ", ".join("-m %d ×%d" % (m, c)
+                           for m, c in sorted(det["hashcat_modes"].items()))
+            print("    hashcat (pipeline)  : %s" % ms)
+            for mode, ln in det["hashcat_lines"][:4]:
+                print("      -m %d : %s"
+                      % (mode, ln if len(ln) <= 96 else ln[:93] + "…"))
+        if det["pertinents"]:
+            noms = {"auth": "auth", "wpa2e": "WPA2-E/RADIUS",
+                    "wep": "WEP", "sae": "SAE"}
+            print("    → solveurs pertinents : %s (les autres rendront "
+                  "« not_applicable »)"
+                  % ", ".join(noms[p] for p in det["pertinents"]))
+    return det
+
+
+def _solve_ask_inputs(det, wordlist, sae_mask, auth_mask, result, fr, deep):
+    """Questions interactives ciblées — UNE par protocole, posée seulement si
+    la détection préalable la rend utile ET si l'option CLI correspondante est
+    absente (intégration v3 étendue ; « faire la bonne demande pour chaque
+    protocole »). Ordre :
+
+      1) wordlist globale  — alimente auth / RADIUS / WEP ;
+      2) mask auth         — si des cibles auth sont attendues (syntaxe du
+         sous-code 1 : 'frag?l?l?l', '?d?d?d?d'…) ;
+      3) candidats RADIUS  — si Message-Authenticator détecté (testés AVANT
+         les dictionnaires du solveur) ;
+      4) WEP profond       — si trames WEP détectées et --deep absent
+         (bascule le solveur WEP seul en échelle complète) ;
+      5) hash WPA + mask SAE — si trames SAE détectées : le hash (-m 22000)
+         est rendu d'abord, puis le mask est demandé (exemple demandé :
+         « WPA3 : renvoyer le hash et demander le masque s'il est disponible »).
+
+    Uniquement sur TTY (ou ask=True). Toute réponse par défaut = Entrée ;
+    EOF/Ctrl-C → valeur par défaut (jamais de blocage). Retourne
+    (wordlist, sae_mask, auth_mask, radius_extra, wep_deep).
+    """
+    wl = wordlist
+    m_auth = auth_mask
+    radius_extra = []
+    wep_deep = False
+
+    def _ask_ligne(prompt):
+        try:
+            r = input(prompt).strip().strip('"').strip("'")
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            r = ""
+        return r
+
+    # 1) wordlist globale
+    if not (wl and os.path.isfile(wl)):
+        if det.get("sae_frames"):
+            print("  [i] WPA3-SAE utilise le MASK (dernière question), pas la wordlist.")
+        rep_ = _ask_ligne("  Wordlist pour les solveurs (auth/RADIUS/WEP) [aucune] : ")
+        if rep_ and os.path.isfile(rep_):
+            wl = rep_
+            print("    → wordlist : %s" % wl)
+        elif rep_:
+            print("    (fichier introuvable : %s — wordlist ignorée)" % rep_)
+    # 2) mask auth (solv1)
+    if not m_auth and "auth" in (det.get("pertinents") or []):
+        protos = ", ".join(sorted(det.get("auth_protos") or {})) or "cibles à détecter"
+        rep_ = _ask_ligne("  Mask auth pour %s (ex. 'frag?l?l?l') [aucun] : "
+                          % protos)
+        if rep_:
+            m_auth = rep_
+            print("    → mask auth : %s" % m_auth)
+    # 3) candidats pour le secret RADIUS
+    if det.get("radius") and det.get("radius_msgauth"):
+        rep_ = _ask_ligne("  Candidats pour le secret RADIUS (séparés par des "
+                          "virgules) [aucun] : ")
+        if rep_:
+            radius_extra = [c.strip() for c in rep_.replace(";", ",").split(",")
+                            if c.strip()]
+            print("    → %d candidat(s) ajouté(s) en tête de recherche"
+                  % len(radius_extra))
+    # 4) WEP : échelle complète maintenant ?
+    if det.get("wep_frames") and not deep:
+        rep_ = _ask_ligne("  WEP : %d trame(s) (IV réutilisés : %d) — lancer "
+                          "l'échelle COMPLÈTE maintenant (long ; comme --deep "
+                          "pour WEP uniquement) ? [o/N] : "
+                          % (det["wep_frames"],
+                             det.get("wep_iv_reuse", 0))).lower()
+        wep_deep = rep_ in ("o", "oui", "y", "yes")
+        if wep_deep:
+            print("    → WEP en mode profond (aucune limite de temps)")
+    # 5) SAE : hash rendu, puis mask demandé
+    mask = sae_mask
+    if det.get("sae_frames") and not mask:
+        lines = []
+        if result is not None:
+            try:
+                lines = [ln for mode, ln in result.all_lines()
+                         if int(mode) == 22000]
+            except Exception:
+                lines = []
+        if lines:
+            print("  Hash(s) WPA extrait(s) par le pipeline (hashcat -m 22000) :")
+            for ln in lines[:3]:
+                print("    " + (ln if len(ln) <= 110 else ln[:107] + "…"))
+            if len(lines) > 3:
+                print("    (+ %d autre(s))" % (len(lines) - 3))
+        else:
+            print("  (pas de hash -m 22000 disponible — handshake EAPOL absent "
+                  "ou pipeline sans tshark)")
+        rep_ = _ask_ligne("  Mask SAE (hex) [%s…] : " % SAE_DEFAULT_MASK[:16])
+        if rep_:
+            mask = rep_
+            print("    → mask SAE : %s"
+                  % (mask[:24] + ("…" if len(mask) > 24 else "")))
+        else:
+            print("    → mask SAE : défaut du solveur")
+    return wl, mask, m_auth, radius_extra, wep_deep
+
+
+def _solve_highlights_for(oc):
+    """PARTIE 1/2 — trouvailles d'un solveur (libellés identiques à la
+    synthèse historique : « mot de passe … », « secret RADIUS », « PMK (SAE) »,
+    « TK », « clé WEP-40 »…)."""
+    fnd = oc.findings or {}
+    hl = []
+    if oc.name == "auth":
+        for c in fnd.get("credentials", []) or []:
+            tag = f"mot de passe [{c.get('proto')}/{c.get('mechanism')}] {c.get('username') or '?'}"
+            hl.append((tag, c.get("password"), ""))
+    elif oc.name == "wpa2e":
+        if fnd.get("radius_secret"):
+            hl.append(("secret RADIUS", fnd["radius_secret"], ""))
+        if fnd.get("pmk"):
+            hl.append(("PMK", fnd["pmk"], ""))
+        if fnd.get("tk"):
+            hl.append(("TK (CCMP)", fnd["tk"], ""))
+    elif oc.name == "wep" and fnd.get("key_hex"):
+        hl.append(("clé WEP-40", fnd.get("key_ascii") or "", fnd["key_hex"]))
+    elif oc.name == "sae":
+        if fnd.get("pmk"):
+            hl.append(("PMK (SAE)", fnd["pmk"], ""))
+        if fnd.get("tk"):
+            hl.append(("TK (SAE)", fnd["tk"], ""))
+    return hl
+
+
+def _solve_is_fail(oc):
+    """Échec à afficher en PARTIE 2/2 : statut non résolu, OU cibles auth
+    détectées-mais-non-résolues même si le statut global est « ok »."""
+    return (oc.status not in ("found", "ok", "not_applicable")
+            or bool((oc.findings or {}).get("failed_targets")))
+
+
+def _solve_hashcat_collect(report, result):
+    """PARTIE 2/2 — rassemble les hashes hashcat en cas d'échec : {mode:
+    [lignes]}. Sources : (1) cibles auth échouées ayant un mode natif
+    (APOP → -m 20, CRAM-MD5 → -m 10200), (2) TOUTES les lignes déjà
+    extraites par le pipeline principal (-m 22000 WPA/WPA3, -m 5600
+    NetNTLMv2…). Ne fait rien si aucun solveur n'a échoué."""
+    by_mode = {}
+    fails = [oc for oc in report.outcomes if _solve_is_fail(oc)]
+    if not fails:
+        return by_mode
+    for oc in fails:
+        for t in (oc.findings or {}).get("failed_targets", []) or []:
+            if t.get("hashcat_line") and t.get("hashcat_mode"):
+                by_mode.setdefault(int(t["hashcat_mode"]), []).append(
+                    str(t["hashcat_line"]))
+    if result is not None:
+        try:
+            for mode, line in result.all_lines():
+                by_mode.setdefault(int(mode), []).append(line)
+        except Exception:
+            pass
+    for m in list(by_mode):
+        by_mode[m] = list(dict.fromkeys(by_mode[m]))
+    return by_mode
+
+
+def _solve_hashcat_write(by_mode, artifact_path):
+    """Écrit un fichier <rapport>-echec-m<mode>.hash par mode (format
+    hashcat : un fichier = un mode, aucune ligne de commentaire).
+    Retourne [(mode, chemin, nb)]."""
+    files = []
+    if not by_mode or not artifact_path:
+        return files
+    base = str(artifact_path)
+    if base.endswith("-solve.txt"):
+        base = base[: -len("-solve.txt")]
+    for mode, lines in sorted(by_mode.items()):
+        path = f"{base}-echec-m{mode}.hash"
+        try:
+            ensure_parent(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            files.append((mode, path, len(lines)))
+        except OSError:
+            pass
+    return files
+
+
+def _solve_hashcat_print(report, hc_modes, hc_files, fr):
+    """Affichage PARTIE 2/2 : raison par protocole échoué + conversions
+    hashcat (lignes, fichiers .hash écrits et commandes prêtes à l'emploi)."""
+    fails = [oc for oc in report.outcomes if _solve_is_fail(oc)]
+    if not fails:
+        print("  (aucun échec — toutes les cibles détectées ont été résolues)"
+              if fr else
+              "  (no failure — every detected target was solved)")
+        return
+    for oc in fails:
+        label = SOLVER_LABELS.get(oc.name, (oc.name, oc.name))[0 if fr else 1]
+        reason = oc.summary or oc.error or oc.status
+        print(f"  ── {label} ──")
+        print(f"    ✘ {reason}")
+        for t in (oc.findings or {}).get("failed_targets", []) or []:
+            tag = "[%s/%s] %s" % (t.get("proto"), t.get("mechanism"),
+                                  t.get("username") or "?")
+            if t.get("hashcat_line") and t.get("hashcat_mode"):
+                print(f"      {tag} → hashcat -m {t['hashcat_mode']} : "
+                      f"{t['hashcat_line']}")
+            elif t.get("note"):
+                print(f"      {tag} → {t['note']}")
+        if oc.name == "wpa2e":
+            print("      secret RADIUS : HMAC-MD5(Message-Authenticator) — pas "
+                  "de mode hashcat natif ; wordlist + --deep" if fr else
+                  "      RADIUS secret: HMAC-MD5(Message-Authenticator) — no "
+                  "native hashcat mode; wordlist + --deep")
+        elif oc.name == "wep":
+            print("      WEP : hors périmètre hashcat — wordlist ciblée (-w) ou "
+                  "--deep (échelle d'alphabets complète)" if fr else
+                  "      WEP: out of hashcat scope — targeted wordlist (-w) or "
+                  "--deep (full alphabet scale)")
+        elif oc.name == "sae":
+            print("      SAE : PWE non retrouvé — essayez --sae-mask <mask du "
+                  "challenge> ; tout handshake WPA est converti en -m 22000 "
+                  "ci-dessous" if fr else
+                  "      SAE: PWE not recovered — try --sae-mask <mask>; any WPA "
+                  "handshake is converted to -m 22000 below")
+        elif oc.name == "auth" and oc.status == "error":
+            print("      (solveur en erreur — aucune cible analysée ; tshark "
+                  "manquant ? passez un export « tshark -T json »)" if fr else
+                  "      (solver error — no target analyzed; missing tshark? "
+                  "pass a « tshark -T json » export)")
+    for mode, path, n in hc_files:
+        print(f"    → {n} hash(es) hashcat -m {mode} : {path}")
+        print(f"      hashcat -m {mode} -a 0 -O -w 3 \"{path}\" <wordlist>")
+    if not hc_files:
+        if hc_modes:
+            print("    → hash(es) hashcat (aucun rapport demandé — lignes "
+                  "ci-dessous) :" if fr else
+                  "    → hashcat hashes (no artifact — lines below):")
+            for mode, lines in sorted(hc_modes.items()):
+                for ln in lines[:3]:
+                    print("      -m %d : %s"
+                          % (mode, ln if len(ln) <= 100 else ln[:97] + "…"))
+        else:
+            print("    (aucun hash convertible au format hashcat pour ces "
+                  "échecs)" if fr else
+                  "    (no hashcat-convertible hash for these failures)")
+
+
+def run_integrated_solvers(pcap, *, result=None, packets=None, tshark_path=None,
+                           wordlist="", deep=False, solve_timeout=0,
+                           quiet=False, verbose=False, artifact_path="",
+                           sae_mask=None, auth_mask=None, ask=None,
+                           only=None, extra_candidates=(), wep_deep=False,
+                           cores=None):
+    """Étape « solveurs intégrés » du pipeline auto — 100 % automatique.
+
+    Ordre logique (les résultats circulent d'une étape à l'autre) :
+      1) auth   (sous-code 1) : identifiants appliqués (clair + cassage) ;
+      2) wpa2e  (sous-code 2) : secret RADIUS — reçoit les mots de passe de
+         l'étape 1 ET les credentials déjà extraits par le pipeline principal ;
+      3) wep    (sous-code 3) : clé WEP-40 — la clé ASCII trouvée repart dans
+         les candidats croisés ;
+      4) sae    (sous-code 4) : WPA3-SAE — PWE via mask (--sae-mask), PTK,
+         GTK déroulée (RFC 3394), déchiffrement CCMP des trames de données.
+
+    Chaque solveur est isolé (try/except) : une erreur est signalée dans le
+    rapport et le pipeline continue. Les sorties console d'origine sont
+    dupliquées dans <rapport>-solve.txt (masquées sur le terminal en --quiet,
+    mais toujours archivées).
+
+    ask : None (défaut) = questions interactives posées seulement si stdin est
+        un TTY ; True/False = forcer/désactiver (--no-ask). Une question par
+        protocole, uniquement si la détection préalable la rend utile :
+        wordlist (auth/RADIUS/WEP), mask auth (--auth-mask), candidats secret
+        RADIUS, bascule WEP profonde, hash WPA rendu + mask SAE (--sae-mask).
+        En mode non interactif (pipe, script, --quiet) le comportement reste
+        100 % automatique.
+
+    only : None (défaut historique) = tous les solveurs ; sinon liste de noms
+        parmi ("auth", "wpa2e", "wep", "sae") — le moteur ne lance que les
+        solveurs décidés pertinents (§14), les autres sont SKIP avec raison.
+    extra_candidates : candidats supplémentaires (knowledge base du moteur,
+        corrélations, §15) — testés par auth (réutilisation cross_try),
+        wpa2e et sae. Liste vide = comportement identique à avant.
+    wep_deep : force l'échelle WEP complète (indépendant de --deep et de la
+        question interactive).
+
+    Retourne SolveReport. Ne lève jamais d'exception vers l'appelant.
+    """
+    fr = get_lang() == "fr"
+    # Bug du run réel (build 18695) : les chemins « solve »/moteur arrivaient
+    # ici avec tshark_path=None alors que tshark EST installé — le solveur SAE
+    # le retrouvait (find_tshark interne) mais la pré-détection auth annonçait
+    # « pcap brut sans tshark » et auth/RADIUS perdaient l'analyse complète.
+    # Résolution unique à l'entrée : --tshark explicite > recherche standard.
+    if not tshark_path:
+        try:
+            tshark_path = find_tshark()
+        except Exception:
+            tshark_path = None
+    budget = int(solve_timeout or 0)
+    if budget <= 0:
+        budget = 0 if deep else SOLVE_DEFAULT_BUDGET
+
+    if not quiet:
+        section_title("SOLVEURS INTÉGRÉS" if fr else "INTEGRATED SOLVERS")
+        info(("mode %s | budget par solveur : %s"
+              % ("profond (--deep)" if deep else "rapide",
+                 "illimité" if not budget else f"{budget} s")) if fr else
+             ("mode %s | per-solver budget: %s"
+              % ("deep (--deep)" if deep else "fast",
+                 "unlimited" if not budget else f"{budget}s")))
+
+    is_json = bool(is_json_export(pcap))
+    wl = wordlist if (wordlist and os.path.isfile(wordlist)) else None
+
+    # Candidats croisés : identifiants déjà découverts par l'extraction principale
+    bonus: list = []
+    if result is not None:
+        for c in getattr(result, "credentials", None) or []:
+            for v in (getattr(c, "password", None), getattr(c, "username", None)):
+                if v and v not in bonus:
+                    bonus.append(v)
+    for v in extra_candidates or ():        # moteur : knowledge base (§15)
+        if v and v not in bonus:
+            bonus.append(v)
+
+    # Détection préalable (annonce + ciblage des questions) puis questions
+    # interactives — uniquement sur TTY (ou ask=True), jamais en mode pipe.
+    interactive = sys.stdin.isatty() if ask is None else bool(ask)
+    det = _solve_preflight(pcap, packets, result, is_json, tshark_path,
+                           show=(not quiet) or interactive)
+    auth_mask_eff = auth_mask
+    radius_extra: list = []
+    wep_deep_eff = bool(wep_deep)       # paramètre moteur + question interactive
+    if interactive:
+        wl, sae_mask, auth_mask_eff, radius_extra, wep_asked = _solve_ask_inputs(
+            det, wl, sae_mask, auth_mask, result, fr, deep)
+        wep_deep_eff = wep_deep_eff or wep_asked
+
+    report = SolveReport(pcap=str(pcap), deep=bool(deep), budget=budget)
+    buf = io.StringIO()
+    tee = _Tee(None if quiet else sys.stdout, buf)
+
+    def _guard(name, fn):
+        """Exécute un solveur de façon isolée : erreur → SolverOutcome, jamais de crash."""
+        t0 = time.time()
+        try:
+            oc = fn()
+        except Exception as exc:  # noqa: BLE001 — isolation explicite et voulue
+            oc = SolverOutcome(name, "error",
+                               error=f"{type(exc).__name__}: {exc}",
+                               elapsed=time.time() - t0)
+            if verbose:
+                import traceback
+                traceback.print_exc()
+        if not oc.elapsed:
+            oc.elapsed = time.time() - t0
+        report.outcomes.append(oc)
+        return oc
+
+    json_na = ("capture JSON : les solveurs Wi-Fi/RADIUS nécessitent le pcap brut"
+               if fr else "JSON capture: Wi-Fi/RADIUS solvers need the raw pcap")
+
+    def _want(name):
+        """only=None (défaut historique) → tous les solveurs comme avant ;
+        sinon sélection explicite (moteur : décisions §14)."""
+        return only is None or name in set(only)
+
+    with Timer() as gt, redirect_stdout(tee):
+        # --- 1) sous-code auth (ex auth_capture_solver.py) ---
+        if _want("auth"):
+            auth_deadline = (time.time() + budget) if budget else None
+            oc_auth = _guard("auth", lambda: run_auth_solver(
+                pcap, wordlist=wl, packets=packets, tshark_path=tshark_path,
+                deep=deep, deadline=auth_deadline, mask=auth_mask_eff,
+                jobs=(int(cores) if cores else None),
+                extra_passwords=list(extra_candidates or ())))
+            for c in oc_auth.findings.get("credentials", []) or []:
+                for v in (c.get("password"), c.get("username")):
+                    if v and v not in bonus:
+                        bonus.append(v)
+
+        # --- 2) sous-code WPA2-Enterprise/RADIUS (ex resolve.py) ---
+        if _want("wpa2e"):
+            if is_json:
+                _guard("wpa2e", lambda: SolverOutcome("wpa2e", "not_applicable",
+                                                      summary=json_na))
+            else:
+                oc_w = _guard("wpa2e", lambda: run_wpa2e_solver(
+                    rad=str(pcap), wifi=str(pcap),
+                    directory=(str(Path(pcap).parent) if deep else None),
+                    wordlists=[wl] if wl else [],
+                    deep=deep, budget_s=budget or None,
+                    extra_candidates=list(bonus) + list(radius_extra)))
+                v = oc_w.findings.get("radius_secret")
+                if v and v not in bonus:
+                    bonus.append(v)
+
+        # --- 3) sous-code WEP (ex wep_crack_auto.py) ---
+        if _want("wep"):
+            if is_json:
+                _guard("wep", lambda: SolverOutcome("wep", "not_applicable",
+                                                    summary=json_na))
+            else:
+                oc_wep = _guard("wep", lambda: run_wep_solver(
+                    pcap, deep=(deep or wep_deep_eff), budget_s=budget or None,
+                    wordlist=wl, cores=cores))
+                k = (oc_wep.findings.get("key_ascii") or "").strip()
+                if k and k not in bonus:
+                    bonus.append(k)
+
+        # --- 4) sous-code SAE (auto-sae — WPA3-SAE v9) ---
+        if _want("sae"):
+            if is_json:
+                _guard("sae", lambda: SolverOutcome("sae", "not_applicable",
+                                                    summary=json_na))
+            else:
+                _guard("sae", lambda: run_sae_solver(
+                    pcap, wordlists=[wl] if wl else [], deep=deep,
+                    budget_s=budget or None, extra_candidates=list(bonus),
+                    mask=sae_mask, tshark_path=tshark_path))
+
+    report.elapsed = gt.seconds
+
+    # --- artefact : <rapport>-solve.txt ---
+    if artifact_path:
+        try:
+            _write_solve_artifact(artifact_path, report, buf.getvalue())
+            report.artifact = artifact_path
+        except OSError as exc:
+            warn(f"rapport solveurs non écrit : {exc}")
+
+    # --- synthèse console (hors redirection stdout) : DEUX PARTIES
+    # clairement identifiées, par protocole. La PARTIE 2/2 alimente aussi des
+    # fichiers .hash par mode (écrits même en --quiet).
+    hc_modes = _solve_hashcat_collect(report, result)
+    hc_files = _solve_hashcat_write(hc_modes, report.artifact)
+    if not quiet:
+        for oc in report.outcomes:
+            print(_solve_summary_line(oc))
+        section_title("RÉSULTATS — PARTIE 1/2 : TROUVÉ" if fr
+                      else "RESULTS — PART 1/2: FOUND")
+        for oc in report.outcomes:
+            label = SOLVER_LABELS.get(oc.name, (oc.name, oc.name))[0 if fr else 1]
+            print(f"  ── {label} ──")
+            shown = False
+            for lbl, val, extra in _solve_highlights_for(oc):
+                if val:
+                    ok(f"{lbl} : {val}" + (f"   ({extra})" if extra else ""))
+                    shown = True
+            if not shown:
+                print("    (rien)")
+        section_title("RÉSULTATS — PARTIE 2/2 : NON TROUVÉ → HASHCAT" if fr
+                      else "RESULTS — PART 2/2: NOT FOUND → HASHCAT")
+        _solve_hashcat_print(report, hc_modes, hc_files, fr)
+        if report.artifact:
+            info(f"rapport solveurs : {report.artifact}")
+    elif report.found_any() and report.artifact:
+        # --quiet : une seule ligne si des résultats existent
+        print(f"solveurs : résultats dans {report.artifact}")
+
+    return report
+
+
+# ==============================================================================================
+#  MOTEUR D'ANALYSE INTÉGRÉ — project · knowledge · graph · targets · solve (MISSION §1-43)
+# ==============================================================================================
+# ============================================================================
+#  MOTEUR — MODÈLE DE DONNÉES GLOBAL · PREUVES · KNOWLEDGE BASE · CANDIDATS
+# ----------------------------------------------------------------------------
+#  Évolution du programme vers un moteur d'analyse et de corrélation de
+#  preuves réseau (mission §3, §4, §6, §7, §12). Rien ici ne remplace le
+#  pipeline existant : le moteur l'ENCAPSULE (extraction, solveurs, rapports)
+#  et ajoute la mémoire partagée (Knowledge Base), la traçabilité (chaque
+#  valeur garde sa provenance capture/trame/protocole/champ) et les statuts
+#  honnêtes (une hypothèse n'est jamais promue en fait sans validation).
+# ============================================================================
+
+ENGINE_VERSION = "1.5"      # v1.2 : noms de fichiers professionnels (aucun
+                            # nom interne de module), TOUT en clair (plus
+                            # aucun masquage PII ni troncature de valeur),
+                            # un dossier par hash hashcat, rapport simplifié.
+                            # Historique : v1.1 rapport trié + secrets/
+                            # messages écrits + cœurs + hashcat externe ;
+                            # v1.1.1 hashcat lancé depuis son dossier,
+                            # réutilisation des résultats solveurs, MIC
+                            # EAPOL multi-AKM, cibles -m 22000 incomplètes
+                            # INVALID, déduplication, rapport plafonné.
+
+# ============================================================================
+#  NOMS DES FICHIERS DE SORTIE (v1.2 — demande utilisateur : « harmonise les
+#  noms pour des noms utilisés en entreprise, pas inventaire_pro… »)
+# ----------------------------------------------------------------------------
+#  Aucune abréviation interne de module dans les noms visibles. Un seul
+#  endroit définit les noms : tout le programme passe par ces fonctions, donc
+#  console, rapports et fichiers disent exactement la même chose.
+# ============================================================================
+
+OUT_GUIDE_TXT = "GUIDE.txt"
+OUT_REPORT_TXT = "RAPPORT.txt"
+OUT_REPORT_HTML = "rapport.html"
+OUT_REPORT_XLSX = "rapport.xlsx"
+OUT_DATA_JSON = "donnees.json"
+OUT_GRAPH_DOT = "graphe.dot"
+OUT_SECRETS_TXT = "secrets-confirmes.txt"
+OUT_DECRYPTED_TXT = "messages-dechiffres.txt"
+OUT_HASHES_DIR = "hashes"
+OUT_HASHES_INDEX = "INDEX.txt"
+OUT_SOLVE_DIR = "solveurs"
+OUT_CACHE_DIR = "cache"
+OUT_WORK_DIR = "travail"
+INVENTORY_BASE = "inventaire-reseau"
+
+
+def out_path(prj, name):
+    """Chemin absolu d'un fichier de sortie à la racine du dossier projet."""
+    return os.path.join(str(getattr(prj, "out_dir", ".")), name)
+
+
+def out_sub(prj, subdir, *rest):
+    """Chemin absolu dans un sous-dossier de sortie (hashes/, solveurs/…)."""
+    return os.path.join(str(getattr(prj, "out_dir", ".")), subdir, *rest)
+
+
+def hash_dir_name(mode, line, user="", capture=""):
+    """Nom du dossier d'UN hash hashcat (v1.2 : « un dossier par hash »).
+
+    Mode + identifiant court + utilisateur quand il existe — lisible et trié
+    par type d'attaque, sans caractère interdit sous Windows/Linux/macOS.
+    """
+    ident = hashlib.sha256(
+        str(line).encode("utf-8", "replace")).hexdigest()[:10]
+    bits = ["m%s" % int(mode)]
+    if user:
+        bits.append(str(user))
+    bits.append(ident)
+    return safe_filename("-".join(bits), fallback="m%s-%s" % (int(mode), ident))
+
+
+def hash_dir(prj, mode, line, user="", capture=""):
+    """Dossier complet d'un hash : <projet>/hashes/m<MODE>-<user>-<id>/."""
+    return out_sub(prj, OUT_HASHES_DIR,
+                   hash_dir_name(mode, line, user=user, capture=capture))
+
+
+def engine_hash_dirs(prj):
+    """Tous les dossiers de hash du projet, triés (mode, identifiant)."""
+    out = []
+    for t in sorted(prj.targets.values(),
+                    key=lambda x: (int(x.mode), x.line)):
+        out.append((t, hash_dir(prj, t.mode, t.line, user=t.user,
+                                capture=t.capture)))
+    return out
+
+
+def _hash_label(t):
+    """Étiquette lisible d'une cible : protocole/utilisateur plutôt qu'un
+    numéro de mode seul (v1.2 : « rapport clair et très simple »)."""
+    mi = mode_info(int(t.mode)) or {}
+    nm = str(mi.get("name") or "").strip()
+    bits = ["-m %s" % int(t.mode)]
+    if nm:
+        bits.append(nm)
+    if t.protocol:
+        bits.append(str(t.protocol))
+    if t.user:
+        bits.append(str(t.user))
+    return " · ".join(bits)
+
+
+# -- Statuts de preuve / connaissance (§4) ----------------------------------
+EV_OBSERVED = "OBSERVED"            # vu dans une capture (source précise)
+EV_CORRELATED = "CORRELATED"        # confirmé par recoupement inter-captures
+EV_INFERRED = "INFERRED"            # déduit (ex. candidat généré)
+EV_HYPOTHESIS = "HYPOTHESIS"        # supposition — jamais présentée comme fait
+EV_USER = "USER_SUPPLIED"           # fourni par l'utilisateur (§7)
+EV_KNOWN = "KNOWN_KNOWLEDGE"        # connaissance interne (règle, pattern)
+EV_VALIDATED = "VALIDATED"          # vérifié cryptographiquement (§21)
+EV_INVALIDATED = "INVALIDATED"      # réfuté
+EV_UNKNOWN = "UNKNOWN"
+EV_RANK = {EV_INVALIDATED: -1, EV_UNKNOWN: 0, EV_HYPOTHESIS: 1, EV_INFERRED: 2,
+           EV_USER: 3, EV_KNOWN: 3, EV_OBSERVED: 4, EV_CORRELATED: 5,
+           EV_VALIDATED: 6}
+
+# -- Statuts standardisés des solveurs (§14) --------------------------------
+ST_NOT_APPLICABLE = "NOT_APPLICABLE"
+ST_NOT_FOUND = "NOT_FOUND"
+ST_INSUFFICIENT = "INSUFFICIENT_DATA"
+ST_PARTIAL = "PARTIAL"
+ST_FOUND = "FOUND"
+ST_VALIDATED = "VALIDATED"
+ST_INVALID = "INVALID"
+ST_TIMEOUT = "TIMEOUT"
+ST_ERROR = "ERROR"
+ST_UNAVAILABLE = "UNAVAILABLE"
+SOLVER_STATUS_MAP = {"found": ST_VALIDATED, "partial": ST_PARTIAL,
+                     "ok": ST_FOUND, "not_found": ST_NOT_FOUND,
+                     "not_applicable": ST_NOT_APPLICABLE,
+                     "unavailable": ST_UNAVAILABLE, "error": ST_ERROR}
+
+# -- Statuts de validation (§21) --------------------------------------------
+VAL_VALIDATED = "VALIDATED"; VAL_LIKELY = "LIKELY"
+VAL_INCONCLUSIVE = "INCONCLUSIVE"; VAL_FAILED = "FAILED"
+
+# -- Contextes (§8) ----------------------------------------------------------
+ENGINE_CONTEXTS = ("CTF", "LAB", "PENTEST", "FORENSIC")
+
+# -- Non-identités (§5) : adresses présentes dans TOUTES les captures -------
+# Les partager n'est pas un signal de corrélation (4e run réel :
+# « ch10.json ↔ sae.json [MEDIUM] — même(s) MAC : ff:ff:ff:ff:ff:ff »).
+# Utilisées par engine_correlate (filtrage à la source) ET par Project.load
+# (purge des corrélations déjà stockées dans project.json).
+ENGINE_NON_IDENTITES = {
+    "MAC": {"ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"},
+    "BSSID": {"ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"},
+    "IP": {"255.255.255.255", "0.0.0.0"},
+}
+
+# -- Types de connaissances (§6) ---------------------------------------------
+KB_TYPES = ("username", "password", "password_candidate", "secret", "key",
+            "pmk", "kek", "tk", "gtk", "ip", "mac", "hostname",
+            "domain", "realm", "spn", "ssid", "bssid", "service", "port",
+            "mask", "pattern", "word", "hash", "token", "salt", "nonce",
+            "challenge", "credential",
+            # inventaire PRO (types injectés par engine_inventory_capture)
+            "email", "apikey", "cookie", "phone", "url", "certificate",
+            "user_agent", "software")
+
+
+@dataclass
+class EvItem:
+    """Une connaissance/preuve élémentaire — valeur + type + provenance (§3).
+
+    `source` est une chaîne lisible (« cap.pcap / frame 184 / XMPP / champ ») ;
+    les champs structurés (capture/frame/protocol/field) permettent la
+    remontée de traçabilité complète (§29).
+    """
+    value: str
+    type: str
+    status: str = EV_OBSERVED
+    confidence: float = 1.0
+    source: str = ""
+    capture: str = ""
+    frame: Optional[int] = None
+    protocol: str = ""
+    tags: list = field(default_factory=list)
+    created_at: str = ""
+    generated_from: list = field(default_factory=list)   # §12 (candidats)
+    note: str = ""
+    field: str = ""     # NOMMÉ EN DERNIER : l'attribut « field » ne doit pas
+                        # masquer dataclasses.field utilisé ci-dessus
+
+    def key(self):
+        return (self.type, self.value)
+
+    def to_dict(self):
+        return {"value": self.value, "type": self.type, "status": self.status,
+                "confidence": round(float(self.confidence), 3),
+                "source": self.source, "capture": self.capture,
+                "frame": self.frame, "protocol": self.protocol,
+                "field": self.field, "tags": list(self.tags),
+                "created_at": self.created_at or now_iso(),
+                "generated_from": list(self.generated_from), "note": self.note}
+
+
+class KnowledgeBase:
+    """Base de connaissances du projet (§6) — mémoire partagée entre captures,
+    rounds et commandes. Toute entrée garde valeur/type/source/scope/
+    confiance/statut/tags/provenance. Dédupliquée par (type, valeur) : les
+    sources se cumulent, le statut le plus fort l'emporte (INVALIDATED sauf).
+    """
+
+    def __init__(self):
+        self._items: "dict[tuple, EvItem]" = {}
+        self._sources: "dict[tuple, list]" = {}
+        self.new_count = 0            # compteur par round (état stable, §18)
+
+    def add(self, value, type_, status=EV_OBSERVED, confidence=1.0, source="",
+            capture="", frame=None, protocol="", field_="", tags=(),
+            generated_from=(), note="", scope=""):
+        if value is None:
+            return None
+        value = str(value)
+        if not value or not value.strip():
+            return None
+        k = (type_, value)
+        src = source or (f"{capture} / frame {frame}" if frame is not None
+                         else capture)
+        if scope:
+            src = f"{src} [{scope}]"
+        if k in self._items:
+            it = self._items[k]
+            self._sources.setdefault(k, [])
+            if src and src not in self._sources[k]:
+                self._sources[k].append(src)
+            promoted = False
+            if status == EV_INVALIDATED:
+                it.status = EV_INVALIDATED; promoted = True
+            elif EV_RANK.get(status, 0) > EV_RANK.get(it.status, 0):
+                it.status = status; promoted = True
+            it.confidence = max(it.confidence, float(confidence))
+            for t in tags:
+                if t not in it.tags:
+                    it.tags.append(t)
+            for g in generated_from:
+                if g not in it.generated_from:
+                    it.generated_from.append(g)
+            if note and not it.note:
+                it.note = note
+            if promoted:
+                self.new_count += 1
+            return it
+        it = EvItem(value=value, type=type_, status=status,
+                    confidence=float(confidence), source=src, capture=capture,
+                    frame=frame, protocol=protocol, field=field_,
+                    tags=list(tags), created_at=now_iso(),
+                    generated_from=list(generated_from), note=note)
+        self._items[k] = it
+        self._sources[k] = [src] if src else []
+        self.new_count += 1
+        return it
+
+    def promote(self, type_, value, status, confidence=None, note=""):
+        it = self._items.get((type_, str(value)))
+        if it is None:
+            return self.add(value, type_, status=status,
+                            confidence=confidence if confidence is not None else 1.0,
+                            note=note)
+        if status == EV_INVALIDATED or EV_RANK.get(status, 0) > EV_RANK.get(it.status, 0):
+            it.status = status
+            self.new_count += 1
+        if confidence is not None:
+            it.confidence = max(it.confidence, float(confidence))
+        if note and not it.note:
+            it.note = note
+        return it
+
+    def get(self, type_, value):
+        return self._items.get((type_, str(value)))
+
+    def by_type(self, *types):
+        return [it for it in self._items.values() if it.type in types]
+
+    def values(self, *types, statuses=None):
+        out = []
+        for it in self._items.values():
+            if types and it.type not in types:
+                continue
+            if statuses and it.status not in statuses:
+                continue
+            if it.status == EV_INVALIDATED:
+                continue
+            out.append(it.value)
+        return out
+
+    def all_items(self):
+        return list(self._items.values())
+
+    def __len__(self):
+        return len(self._items)
+
+    def snapshot_count(self):
+        return len(self._items)
+
+    def to_list(self):
+        out = []
+        for it in self._items.values():
+            d = it.to_dict()
+            d["sources"] = list(self._sources.get(it.key(), []))
+            out.append(d)
+        return out
+
+    def load_list(self, data):
+        for d in data or []:
+            it = self.add(d.get("value"), d.get("type", "word"),
+                          status=d.get("status", EV_OBSERVED),
+                          confidence=d.get("confidence", 1.0),
+                          source=d.get("source", ""),
+                          capture=d.get("capture", ""),
+                          frame=d.get("frame"),
+                          protocol=d.get("protocol", ""),
+                          field_=d.get("field", ""),
+                          tags=d.get("tags", ()),
+                          generated_from=d.get("generated_from", ()),
+                          note=d.get("note", ""))
+            if it is not None:
+                for s in d.get("sources", []):
+                    self._sources.setdefault(it.key(), [])
+                    if s not in self._sources[it.key()]:
+                        self._sources[it.key()].append(s)
+        self.new_count = 0
+
+
+@dataclass
+class Entity:
+    """Entité du graphe (§3/§9) : User, Host, Service, SSID, Domain…"""
+    kind: str
+    value: str
+    attrs: dict = field(default_factory=dict)
+    evidence: list = field(default_factory=list)   # sources (traçabilité §29)
+
+    def key(self):
+        return (self.kind, self.value)
+
+    def to_dict(self):
+        return {"kind": self.kind, "value": self.value,
+                "attrs": dict(self.attrs), "evidence": list(self.evidence)}
+
+
+@dataclass
+class Relation:
+    """Relation typée du graphe de connaissances (§9)."""
+    src: str            # "User:alice"
+    dst: str            # "Capture:cap.pcap"
+    rel: str            # appears_in / authenticated_to / has_ip / related_to…
+    evidence: str = ""
+    capture: str = ""
+    frame: Optional[int] = None
+    ts: Optional[float] = None
+    confidence: float = 1.0
+
+    def to_dict(self):
+        return {"src": self.src, "dst": self.dst, "rel": self.rel,
+                "evidence": self.evidence, "capture": self.capture,
+                "frame": self.frame, "ts": self.ts,
+                "confidence": round(float(self.confidence), 3)}
+
+
+@dataclass
+class CaptureInfo:
+    """État d'une capture dans le projet (§3)."""
+    path: str
+    name: str
+    sha16: str = ""
+    sha256: str = ""
+    size: int = 0
+    mtime: float = 0.0
+    status: str = "PENDING"    # ANALYZED|PARTIAL|NO_DATA|ERROR|PENDING
+    error: str = ""
+    packets: int = 0
+    protocols: dict = field(default_factory=dict)
+    t_first: Optional[float] = None
+    t_last: Optional[float] = None
+    ips: list = field(default_factory=list)
+    macs: list = field(default_factory=list)
+    users: list = field(default_factory=list)
+    bssids: list = field(default_factory=list)
+    ssids: list = field(default_factory=list)
+    realms: list = field(default_factory=list)
+    spns: list = field(default_factory=list)
+    hostnames: list = field(default_factory=list)   # inventaire PRO
+    emails: list = field(default_factory=list)      # masqués (PII)
+    det: dict = field(default_factory=dict)     # détection préalable (v3.1)
+    n_hashes: int = 0
+    n_creds: int = 0
+    analysis_seconds: float = 0.0
+    cached: bool = False
+
+    def to_dict(self):
+        return {k: getattr(self, k) for k in (
+            "path", "name", "sha16", "sha256", "size", "mtime", "status",
+            "error", "packets", "protocols", "t_first", "t_last", "ips",
+            "macs", "users", "bssids", "ssids", "realms", "spns",
+            "hostnames", "emails", "det",
+            "n_hashes", "n_creds", "analysis_seconds", "cached")}
+
+    @classmethod
+    def from_dict(cls, d):
+        ci = cls(path=d.get("path", ""), name=d.get("name", ""))
+        for k, v in d.items():
+            if hasattr(ci, k):
+                setattr(ci, k, v)
+        return ci
+
+
+@dataclass
+class HashTarget:
+    """Cible Hashcat centralisée (§10/§11/§23) — jamais inventée : modes du
+    pipeline principal ou conversions vérifiées des solveurs."""
+    mode: int
+    line: str
+    kind: str = "HASH"          # HASH | CHALLENGE→HASH | PMKID
+    user: str = ""
+    domain: str = ""
+    capture: str = ""
+    frame: Optional[int] = None
+    protocol: str = ""
+    why: str = ""               # pourquoi exploitable (§23) — ou raison d'échec (§24)
+    status: str = "READY"       # READY|CRACKED|RESOLVED|INVALID|NO_WORDLIST|OUT_OF_SCOPE
+    password: str = ""
+    validation: str = ""        # VALIDATED|LIKELY|INCONCLUSIVE|FAILED (§21)
+
+    def key(self):
+        return (int(self.mode), self.line)
+
+    def to_dict(self):
+        return {"mode": self.mode, "line": self.line, "kind": self.kind,
+                "user": self.user, "domain": self.domain,
+                "capture": self.capture, "frame": self.frame,
+                "protocol": self.protocol, "why": self.why,
+                "status": self.status, "password": self.password,
+                "validation": self.validation}
+
+
+@dataclass
+class SolverRun:
+    """Une exécution (ou non-exécution décidée) de solveur (§14/§34)."""
+    capture: str
+    solver: str
+    decision: str               # RUN | SKIP
+    reason: str                 # pourquoi lancé / pourquoi PAS lancé (§24)
+    evidence: str = ""          # capture / trames / compteurs
+    status: str = ST_NOT_APPLICABLE
+    detail: str = ""
+    seconds: float = 0.0
+    findings: dict = field(default_factory=dict)
+    run: str = ""               # horodatage du run moteur (hygiène rapport :
+                                # les erreurs des runs précédents ne passent
+                                # plus pour actuelles — run réel build 18695)
+
+    def to_dict(self):
+        return {"capture": self.capture, "solver": self.solver,
+                "decision": self.decision, "reason": self.reason,
+                "evidence": self.evidence, "status": self.status,
+                "detail": self.detail, "seconds": round(self.seconds, 3),
+                "findings": self.findings, "run": self.run}
+
+
+def engine_latest_runs(prj):
+    """solver_runs du DERNIER run moteur seulement (hygiène rapport).
+
+    Run réel build 18695 : 3 runs accumulés → 192 décisions affichées, dont
+    d'anciennes erreurs (latin-1, SAE NOT_FOUND pré-fix) présentées comme
+    actuelles. project.json garde TOUT (§28, source de vérité) ; console,
+    RAPPORT.txt et HTML n'affichent que le dernier run + le compte archivé.
+    Repli : aucun run horodaté (vieux projet) → tout est affiché, comme avant.
+    """
+    stamp = (prj.settings or {}).get("last_run") or ""
+    cur = [s for s in prj.solver_runs if getattr(s, "run", "") == stamp]
+    return cur if (cur or not stamp) else list(prj.solver_runs)
+
+
+@dataclass
+class ChainStep:
+    action: str
+    status: str                 # CONFIRMED|PROBABLE|POSSIBLE|THEORETICAL|FAILED (§20)
+    detail: str = ""
+    source: str = ""
+
+
+@dataclass
+class ResolutionChain:
+    """Chaîne de résolution (§17/§20) : PCAP → cible → solveur → secret →
+    déchiffrement → nouvelle preuve. Chaque étape est classée ; une chaîne
+    hypothétique n'est jamais présentée comme une compromission réelle."""
+    name: str
+    steps: list = field(default_factory=list)   # [ChainStep]
+    outcome: str = ""
+
+    def to_dict(self):
+        return {"name": self.name, "outcome": self.outcome,
+                "steps": [{"action": s.action, "status": s.status,
+                           "detail": s.detail, "source": s.source}
+                          for s in self.steps]}
+
+
+class Project:
+    """Projet = dossier analysé (§3) : captures, KB, entités, relations,
+    corrélations, cibles, solveurs, chaînes, rounds, journal [AUTO] (§34).
+    Sérialisé en project.json — source de vérité (§28) — rechargeable par
+    les commandes knowledge/graph/targets/solve (travail itératif)."""
+
+    def __init__(self, root, out_dir, context="CTF", scope=(), excluded=()):
+        self.root = str(root)
+        self.out_dir = str(out_dir)
+        self.context = str(context).upper()
+        self.scope = list(scope)
+        self.excluded = list(excluded)
+        self.captures: "list[CaptureInfo]" = []
+        self.kb = KnowledgeBase()
+        self.entities: "dict[tuple, Entity]" = {}
+        self.relations: "list[Relation]" = []
+        self.correlations: "list[dict]" = []
+        self.targets: "dict[tuple, HashTarget]" = {}
+        self.solver_runs: "list[SolverRun]" = []
+        self.chains: "list[ResolutionChain]" = []
+        self.decryptions: "list[dict]" = []
+        self.timeline: "list[dict]" = []
+        self.missing: "list[dict]" = []
+        self.errors: "list[dict]" = []
+        self.rounds: "list[dict]" = []
+        self.actions_log: "list[dict]" = []
+        self.wordlist = None            # chemin validé (§13)
+        self.wordlist_status = "NO_WORDLIST"
+        self.wordlist_lines = 0
+        self.wordlist_bytes = 0
+        self.settings: dict = {}
+        self.created_at = now_iso()
+        self.updated_at = self.created_at
+        self.transient: dict = {}       # result/packets en mémoire (non sérialisé)
+
+    # -- entités / relations ------------------------------------------------
+    def add_entity(self, kind, value, evidence="", **attrs):
+        if not value:
+            return None
+        value = str(value)
+        k = (kind, value)
+        ent = self.entities.get(k)
+        if ent is None:
+            ent = Entity(kind=kind, value=value)
+            self.entities[k] = ent
+        if evidence and evidence not in ent.evidence:
+            ent.evidence.append(evidence)
+        for a, v in attrs.items():
+            if v not in (None, "", []):
+                ent.attrs.setdefault(a, v)
+        return ent
+
+    def add_relation(self, src, dst, rel, evidence="", capture="", frame=None,
+                     ts=None, confidence=1.0):
+        r = Relation(src=src, dst=dst, rel=rel, evidence=evidence,
+                     capture=capture, frame=frame, ts=ts, confidence=confidence)
+        sig = (r.src, r.dst, r.rel, r.capture, r.frame)
+        if not any((x.src, x.dst, x.rel, x.capture, x.frame) == sig
+                   for x in self.relations[-400:]):
+            self.relations.append(r)
+        return r
+
+    def add_target(self, mode, line, kind="HASH", user="", domain="",
+                   capture="", frame=None, protocol="", why="",
+                   status="READY", validation=""):
+        if not line:
+            return None
+        k = (int(mode), line)
+        t = self.targets.get(k)
+        if t is None:
+            t = HashTarget(mode=int(mode), line=line, kind=kind, user=user,
+                           domain=domain, capture=capture, frame=frame,
+                           protocol=protocol, why=why, status=status,
+                           validation=validation)
+            # v1.1.1 — intégrité -m 22000 (§42/§23) : une ligne WPA*01* dont
+            # les champs obligatoires sont vides (run réel : export tshark
+            # partiel « eapol.json » → WPA*01*mic*ap*sta****) est INCASSABLE
+            # par hashcat — la laisser READY envoyait l'utilisateur dans le
+            # mur (hashcat -m 22000 en échec sur ligne invalide). Statut
+            # INVALID + raison explicite ; le post-crack peut encore la passer
+            # RESOLVED si le MIC du même handshake est vérifié (jumelle brute).
+            if int(mode) == 22000 and line.startswith("WPA*") \
+                    and status == "READY":
+                _f = line.split("*")
+                if len(_f) < 9 or not all(_f[2:8]):
+                    t.status = "INVALID"
+                    t.validation = VAL_FAILED
+                    t.why = (t.why + " — MAIS ligne incomplète (champs vides, "
+                             "ex. snonce/anonce/eapol) : export partiel, "
+                             "hashcat ne peut PAS l'exploiter ; fournir la "
+                             "capture brute ou un export 4-way complet")
+            self.targets[k] = t
+        else:
+            for attr, val in (("user", user), ("domain", domain),
+                              ("capture", capture), ("protocol", protocol)):
+                if val and not getattr(t, attr):
+                    setattr(t, attr, val)
+            if frame is not None and t.frame is None:
+                t.frame = frame
+            if why and not t.why:
+                t.why = why
+        return t
+
+    def log_action(self, action, reason, evidence="", inputs="", output="",
+                   status="DONE", echo=True):
+        """Journal [AUTO] (§34) : chaque action automatique importante est
+        affichée ET archivée (ACTION / REASON / EVIDENCE / INPUT / OUTPUT /
+        STATUS)."""
+        rec = {"action": action, "reason": reason, "evidence": evidence,
+               "input": inputs, "output": output, "status": status,
+               "at": now_iso()}
+        self.actions_log.append(rec)
+        if echo:
+            print("  [AUTO]")
+            print(f"    Action   : {action}")
+            print(f"    Reason   : {reason}")
+            if evidence:
+                print(f"    Evidence : {evidence}")
+            if inputs:
+                print(f"    Input    : {inputs}")
+            if output:
+                print(f"    Output   : {output}")
+            print(f"    Status   : {status}")
+        return rec
+
+    def add_missing(self, what, why, capture="", needed=""):
+        if any(x["what"] == what and x["capture"] == capture
+               for x in self.missing):
+            return                              # dédupliqué (rapport lisible)
+        self.missing.append({"what": what, "why": why, "capture": capture,
+                             "needed": needed})
+
+    def add_error(self, where, error, capture=""):
+        self.errors.append({"where": where, "error": str(error)[:400],
+                            "capture": capture})
+
+    def add_timeline(self, event, capture="", frame=None, ts=None, kind=""):
+        self.timeline.append({"event": event, "capture": capture,
+                              "frame": frame, "ts": ts, "kind": kind})
+
+    # -- sérialisation (§28 : le JSON est la source de vérité) ---------------
+    def to_json(self):
+        self.updated_at = now_iso()
+        return {
+            "project": {"root": self.root, "out_dir": self.out_dir,
+                        "context": self.context, "scope": self.scope,
+                        "excluded": self.excluded,
+                        "engine_version": ENGINE_VERSION,
+                        "app_version": str(__version__),
+                        "created_at": self.created_at,
+                        "updated_at": self.updated_at,
+                        "wordlist": self.wordlist,
+                        "wordlist_status": self.wordlist_status,
+                        "wordlist_lines": self.wordlist_lines,
+                        "settings": self.settings},
+            "captures": [c.to_dict() for c in self.captures],
+            "timeline": list(self.timeline),
+            "entities": [e.to_dict() for e in self.entities.values()],
+            "relations": [r.to_dict() for r in self.relations],
+            "correlations": list(self.correlations),
+            "evidence": [it.to_dict() for it in self.kb.all_items()
+                         if it.status in (EV_OBSERVED, EV_CORRELATED,
+                                          EV_VALIDATED, EV_INVALIDATED)],
+            "knowledge": self.kb.to_list(),
+            "authentications": [it.to_dict() for it in
+                                self.kb.by_type("credential")],
+            "credentials": [it.to_dict() for it in self.kb.by_type("password")
+                            if it.status in (EV_OBSERVED, EV_VALIDATED,
+                                             EV_CORRELATED)],
+            "secrets": [it.to_dict() for it in self.kb.by_type("secret")],
+            "cryptographic_material": [it.to_dict() for it in self.kb.by_type(
+                "pmk", "kek", "tk", "gtk", "key")],
+            "hashes": [t.to_dict() for t in self.targets.values()],
+            "hashcat_targets": [t.to_dict() for t in self.targets.values()
+                                if t.status in ("READY", "CRACKED", "RESOLVED")],
+            "solver_results": [s.to_dict() for s in self.solver_runs],
+            "decryption_results": list(self.decryptions),
+            "resolution_chains": [c.to_dict() for c in self.chains],
+            "attack_paths": [c.to_dict() for c in self.chains],
+            "mitre": list(self.settings.get("mitre", [])),
+            "missing_data": list(self.missing),
+            "failed_operations": [s.to_dict() for s in self.solver_runs
+                                  if s.status in (ST_NOT_FOUND, ST_TIMEOUT,
+                                                  ST_ERROR, ST_INVALID)],
+            "limitations": list(self.settings.get("limitations", [])),
+            "next_actions": list(self.settings.get("next_actions", [])),
+            "generated_files": list(self.settings.get("generated_files", [])),
+            "rounds": list(self.rounds),
+            "actions_log": list(self.actions_log),
+            "errors": list(self.errors),
+        }
+
+    def save(self, path=None):
+        path = path or out_path(self, OUT_DATA_JSON)
+        ensure_parent(path)
+        # Hygiène multi-runs (run réel build 18695) :
+        #  - generated_files : les mêmes fichiers ré-enregistrés à chaque run
+        #    apparaissaient en double (×2) dans la section 12 → tri + déduple.
+        #  - decryptions : le même (capture, méthode) rejoué à chaque run
+        #    s'accumulait → la DERNIÈRE entrée par clé remplace les anciennes
+        #    (c'est elle qui fait foi : clés/trames du run courant).
+        gf = self.settings.get("generated_files")
+        if gf:
+            self.settings["generated_files"] = sorted(set(gf))
+        if self.decryptions:
+            _vus = {}
+            for d in self.decryptions:
+                _vus[(d.get("capture"), d.get("method"))] = d
+            self.decryptions = list(_vus.values())
+        payload = self.to_json()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=1, ensure_ascii=False, default=str)
+        os.replace(tmp, path)
+        return path
+
+    @classmethod
+    def load(cls, out_dir):
+        path = os.path.join(out_dir, OUT_DATA_JSON)
+        if not os.path.isfile(path):
+            # Migration v1.2 : les projets produits avant le renommage
+            # (project.json) se rechargent tels quels — aucune donnée perdue.
+            legacy = os.path.join(out_dir, "project.json")
+            if os.path.isfile(legacy):
+                path = legacy
+        if not os.path.isfile(path):
+            return None
+        # errors="replace" : project.json retouché à la main sur Windows
+        # (cp1252…) reste chargeable — zéro exception Unicode (run réel).
+        with open(path, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        p = data.get("project", {})
+        prj = cls(p.get("root", ""), out_dir, context=p.get("context", "CTF"),
+                  scope=p.get("scope", ()), excluded=p.get("excluded", ()))
+        prj.created_at = p.get("created_at", prj.created_at)
+        prj.wordlist = p.get("wordlist")
+        prj.wordlist_status = p.get("wordlist_status", "NO_WORDLIST")
+        prj.wordlist_lines = p.get("wordlist_lines", 0)
+        prj.settings = p.get("settings", {})
+        prj.captures = [CaptureInfo.from_dict(d) for d in data.get("captures", [])]
+        prj.kb.load_list(data.get("knowledge", []))
+        # Migration (v1.0) : les entrées KB de type « flag » étaient
+        # synthétisées par d'anciennes versions de l'outil. L'outil ne
+        # connaît plus aucun format de flag (§42 : on n'affiche que ce qui
+        # est réellement trouvé — les secrets). Les entrées héritées sont
+        # retirées au chargement et le retrait est tracé dans settings.
+        _legacy = [k for k, it in prj.kb._items.items()
+                   if getattr(it, "type", "") == "flag"]
+        for k in _legacy:
+            del prj.kb._items[k]
+        if _legacy:
+            prj.settings["kb_pruned_legacy"] = (
+                prj.settings.get("kb_pruned_legacy", 0) + len(_legacy))
+        for d in data.get("entities", []):
+            e = prj.add_entity(d.get("kind", "?"), d.get("value", ""),
+                               *(d.get("evidence") or [""])[0:1])
+            if e is not None:
+                e.attrs.update(d.get("attrs", {}))
+                for ev in d.get("evidence", []):
+                    if ev not in e.evidence:
+                        e.evidence.append(ev)
+        for d in data.get("relations", []):
+            prj.relations.append(Relation(
+                src=d.get("src", ""), dst=d.get("dst", ""), rel=d.get("rel", ""),
+                evidence=d.get("evidence", ""), capture=d.get("capture", ""),
+                frame=d.get("frame"), ts=d.get("ts"),
+                confidence=d.get("confidence", 1.0)))
+        prj.correlations = data.get("correlations", [])
+        # Migration (4e run réel) : les corrélations déjà stockées dont les
+        # seules « identités » partagées sont des adresses broadcast/nulles
+        # sont du bruit (§5) — supprimées au chargement ; un run les
+        # recalcule de toute façon. Celles qui partagent de vraies identités
+        # sont conservées telles quelles.
+        _n_cor = 0
+        _keep = []
+        for _c in prj.correlations:
+            _sh = _c.get("shared") or {}
+            _reste = any(str(v).lower() not in ENGINE_NON_IDENTITES.get(k, ())
+                         for k, vals in _sh.items() for v in (vals or []))
+            if _sh and not _reste:
+                _n_cor += 1        # 100 % broadcast/nul → bruit, purgé
+            else:
+                _keep.append(_c)
+        prj.correlations = _keep
+        if _n_cor:
+            prj.settings["correlations_pruned_broadcast"] = (
+                prj.settings.get("correlations_pruned_broadcast", 0) + _n_cor)
+        for d in data.get("hashes", []):
+            t = prj.add_target(d.get("mode", 0), d.get("line", ""),
+                               kind=d.get("kind", "HASH"), user=d.get("user", ""),
+                               domain=d.get("domain", ""),
+                               capture=d.get("capture", ""),
+                               frame=d.get("frame"),
+                               protocol=d.get("protocol", ""),
+                               why=d.get("why", ""))
+            if t is not None:
+                t.status = d.get("status", t.status)
+                t.password = d.get("password", "")
+                t.validation = d.get("validation", "")
+        for d in data.get("solver_results", []):
+            sr = SolverRun(capture=d.get("capture", ""),
+                           solver=d.get("solver", ""),
+                           decision=d.get("decision", "RUN"),
+                           reason=d.get("reason", ""),
+                           evidence=d.get("evidence", ""),
+                           status=d.get("status", ST_NOT_APPLICABLE),
+                           detail=d.get("detail", ""),
+                           seconds=d.get("seconds", 0.0),
+                           findings=d.get("findings", {}) or {},
+                           run=d.get("run", ""))
+            prj.solver_runs.append(sr)
+        for d in data.get("resolution_chains", []):
+            ch = ResolutionChain(name=d.get("name", ""),
+                                 outcome=d.get("outcome", ""))
+            for s in d.get("steps", []):
+                ch.steps.append(ChainStep(action=s.get("action", ""),
+                                          status=s.get("status", "POSSIBLE"),
+                                          detail=s.get("detail", ""),
+                                          source=s.get("source", "")))
+            prj.chains.append(ch)
+        prj.decryptions = data.get("decryption_results", [])
+        # Migration (v1.0) : les vieux résultats de décryption peuvent
+        # porter un champ « flags » synthétisé par d'anciennes versions.
+        # La décryption elle-même reste vraie (trames vérifiées LLC/CRC32
+        # ou MIC) ; seul le champ hérité est retiré (§42 : jamais
+        # d'artefact synthétisé affiché comme trouvé). Retrait tracé.
+        _n_pf = 0
+        for _d in prj.decryptions:
+            if "flags" in _d:
+                _n_pf += len(_d.pop("flags") or [])
+        if _n_pf:
+            prj.settings["dec_pruned_legacy"] = (
+                prj.settings.get("dec_pruned_legacy", 0) + _n_pf)
+        prj.timeline = data.get("timeline", [])
+        prj.missing = data.get("missing_data", [])
+        prj.errors = data.get("errors", [])
+        prj.rounds = data.get("rounds", [])
+        prj.actions_log = data.get("actions_log", [])
+        return prj
+
+
+# ----------------------------------------------------------------------------
+# Connaissances externes (§7) — fichier --knowledge : JSON [{type,value,...}]
+# ou lignes « type:valeur » (# commentaires). Marquées USER_SUPPLIED.
+# ----------------------------------------------------------------------------
+def engine_load_knowledge_file(prj, path):
+    n = 0
+    try:
+        raw = open(path, encoding="utf-8", errors="replace").read()
+    except OSError as exc:
+        prj.add_error("knowledge", f"fichier illisible : {exc}", capture=path)
+        return 0
+    entries = None
+    if path.lower().endswith(".json"):
+        try:
+            entries = json.loads(raw)
+        except ValueError:
+            entries = None
+    if entries is None:
+        entries = []
+        for ln in raw.splitlines():
+            ln = ln.split("#", 1)[0].strip()
+            if not ln or ":" not in ln:
+                continue
+            ty, val = ln.split(":", 1)
+            entries.append({"type": ty.strip().lower(), "value": val.strip()})
+    for e in entries if isinstance(entries, list) else []:
+        if not isinstance(e, dict):
+            if isinstance(e, str) and e.strip():
+                e = {"type": "word", "value": e.strip()}
+            else:
+                continue
+        val = e.get("value")
+        ty = str(e.get("type", "word")).lower()
+        if ty not in KB_TYPES:
+            ty = "word"
+        if val is None or str(val) == "":
+            continue
+        prj.kb.add(val, ty, status=EV_USER, confidence=1.0,
+                   source=f"fichier connaissances {os.path.basename(path)}",
+                   tags=["KNOWLEDGE EXTERNE"],
+                   note=e.get("context", "") or e.get("note", ""))
+        n += 1
+    if n:
+        prj.log_action("Import connaissances externes",
+                       f"{n} entrée(s) depuis {path}",
+                       evidence="USER_SUPPLIED — affiché comme tel (§7)",
+                       output=f"{n} connaissance(s)", status="DONE", echo=False)
+    return n
+
+
+# ----------------------------------------------------------------------------
+# Moteur de candidats (§12) — génère des mots de passe plausibles à partir
+# des connaissances (usernames, mots, domaines, SSID, années, patterns),
+# chacun avec sa provenance (generated_from). Borné (limit) et déterministe.
+# ----------------------------------------------------------------------------
+def engine_generate_candidates(prj, limit=500):
+    annee = time.localtime().tm_year
+    years = [str(annee), str(annee - 1), str(annee + 1), "2024", "2025", "2026"]
+    for ci in prj.captures:
+        try:
+            y = str(time.localtime(ci.mtime).tm_year)
+            if y not in years:
+                years.append(y)
+        except (ValueError, OSError, OverflowError):
+            pass
+    suffixes = ["", "!", "1", "123", "1234", "@", ".", "2024", "2025", "2026"]
+    base_words = []
+    for ty in ("word", "username", "hostname", "domain", "realm", "ssid",
+               "service"):
+        for v in prj.kb.values(ty):
+            v = str(v)
+            if 2 <= len(v) <= 24:
+                base_words.append(v)
+    cands = []          # (value, generated_from)
+    seen = set()
+
+    def _push(val, srcs):
+        if val and val not in seen and len(val) <= 40:
+            seen.add(val)
+            cands.append((val, list(srcs)))
+
+    # mots connus tels quels + variantes de casse
+    for w in base_words:
+        _push(w, [f"word={w}"])
+        _push(w.capitalize(), [f"capitalize({w})"])
+        _push(w.upper(), [f"upper({w})"])
+    # username/mot + année + suffixes usuels (pattern « Thomas2026! »)
+    for w in base_words[:120]:
+        for y in years[:5]:
+            _push(w + y, [f"word={w}", f"year={y}"])
+            _push(w.capitalize() + y, [f"capitalize({w})", f"year={y}"])
+            _push(w + y + "!", [f"word={w}", f"year={y}", "suffix=!"])
+        for s in suffixes:
+            if s:
+                _push(w + s, [f"word={w}", f"suffix={s}"])
+                _push(w.capitalize() + s, [f"capitalize({w})", f"suffix={s}"])
+    # domaines/realmes : premier label
+    for d in prj.kb.values("domain", "realm"):
+        lab = str(d).replace(".", " ").replace("@", " ").split()[0] \
+            if str(d).strip() else ""
+        if lab:
+            _push(lab, [f"domain={d}"])
+            _push(lab.capitalize() + years[0], [f"domain={d}", f"year={years[0]}"])
+    # patterns/masks fournis par l'utilisateur : rien à « générer » (le mask
+    # est transmis tel quel au solveur auth) — signalés dans le rapport.
+    n_new = 0
+    for val, srcs in cands[:limit]:
+        before = prj.kb.get("password_candidate", val)
+        prj.kb.add(val, "password_candidate", status=EV_INFERRED,
+                   confidence=0.3, source="moteur de candidats (§12)",
+                   generated_from=srcs, tags=["generated"])
+        if before is None:
+            n_new += 1
+    return n_new
+
+
+def engine_candidate_passwords(prj, limit=800):
+    """Tous les mots de passe à tester en tête : VALIDATED/OBSERVED/USER +
+    candidats générés (les plus forts d'abord)."""
+    out = []
+    for st in (EV_VALIDATED, EV_USER, EV_OBSERVED, EV_CORRELATED):
+        for v in prj.kb.values("password", "secret", statuses=(st,)):
+            if v not in out:
+                out.append(v)
+    for v in prj.kb.values("password_candidate"):
+        if v not in out:
+            out.append(v)
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+# ============================================================================
+#  MOTEUR — INVENTAIRE · ANALYSE PAR CAPTURE · CACHE · CORRÉLATION · GRAPHE
+# ----------------------------------------------------------------------------
+#  Mission §5 (corrélation inter-pcap), §9 (graphe), §27 (timeline),
+#  §31 (cache), §33 (mode folder = analyse multi-captures). Encapsule le
+#  pipeline existant : _run_extraction (tshark/JSON), _solve_preflight
+#  (détection pure Python), parse_pcap/parse_80211 (sous-code 2).
+# ============================================================================
+
+ENGINE_CAP_EXTS = (".pcap", ".pcapng", ".cap", ".dmp", ".json")
+
+
+def engine_json_is_capture(path):
+    """True si un .json est un export de capture du moteur/tshark (une LISTE
+    de paquets, donc premier caractère non-blanc = `[`). Les rapports de
+    projet, fichiers de test et autres JSON objets sont ignorés proprement
+    au lieu de remonter 30 erreurs « export JSON inattendu »."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512)
+    except OSError:
+        return False
+    return head.lstrip()[:1] == b"["
+ENGINE_MAX_IPS = 2000          # garde-fous mémoire/rapport (captures énormes)
+ENGINE_MAX_MACS = 2000
+
+
+def engine_sha256(path, chunk=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def engine_inventory(root, recursive=True):
+    """§33 étape 1-2 : scan du dossier → captures (.pcap/.pcapng/.cap/.dmp
+    + exports tshark .json). Un fichier illisible n'arrête rien (§30)."""
+    base = Path(root).expanduser()
+    files = []
+    if base.is_file():
+        return [base]
+    if not base.is_dir():
+        return []
+    it = base.rglob("*") if recursive else base.iterdir()
+    for p in it:
+        try:
+            if p.is_file() and str(p).lower().endswith(ENGINE_CAP_EXTS):
+                files.append(p)
+        except OSError:
+            continue
+    return sorted(files, key=lambda x: str(x).lower())
+
+
+def engine_ssid_from_beacon(payload):
+    """SSID (tag 0) d'un beacon/probe-response — parseur d'IE minimal."""
+    try:
+        i = 12                       # timestamp(8) + interval(2) + cap(2)
+        n = len(payload)
+        while i + 1 < n:
+            tag = payload[i]; ln = payload[i + 1]
+            if tag == 0 and 0 < ln <= 32 and i + 2 + ln <= n:
+                s = payload[i + 2:i + 2 + ln]
+                return s.decode("utf-8", "replace")
+            i += 2 + ln
+    except Exception:
+        pass
+    return None
+
+
+def engine_mac_str(b):
+    """bytes(6) → « aa:bb:cc:dd:ee:ff » (None si invalide)."""
+    try:
+        if isinstance(b, (bytes, bytearray)) and len(b) == 6:
+            return ":".join("%02x" % x for x in b)
+    except Exception:
+        pass
+    return None
+
+
+def engine_pure_scan(path):
+    """Analyse 802.11 pure Python (sans tshark) : fenêtre temporelle,
+    BSSID, SSID — réutilise parse_pcap/parse_80211 du sous-code 2.
+    Garde-fou : le parsing 802.11 n'est tenté QUE si le linktype pcap est
+    IEEE802_11(105) ou RADIOTAP(127) — un pcap Ethernet n'est jamais lu
+    comme du 802.11 (zéro invention, §42). La fenêtre temporelle reste
+    extraite quel que soit le linktype."""
+    out = {"t_first": None, "t_last": None, "bssids": set(), "ssids": set(),
+           "frames": 0, "records": 0}
+    try:
+        linktype, records = parse_pcap(str(path))
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+    out["records"] = len(records)
+    is_80211 = int(linktype) in (105, 127)
+    for rec in records:
+        try:
+            ts = rec.ts_sec + (rec.ts_usec or 0) / 1e6
+            if ts > 1e8:
+                if out["t_first"] is None or ts < out["t_first"]:
+                    out["t_first"] = ts
+                if out["t_last"] is None or ts > out["t_last"]:
+                    out["t_last"] = ts
+            if not is_80211:
+                continue
+            p = parse_80211(rec.data, rec.frame_num)
+            if not p:
+                continue
+            out["frames"] += 1
+            ftype = p.get("type"); sub = p.get("subtype")
+            if ftype == 0:                       # management
+                b = engine_mac_str(p.get("addr3"))
+                if b:
+                    out["bssids"].add(b)
+                if sub in (8, 5):                # beacon / probe-resp
+                    s = engine_ssid_from_beacon(p.get("payload", b""))
+                    if s:
+                        out["ssids"].add(s)
+            elif ftype == 2:                     # data → BSSID conventionnel
+                b = engine_mac_str(p.get("addr1") if p.get("to_ds")
+                                   else p.get("addr2"))
+                if b:
+                    out["bssids"].add(b)
+        except Exception:
+            continue
+    return out
+
+
+def engine_ingest(prj, ci, data):
+    """Injecte le résultat normalisé d'une analyse (vif ou cache) dans le
+    projet : KB, entités, relations, cibles, timeline. Provenance complète
+    (§3/§29) : capture / frame / protocole / champ."""
+    cap = ci.name
+    kb = prj.kb
+    for proto, cnt in sorted((data.get("protocols") or {}).items()):
+        ci.protocols[proto] = cnt
+    ci.packets = data.get("packets", ci.packets)
+    ci.t_first = data.get("t_first", ci.t_first)
+    ci.t_last = data.get("t_last", ci.t_last)
+    ci.ips = list(data.get("ips") or [])[:ENGINE_MAX_IPS]
+    ci.macs = list(data.get("macs") or [])[:ENGINE_MAX_MACS]
+    for ip in ci.ips:
+        prj.add_entity("IP", ip, evidence=f"{cap} (ip.src/ip.dst)")
+        prj.add_relation(f"Capture:{cap}", f"IP:{ip}", "contains_ip",
+                         evidence="paquets observés", capture=cap)
+    for mac in ci.macs:
+        prj.add_entity("MAC", mac, evidence=f"{cap} (eth/wlan)")
+    for u in data.get("users") or []:
+        ci.users.append(u) if u not in ci.users else None
+        kb.add(u, "username", status=EV_OBSERVED, confidence=0.9,
+               capture=cap, protocol=data.get("user_proto", ""),
+               field_="username")
+        prj.add_entity("User", u, evidence=f"{cap} (identifiant observé)")
+        prj.add_relation(f"User:{u}", f"Capture:{cap}", "appears_in",
+                         evidence="identifiant dans le trafic", capture=cap)
+    for c in data.get("creds") or []:
+        proto, user, pw, frame = c.get("protocol", ""), c.get("username", ""), \
+            c.get("password", ""), c.get("frame")
+        ci.n_creds += 1
+        src = f"{cap} / frame {frame} / {proto}" if frame else f"{cap} / {proto}"
+        kb.add(user, "username", status=EV_OBSERVED, confidence=0.95,
+               source=src, capture=cap, frame=frame, protocol=proto)
+        kb.add(pw, "password", status=EV_OBSERVED, confidence=0.95,
+               source=src, capture=cap, frame=frame, protocol=proto)
+        kb.add(f"{user}:{pw}", "credential", status=EV_OBSERVED,
+               confidence=0.95, source=src, capture=cap, frame=frame,
+               protocol=proto)
+        prj.add_entity("User", user, evidence=src)
+        prj.add_relation(f"User:{user}", f"Capture:{cap}",
+                         "authenticated_with", evidence=src, capture=cap,
+                         frame=frame)
+        prj.add_timeline(f"identifiant observé {proto} : {user}", capture=cap,
+                         frame=frame, kind="credential")
+    for h in data.get("hashes") or []:
+        mode, line = h.get("mode"), h.get("line", "")
+        if mode is None or not line:
+            continue
+        ci.n_hashes += 1
+        t = prj.add_target(mode, line, kind="HASH", user=h.get("user", "") or "",
+                           domain=h.get("domain", "") or "", capture=cap,
+                           frame=h.get("frame"), protocol=h.get("protocol", ""),
+                           why=f"format validé par le pipeline principal "
+                               f"(mode {mode}) — {h.get('protocol', '')}",
+                           validation=VAL_LIKELY)
+        if t is not None and h.get("user"):
+            kb.add(h["user"], "username", status=EV_OBSERVED, confidence=0.9,
+                   capture=cap, frame=h.get("frame"),
+                   protocol=h.get("protocol", ""), field_="hash.user")
+            prj.add_entity("User", h["user"],
+                           evidence=f"{cap} (hash mode {mode})")
+        if h.get("domain"):
+            kb.add(h["domain"], "domain", status=EV_OBSERVED, confidence=0.8,
+                   capture=cap)
+            prj.add_entity("Domain", h["domain"], evidence=f"{cap} (hash)")
+    for d in data.get("diag") or []:
+        user, realm, spn, frame = d.get("user"), d.get("realm"), \
+            d.get("spn"), d.get("frame")
+        if user:
+            ci.users.append(user) if user not in ci.users else None
+            kb.add(user, "username", status=EV_OBSERVED, confidence=0.9,
+                   capture=cap, frame=frame, protocol="Kerberos")
+            prj.add_entity("User", user, evidence=f"{cap} (Kerberos frame {frame})")
+        if realm:
+            ci.realms.append(realm) if realm not in ci.realms else None
+            kb.add(realm, "realm", status=EV_OBSERVED, capture=cap,
+                   frame=frame, protocol="Kerberos")
+            prj.add_entity("Realm", realm, evidence=f"{cap} (Kerberos)")
+        if spn:
+            ci.spns.append(spn) if spn not in ci.spns else None
+            kb.add(spn, "spn", status=EV_OBSERVED, capture=cap, frame=frame,
+                   protocol="Kerberos")
+            prj.add_entity("SPN", spn, evidence=f"{cap} (Kerberos)")
+    for b in data.get("bssids") or []:
+        ci.bssids.append(b) if b not in ci.bssids else None
+        kb.add(b, "bssid", status=EV_OBSERVED, capture=cap)
+        prj.add_entity("BSSID", b, evidence=f"{cap} (trames 802.11)")
+    for s in data.get("ssids") or []:
+        ci.ssids.append(s) if s not in ci.ssids else None
+        kb.add(s, "ssid", status=EV_OBSERVED, capture=cap)
+        prj.add_entity("SSID", s, evidence=f"{cap} (beacons)")
+    for nt in data.get("notes") or []:
+        prj.add_missing(nt, "note du pipeline principal", capture=cap)
+    for ms in data.get("missing") or []:
+        prj.add_missing(ms, "données manquantes signalées par l'extraction",
+                        capture=cap)
+    if ci.t_first and ci.t_last:
+        prj.add_timeline(f"fenêtre capture ({ci.t_last - ci.t_first:.0f} s)",
+                         capture=cap, ts=ci.t_first, kind="window")
+
+
+def _engine_result_to_data(result):
+    """ExtractResult → dict normalisé (sérialisable, mis en cache §31)."""
+    data = {
+        "packets": int(getattr(result, "packets", 0) or 0),
+        "protocols": dict(getattr(result, "proto_counts", {}) or {}),
+        "creds": [], "hashes": [], "diag": [], "users": [],
+        "notes": list(getattr(result, "notes", []) or []),
+        "missing": list(getattr(result, "missing", []) or []),
+    }
+    st = getattr(result, "packet_stats", None) or {}
+    data["ips"] = list(st.get("ips") or [])
+    data["macs"] = list(st.get("macs") or [])
+    data["t_first"] = st.get("t_first")
+    data["t_last"] = st.get("t_last")
+    for c in getattr(result, "credentials", None) or []:
+        data["creds"].append({"protocol": getattr(c, "protocol", ""),
+                              "username": getattr(c, "username", ""),
+                              "password": getattr(c, "password", ""),
+                              "frame": getattr(c, "frame", None)})
+    for mode, hits in sorted((getattr(result, "hashes", {}) or {}).items()):
+        for h in hits:
+            data["hashes"].append({"mode": int(mode),
+                                   "line": getattr(h, "line", ""),
+                                   "user": getattr(h, "user", "") or "",
+                                   "domain": getattr(h, "domain", "") or "",
+                                   "frame": getattr(h, "frame", None),
+                                   "protocol": getattr(h, "protocol", "")})
+    for d in getattr(result, "diag", None) or []:
+        data["diag"].append({"frame": getattr(d, "frame", None),
+                             "msg": getattr(d, "msg", ""),
+                             "user": getattr(d, "user", None),
+                             "realm": getattr(d, "realm", None),
+                             "spn": getattr(d, "spn", None)})
+    data["users"] = sorted(getattr(result, "preauth_users", None) or [])
+    return data
+
+
+def engine_cache_path(prj, sha16):
+    return out_sub(prj, OUT_CACHE_DIR, f"{sha16}.json")
+
+
+def engine_cache_load(prj, ci):
+    try:
+        p = engine_cache_path(prj, ci.sha16)
+        if not os.path.isfile(p):
+            return None
+        with open(p, encoding="utf-8") as f:
+            c = json.load(f)
+        if (c.get("size") == ci.size and abs(float(c.get("mtime", 0)) - ci.mtime) < 1
+                and c.get("sha256") == ci.sha256
+                and c.get("engine_version") == ENGINE_VERSION):
+            return c
+    except Exception:
+        return None
+    return None
+
+
+def engine_cache_save(prj, ci, data):
+    try:
+        payload = {"sha256": ci.sha256, "size": ci.size, "mtime": ci.mtime,
+                   "engine_version": ENGINE_VERSION, "status": ci.status,
+                   "packets": ci.packets, "t_first": ci.t_first,
+                   "t_last": ci.t_last, "bssids": ci.bssids,
+                   "ssids": ci.ssids, "det": ci.det, "data": data,
+                   "analyzed_at": now_iso()}
+        p = engine_cache_path(prj, ci.sha16)
+        ensure_parent(p)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, default=str)
+    except OSError as exc:
+        prj.add_error("cache", f"écriture impossible : {exc}", capture=ci.name)
+
+
+def engine_analyze_capture(prj, path, tshark_path=None, use_cache=True,
+                           echo=True):
+    """§33 étapes 3-6 : métadonnées → analyse → normalisation → entités.
+
+    Deux voies complémentaires :
+      1) extraction principale (_run_extraction : tshark ou JSON natif) →
+         hashes, credentials, Kerberos, IP/MAC, protocoles, fenêtre ;
+      2) analyse pure Python (toujours tentée sur pcap) : détection
+         préalable (RADIUS/Message-Authenticator, EAPOL, WEP+IV, SAE) +
+         BSSID/SSID/fenêtre via parse_pcap — le moteur reste utile SANS
+         tshark (solveurs WEP/RADIUS/SAE purs).
+    Erreur = capture marquée ERROR, le dossier continue (§30).
+    """
+    path = str(path)
+    name = os.path.basename(path)
+    t0 = time.time()
+    ci = CaptureInfo(path=path, name=name)
+    try:
+        st_ = os.stat(path)
+        ci.size, ci.mtime = st_.st_size, st_.st_mtime
+    except OSError as exc:
+        ci.status = "ERROR"; ci.error = str(exc)
+        prj.captures.append(ci)
+        prj.add_error("inventaire", exc, capture=name)
+        return ci
+    try:
+        ci.sha256 = engine_sha256(path)
+        ci.sha16 = ci.sha256[:16]
+    except OSError as exc:
+        ci.status = "ERROR"; ci.error = f"lecture impossible : {exc}"
+        prj.captures.append(ci)
+        prj.add_error("inventaire", exc, capture=name)
+        return ci
+    if ci.size == 0:
+        ci.status = "ERROR"; ci.error = "fichier vide (0 octet)"
+        prj.captures.append(ci)
+        prj.add_error("analyse", "fichier vide", capture=name)
+        return ci
+
+    cached = engine_cache_load(prj, ci) if use_cache else None
+    if cached is not None:
+        ci.cached = True
+        ci.status = cached.get("status", "ANALYZED")
+        ci.det = cached.get("det", {}) or {}
+        ci.bssids = list(cached.get("bssids") or [])
+        ci.ssids = list(cached.get("ssids") or [])
+        engine_ingest(prj, ci, cached.get("data", {}) or {})
+        ci.analysis_seconds = time.time() - t0
+        prj.captures.append(ci)
+        if echo:
+            print(f"  [=] {name} : analyse réutilisée depuis le cache "
+                  f"(sha256 {ci.sha16}…, {ci.packets} paquets)")
+        return ci
+
+    data = None
+    is_json = bool(is_json_export(path))
+    # 1) extraction principale (tshark, ou JSON natif sans tshark)
+    try:
+        work = out_sub(prj, OUT_WORK_DIR, Path(name).stem)
+        res = _run_extraction(path, work, [], tshark_path=tshark_path,
+                              wordlist="", no_progress=True, quiet=True,
+                              return_packets=True)
+        result, _arts, _secs, packets = res
+        data = _engine_result_to_data(result)
+        prj.transient[path] = (result, packets)
+        ci.status = "ANALYZED"
+    except Exception as exc:
+        ci.status = "PARTIAL"
+        ci.error = f"extraction principale indisponible : {type(exc).__name__}: {exc}"
+        prj.add_error("extraction", ci.error, capture=name)
+    # 2) analyse pure Python (pcap) : détection + BSSID/SSID/fenêtre
+    if not is_json:
+        try:
+            pure = engine_pure_scan(path)
+            if data is None:
+                data = {"packets": pure.get("frames", 0), "protocols": {},
+                        "creds": [], "hashes": [], "diag": [], "users": [],
+                        "notes": [], "missing": [], "bssids": [], "ssids": []}
+            data.setdefault("bssids", [])
+            data.setdefault("ssids", [])
+            for b in pure.get("bssids", ()):
+                if b not in data["bssids"]:
+                    data["bssids"].append(b)
+            for s in pure.get("ssids", ()):
+                if s not in data["ssids"]:
+                    data["ssids"].append(s)
+            if data.get("t_first") is None and pure.get("t_first"):
+                data["t_first"] = pure["t_first"]
+            if data.get("t_last") is None and pure.get("t_last"):
+                data["t_last"] = pure["t_last"]
+            if not data.get("packets") and pure.get("records"):
+                data["packets"] = pure["records"]
+            if pure.get("error") and path not in prj.transient:
+                # fichier illisible ET extraction indisponible → ERROR (§30 :
+                # la capture est marquée, le dossier continue)
+                ci.status = "ERROR"
+                ci.error = ((ci.error + " ; " if ci.error else "")
+                            + "lecture pcap impossible : "
+                            + pure["error"])[:400]
+                prj.add_error("analyse pure", pure["error"], capture=name)
+        except Exception as exc:
+            prj.add_error("analyse pure", exc, capture=name)
+        try:
+            ci.det = _solve_preflight(path, None, None, False, tshark_path,
+                                      show=False, scan=True)
+        except Exception as exc:
+            ci.det = {}
+            prj.add_error("détection préalable", exc, capture=name)
+        data = data or {"packets": 0, "protocols": {}, "creds": [],
+                        "hashes": [], "diag": [], "users": [], "notes": [],
+                        "missing": []}
+        data["det"] = {k: ci.det.get(k) for k in
+                       ("radius", "radius_msgauth", "eapol", "wep_frames",
+                        "wep_iv_reuse", "sae_frames")}
+    else:
+        ci.det = {"is_json": True, "packets": (data or {}).get("packets", 0),
+                  "auth_protos": (data or {}).get("auth_protos", {})}
+        if data is not None:
+            # JSON tshark : protocoles auth + IP/MAC/horodatage lus des
+            # couches (ip.src/eth.src/frame.time_epoch) — la corrélation
+            # inter-captures (§5) fonctionne aussi sur exports JSON.
+            protos = {}
+            ips = set(); macs = set(); tmin = None; tmax = None
+            for pkt in (prj.transient.get(path, (None, None))[1] or []):
+                try:
+                    lay = pkt_layers(pkt)
+                except Exception:
+                    continue
+                for pn in ("xmpp", "http", "ftp", "pop", "imap", "smtp",
+                           "telnet"):
+                    if pn in lay:
+                        protos[pn] = protos.get(pn, 0) + 1
+                for lname, sfx in (("ip", "ip."), ("ipv6", "ipv6.")):
+                    l = lay.get(lname)
+                    if isinstance(l, dict):
+                        for k in (sfx + "src", sfx + "dst"):
+                            v = l.get(k)
+                            if isinstance(v, list):
+                                v = v[0] if v else None
+                            if v:
+                                ips.add(str(v))
+                for lname in ("eth", "wlan"):
+                    l = lay.get(lname)
+                    if isinstance(l, dict):
+                        for k in (lname + ".src", lname + ".dst",
+                                  lname + ".sa", lname + ".da",
+                                  "wlan.bssid"):
+                            v = l.get(k)
+                            if isinstance(v, list):
+                                v = v[0] if v else None
+                            if (isinstance(v, str) and len(v) == 17
+                                    and v.count(":") == 5):
+                                macs.add(v.lower())
+                fr = lay.get("frame")
+                if isinstance(fr, dict):
+                    try:
+                        te = float(fr.get("frame.time_epoch"))
+                        tmin = te if tmin is None else min(tmin, te)
+                        tmax = te if tmax is None else max(tmax, te)
+                    except (TypeError, ValueError):
+                        pass
+            ci.det["auth_protos"] = protos
+            data["auth_protos"] = protos
+            if not data.get("ips"):
+                data["ips"] = sorted(ips)
+            if not data.get("macs"):
+                data["macs"] = sorted(macs)
+            if data.get("t_first") is None and tmin:
+                data["t_first"] = tmin
+            if data.get("t_last") is None and tmax:
+                data["t_last"] = tmax
+    if data is None:
+        ci.status = "ERROR"
+        ci.error = ci.error or "aucune analyse possible"
+        prj.captures.append(ci)
+        prj.add_error("analyse", ci.error, capture=name)
+        return ci
+    if ci.status == "PARTIAL" and not is_json:
+        ci.status = "PARTIAL"       # pcap sans tshark : détection pure OK
+    if not (data.get("packets") or data.get("creds") or data.get("hashes")
+            or ci.det.get("wep_frames") or ci.det.get("sae_frames")
+            or ci.det.get("radius")):
+        ci.status = "NO_DATA" if ci.status == "ANALYZED" else ci.status
+    engine_ingest(prj, ci, data)
+    # INVENTAIRE RÉSEAU : passage exhaustif sur la capture (KB, entités,
+    # hostnames/e-mails pour corrélation). ISOLÉ : un échec est compté
+    # dans prj.errors, jamais bloquant pour l'analyse principale (§30/§42).
+    try:
+        engine_inventory_capture(prj, ci, echo=echo)
+    except Exception as exc:
+        prj.add_error("inventaire_reseau", exc, capture=name)
+    ci.analysis_seconds = time.time() - t0
+    if use_cache:
+        engine_cache_save(prj, ci, data)
+    prj.captures.append(ci)
+    if echo:
+        n_h = ci.n_hashes; n_c = ci.n_creds
+        print(f"  [+] {name} : {ci.status} — {ci.packets} paquets, "
+              f"{len(ci.protocols)} protocoles, {n_h} hash(es), "
+              f"{n_c} identifiant(s) clair(s)  ({ci.analysis_seconds:.1f}s)"
+              + ("  [cache]" if ci.cached else ""))
+    return ci
+
+
+# ----------------------------------------------------------------------------
+# CORRÉLATION INTER-CAPTURES (§5) — uniquement sur des identités observables
+# partagées (IP, MAC, username, BSSID, SSID, realm, SPN, hostname). Jamais
+# sur « même protocole » ; le recouvrement temporel est un signal d'APPUI.
+# ----------------------------------------------------------------------------
+def engine_correlate(prj, echo=True):
+    sig_fields = (("ips", "IP"), ("macs", "MAC"), ("users", "username"),
+                  ("bssids", "BSSID"), ("ssids", "SSID"),
+                  ("realms", "realm"), ("spns", "SPN"),
+                  # inventaire réseau : hôtes (SNI/DNS/HTTP) et e-mails
+                  # (toujours sous forme MASQUÉE, déterministe → recoupement
+                  # possible sans exposer la PII)
+                  ("hostnames", "hostname"), ("emails", "email"))
+    # Non-identités (4e run réel : « CORRÉLATION ch10.json ↔ sae.json
+    # [MEDIUM] — même(s) MAC : ff:ff:ff:ff:ff:ff ») : ENGINE_NON_IDENTITES
+    # (parts/60, source unique) — retirées des ensembles comparés, jamais de
+    # la KB (elles y restent OBSERVED).
+    _NON_IDENTITES = ENGINE_NON_IDENTITES
+    cors = []
+    caps = [c for c in prj.captures if c.status in ("ANALYZED", "PARTIAL",
+                                                     "NO_DATA")]
+    for i in range(len(caps)):
+        for j in range(i + 1, len(caps)):
+            a, b = caps[i], caps[j]
+            shared = {}
+            for fld, kbty in sig_fields:
+                va = {str(x).lower() for x in (getattr(a, fld) or [])}
+                vb = {str(x).lower() for x in (getattr(b, fld) or [])}
+                inter = sorted(va & vb)
+                inter = [x for x in inter
+                         if x not in _NON_IDENTITES.get(kbty, ())]
+                if inter:
+                    shared[kbty] = inter      # v1.2 : TOUTES, en clair
+            if not shared:
+                continue
+            overlap = None
+            if None not in (a.t_first, a.t_last, b.t_first, b.t_last):
+                overlap = (a.t_first <= b.t_last and b.t_first <= a.t_last)
+            n_types = len(shared)
+            n_vals = sum(len(v) for v in shared.values())
+            strong = any(k in shared for k in
+                         ("BSSID", "MAC", "username", "realm", "SPN", "SSID"))
+            if n_types >= 2 or (n_vals >= 3 and strong):
+                conf = "HIGH"
+            elif strong or overlap:
+                conf = "MEDIUM"
+            else:
+                conf = "LOW"
+            reasons = [f"même(s) {k} : {', '.join(v)}"   # v1.2 : toutes, en clair
+                       for k, v in sorted(shared.items())]
+            if overlap:
+                reasons.append("fenêtres temporelles chevauchantes")
+            cor = {"capture_a": a.name, "capture_b": b.name,
+                   "shared": shared, "confidence": conf,
+                   "reason": " ; ".join(reasons),
+                   "time_overlap": bool(overlap)}
+            cors.append(cor)
+            prj.add_relation(f"Capture:{a.name}", f"Capture:{b.name}",
+                             "related_to", evidence=cor["reason"],
+                             confidence={"HIGH": 0.9, "MEDIUM": 0.7,
+                                         "LOW": 0.4}[conf])
+            # promotion KB : valeur partagée = CORRELATED (§4)
+            for kbty, vals in shared.items():
+                ty = {"IP": "ip", "MAC": "mac", "username": "username",
+                      "BSSID": "bssid", "SSID": "ssid", "realm": "realm",
+                      "SPN": "spn",
+                      # identités de l'inventaire réseau
+                      "hostname": "hostname", "email": "email"}[kbty]
+                for v in vals:
+                    it = prj.kb.get(ty, v)
+                    orig = it.value if it else v
+                    prj.kb.promote(ty, orig, EV_CORRELATED, confidence=0.85,
+                                   note=f"partagé entre {a.name} et {b.name}")
+    prj.correlations = cors
+    if echo:
+        if cors:
+            print(f"  [corrélation] {len(cors)} relation(s) inter-captures :")
+            for c in cors:
+                print(f"    {c['capture_a']} ↔ {c['capture_b']} — "
+                      f"{c['confidence']} — {c['reason']}")
+        else:
+            print("  [corrélation] aucune identité partagée entre captures "
+                  "— aucune relation affirmée (§5 : pas de corrélation sans "
+                  "preuve)")
+    return cors
+
+
+# ----------------------------------------------------------------------------
+# GRAPHE DE CONNAISSANCES (§9) — nœuds = entités/captures, arêtes = relations.
+# Export DOT (Graphviz) : `graph` CLI.
+# ----------------------------------------------------------------------------
+def engine_graph_stats(prj):
+    nodes = {(f"Capture:{c.name}") for c in prj.captures}
+    for k in prj.entities:
+        nodes.add(f"{k[0]}:{k[1]}")
+    for r in prj.relations:
+        nodes.add(r.src); nodes.add(r.dst)
+    return len(nodes), len(prj.relations)
+
+
+def _dot_id(s):
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def engine_graph_dot(prj):
+    lines = ["graph knowledge {", '  graph [rankdir=LR, fontsize=10];',
+             '  node [shape=box, style="rounded,filled", fillcolor="#eef6ff",'
+             ' fontsize=9];']
+    shapes = {"Capture": "folder", "User": "ellipse", "IP": "box",
+              "MAC": "box", "BSSID": "hexagon", "SSID": "hexagon",
+              "Realm": "ellipse", "SPN": "ellipse", "Domain": "ellipse"}
+    seen = set()
+    for c in prj.captures:
+        nid = f"Capture:{c.name}"
+        lines.append(f'  {_dot_id(nid)} [shape=folder, fillcolor="#fff3cd",'
+                     f' label={_dot_id(c.name + " [" + c.status + "]")};')
+        seen.add(nid)
+    for (kind, val), ent in prj.entities.items():
+        nid = f"{kind}:{val}"
+        if nid in seen:
+            continue
+        seen.add(nid)
+        sh = shapes.get(kind, "box")
+        lines.append(f'  {_dot_id(nid)} [shape={sh}, label={_dot_id(kind + " " + val)}];')
+    for r in prj.relations:
+        for nid in (r.src, r.dst):
+            if nid not in seen:
+                seen.add(nid)
+                lines.append(f'  {_dot_id(nid)} [label={_dot_id(nid)}];')
+        lines.append(f'  {_dot_id(r.src)} -- {_dot_id(r.dst)} '
+                     f'[label={_dot_id(r.rel)}, fontsize=8];')
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+# ----------------------------------------------------------------------------
+# TIMELINE GLOBALE (§27) — fusion des fenêtres et événements horodatés ;
+# les événements sans horloge (frame seule) restent groupés par capture.
+# ----------------------------------------------------------------------------
+def engine_timeline(prj):
+    dated = [e for e in prj.timeline if e.get("ts")]
+    undated = [e for e in prj.timeline if not e.get("ts")]
+    dated.sort(key=lambda e: (e["ts"], e.get("capture", "")))
+    merged = True
+    wins = [(c.name, c.t_first, c.t_last) for c in prj.captures
+            if c.t_first and c.t_last]
+    if len(wins) > 1:
+        lo = min(w[1] for w in wins); hi = max(w[2] for w in wins)
+        merged = hi - lo <= max((w[2] - w[1]) for w in wins) * 4 + 3600
+    return {"events": dated, "by_capture": undated,
+            "windows": [{"capture": n, "t_first": a, "t_last": b}
+                        for n, a, b in wins],
+            "mergeable": merged}
+
+
+# ============================================================================
+#  MOTEUR — HASHCAT TARGET MANAGER · WORDLIST · SCOPE
+# ----------------------------------------------------------------------------
+#  Mission §10 (distinction HASH/CHALLENGE/…, jamais de faux hash), §11
+#  (gestion centralisée : validation, déduplication, provenance, fichiers,
+#  commandes), §13 (wordlist : NO_WORDLIST jamais ERROR), §8/§36 (scope
+#  pentest : analyse passive uniquement, OUT_OF_SCOPE marqué, jamais testé).
+#  Les modes hashcat ne sont JAMAIS inventés : ils proviennent du pipeline
+#  principal (table des modes existante) ou des conversions vérifiées des
+#  solveurs (APOP→20, CRAM-MD5→10200, WPA→22000).
+# ============================================================================
+
+import ipaddress as _ipaddress
+
+
+def engine_validate_hash_line(mode, line):
+    """Validation de format (§10) — (ok, pourquoi). Règles légères et
+    honnêtes pour les modes produits par ce programme ; les lignes issues du
+    pipeline principal sont déjà validées en amont (HashHit)."""
+    if not line or not isinstance(line, str):
+        return False, "ligne vide"
+    if any(ch in line for ch in ("\n", "\r")):
+        return False, "retour chariot dans la ligne"
+    m = int(mode)
+    if m == 22000:
+        ok = line.startswith("WPA*") or line.startswith("WPA:")
+        return ok, ("préfixe WPA* conforme" if ok else "préfixe WPA* absent")
+    if m == 10200:
+        parts = line.split("$")
+        ok = (len(parts) >= 4 and parts[1] == "cram_md5"
+              and parts[2] and parts[3])
+        return ok, ("$cram_md5$<b64 challenge>$<b64 réponse> conforme"
+                    if ok else "structure $cram_md5$ invalide")
+    if m == 20:
+        h, _, salt = line.partition(":")
+        ok = len(h) == 32 and all(c in "0123456789abcdefABCDEF" for c in h) \
+            and salt != ""
+        return ok, ("md5 hex : sel (APOP) conforme" if ok
+                    else "attendu <md5-32hex>:<timestamp>")
+    if m == 5600:
+        ok = line.count(":") >= 3 and "::" in line
+        return ok, ("NetNTLMv2 user::domain:chal:resp conforme" if ok
+                    else "structure NetNTLMv2 (::) invalide")
+    if m == 5500:
+        ok = "::" in line and line.count(":") >= 4
+        return ok, ("NetNTLMv1 conforme" if ok else "structure NetNTLMv1 invalide")
+    if m == 13100:
+        ok = line.startswith("$krb5tgs$")
+        return ok, ("$krb5tgs$ conforme" if ok else "préfixe $krb5tgs$ absent")
+    if m == 18200:
+        ok = line.startswith("$krb5asrep$")
+        return ok, ("$krb5asrep$ conforme" if ok else "préfixe $krb5asrep$ absent")
+    if m in (11100, 11200):
+        ok = line.startswith("$") and line.count("$") >= 2
+        return ok, ("structure CRAM DB conforme" if ok else "structure invalide")
+    ok = len(line) >= 8 and all(32 <= ord(c) < 127 for c in line)
+    return ok, ("ligne imprimable ≥8 caractères" if ok
+                else "ligne trop courte ou non imprimable")
+
+
+def engine_targets_from_solver_outcomes(prj, ci, report):
+    """Échecs des solveurs → cibles hashcat (§11 + demande v3 « en cas
+    d'échec, tous les hashes au format hashcat »). Les conversions APOP/
+    CRAM-MD5 proviennent de _hashcat_hint_auth (formats vérifiés)."""
+    n = 0
+    for oc in report.outcomes:
+        for t in (oc.findings or {}).get("failed_targets", []) or []:
+            if not t.get("hashcat_line") or not t.get("hashcat_mode"):
+                continue
+            mode = int(t["hashcat_mode"]); line = str(t["hashcat_line"])
+            ok, why = engine_validate_hash_line(mode, line)
+            tgt = prj.add_target(
+                mode, line, kind="CHALLENGE→HASH",
+                user=t.get("username", "") or "", capture=ci.name,
+                protocol=f"{t.get('proto')}/{t.get('mechanism')}",
+                why=(f"dérivé d'un challenge/réponse {t.get('mechanism')} "
+                     f"non résolu — {why}") if ok else f"format invalide : {why}",
+                status="READY" if ok else "INVALID",
+                validation=VAL_LIKELY if ok else VAL_FAILED)
+            if tgt is not None and ok:
+                n += 1
+    return n
+
+
+def engine_hashcat_cmd(mode, path, wordlist):
+    """Commande hashcat exacte (identique partout : dossier du hash, INDEX.txt,
+    prochaines actions, rapport)."""
+    return ('hashcat -m %d -a 0 -O -w 3 "%s" "%s"'
+            % (int(mode), path, wordlist or "<wordlist>"))
+
+
+def engine_hashcat_log_path(prj, mode):
+    """Journal hashcat d'un mode : solveurs/hashcat-m<mode>.log."""
+    return out_sub(prj, OUT_SOLVE_DIR, "hashcat-m%d.log" % int(mode))
+
+
+def engine_write_hash_folder(prj, t, d):
+    """v1.2 — UN DOSSIER PAR HASH (demande utilisateur).
+
+    Contenu, tout en clair :
+      hash.txt        la ligne au format hashcat, strictement (rien d'autre)
+      commande.txt    la commande exacte à copier-coller (+ variantes utiles)
+      resultat.txt    mot de passe cassé ou état honnête (§42 : jamais
+                      « cassé » sans preuve) + ce qui a été tenté
+      fiche.txt       d'où vient ce hash : capture, trame, protocole, mode,
+                      pourquoi exploitable, historique des tentatives
+    Retourne le chemin du dossier (None si écriture impossible).
+    """
+    mode = int(t.mode)
+    line = str(t.line or "")
+    wl = prj.wordlist or "<wordlist>"
+    cmd = engine_hashcat_cmd(mode, os.path.join(d, "hash.txt"), wl)
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "hash.txt"), "w", encoding="utf-8") as f:
+            f.write(line + "\n")
+        mi = mode_info(mode) or {}
+        cmds = [
+            "# Commande hashcat pour CE hash (dictionnaire + wordlist du projet)",
+            cmd,
+            "",
+            "# Variante sans wordlist (attaque par masque, ex. 8 chiffres) :",
+            'hashcat -m %d -a 3 -O -w 3 "%s" ?d?d?d?d?d?d?d?d'
+            % (mode, os.path.join(d, "hash.txt")),
+            "",
+            "# Voir un mot de passe déjà cassé pour ce hash :",
+            'hashcat -m %d --show "%s"' % (mode, os.path.join(d, "hash.txt")),
+            "",
+            "# Mode %d = %s (%s)" % (mode, mi.get("name", "?"),
+                                     mi.get("category", "?")),
+            "# Depuis n'importe quel dossier : lancer hashcat depuis SON propre"
+            " dossier (il y cherche OpenCL/).",
+        ]
+        if mi.get("notes"):
+            cmds.append("# Note : %s" % str(mi["notes"]).replace("\n", " "))
+        with open(os.path.join(d, "commande.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(cmds) + "\n")
+        # résultat — honnête, en clair, rien d'affirmé sans preuve (§42)
+        r = ["# RÉSULTAT — hashcat -m %d" % mode,
+             "# hash     : %s" % line,
+             "# état     : %s" % t.status,
+             "# validation : %s" % (t.validation or "-")]
+        if t.status in ("CRACKED", "RESOLVED") and t.password:
+            r += ["", "MOT DE PASSE TROUVÉ (vérifié) : %s" % t.password,
+                  "", "# preuve : %s" % (t.why or "-")]
+        elif t.status == "INVALID":
+            r += ["", "HASH INEXPLOITABLE EN L'ÉTAT : %s" % (t.why or "-"),
+                  "", "# Rien n'est affirmé sans donnée exploitable (§42)."]
+        else:
+            r += ["", "AUCUN MOT DE PASSE TROUVÉ POUR L'INSTANT.",
+                  "", "# Ce qui a été tenté :"]
+            if prj.wordlist:
+                r.append("#   - wordlist du projet : %s (%s ligne(s))"
+                         % (prj.wordlist, prj.wordlist_lines or "?"))
+            else:
+                r.append("#   - aucune wordlist fournie (§13 : ce n'est pas "
+                         "une erreur, le hash reste prêt)")
+            lg = engine_hashcat_log_path(prj, mode)
+            if os.path.isfile(lg):
+                r.append("#   - session hashcat : %s" % lg)
+            else:
+                r.append("#   - aucune session hashcat lancée sur ce mode")
+            r += ["", "# Pour casser : copier la commande de commande.txt",
+                  "# (ou relancer avec --hashcat CHEMIN --hashcat-run)."]
+        with open(os.path.join(d, "resultat.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(r) + "\n")
+        # fiche — traçabilité complète (§29), tout en chiffres et en clair
+        fi = ["# FICHE DU HASH — hashcat -m %d" % mode,
+              "hash        : %s" % line,
+              "type        : %s" % (mi.get("name") or "?"),
+              "catégorie   : %s" % (mi.get("category") or "?"),
+              "protocole   : %s" % (t.protocol or "-"),
+              "utilisateur : %s" % (t.user or "-"),
+              "domaine     : %s" % (t.domain or "-"),
+              "capture     : %s" % (t.capture or "-"),
+              "trame       : %s" % (t.frame if t.frame is not None else "-"),
+              "origine     : %s" % (t.kind or "-"),
+              "état        : %s" % t.status,
+              "validation  : %s" % (t.validation or "-"),
+              "mot de passe: %s" % (t.password or "(non trouvé)"),
+              "",
+              "# Pourquoi exploitable / état :",
+              "%s" % (t.why or "-"),
+              "",
+              "# Empreinte SHA-256 de la ligne de hash :",
+              hashlib.sha256(line.encode("utf-8", "replace")).hexdigest(),
+              ]
+        with open(os.path.join(d, "fiche.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(fi) + "\n")
+        return d
+    except OSError as exc:
+        prj.add_error("hashes", "écriture du dossier %s : %s" % (d, exc))
+        return None
+
+
+def engine_write_hash_index(prj, written):
+    """hashes/INDEX.txt — la liste claire de TOUS les dossiers de hash.
+
+    Une ligne par hash : état, mot de passe EN CLAIR s'il est trouvé (jamais
+    tronqué, jamais masqué — v1.2), type, utilisateur, capture, dossier.
+    """
+    path = out_sub(prj, OUT_HASHES_DIR, OUT_HASHES_INDEX)
+    n_cracked = sum(1 for t in prj.targets.values()
+                    if t.status in ("CRACKED", "RESOLVED") and t.password)
+    L = ["# HASHES HASHCAT — %d hash(es), %d mode(s), %d cassé(s)"
+         % (len(prj.targets),
+            len({int(t.mode) for t in prj.targets.values()}), n_cracked),
+         "# généré le %s · moteur v%s" % (now_iso(), ENGINE_VERSION),
+         "# UN DOSSIER PAR HASH : hash.txt (ligne hashcat), commande.txt,",
+         "# resultat.txt (mot de passe ou état honnête), fiche.txt (provenance).",
+         "# Tout est EN CLAIR : aucune valeur masquée ni tronquée.",
+         ""]
+    by_mode = {}
+    for t, d in written:
+        by_mode.setdefault(int(t.mode), []).append((t, d))
+    for mode in sorted(by_mode):
+        mi = mode_info(mode) or {}
+        L.append("== hashcat -m %d — %s (%s) — %d hash(es)"
+                 % (mode, mi.get("name", "?"), mi.get("category", "?"),
+                    len(by_mode[mode])))
+        for t, d in sorted(by_mode[mode], key=lambda x: x[0].line):
+            st = t.status
+            val = t.password if t.password else "-"
+            L.append("  [%-8s] %s" % (st, _hash_label(t)))
+            L.append("             hash        : %s" % t.line)
+            L.append("             mot de passe: %s" % val)
+            L.append("             capture     : %s%s"
+                     % (t.capture or "-",
+                        "" if t.frame is None else " (trame %s)" % t.frame))
+            L.append("             dossier     : %s" % d)
+            if st == "INVALID":
+                L.append("             problème    : %s" % (t.why or "-"))
+        L.append("")
+    if not by_mode:
+        L += ["(aucun hash hashcat extrait de ce projet)", ""]
+    wl = prj.wordlist
+    L.append("# Wordlist du projet : %s"
+             % (wl if wl else "AUCUNE (§13 — pas une erreur ; fournissez -w)"))
+    if wl:
+        L.append("# Pour tout casser d'un coup (par mode) :")
+        for mode in sorted(by_mode):
+            L.append("#   " + engine_hashcat_cmd(
+                mode, out_sub(prj, OUT_HASHES_DIR,
+                              "hashcat-m%d.hash" % mode), wl))
+    try:
+        ensure_parent(path)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(L) + "\n")
+        prj.settings.setdefault("generated_files", [])
+        if path not in prj.settings["generated_files"]:
+            prj.settings["generated_files"].append(path)
+        return path
+    except OSError as exc:
+        prj.add_error("hashes", "écriture %s : %s" % (path, exc))
+        return None
+
+
+def engine_write_targets(prj, echo=True):
+    """§11.7-9 + v1.2 — cibles hashcat : UN DOSSIER PAR HASH dans hashes/,
+    plus un fichier par mode (hashcat accepte plusieurs lignes) et INDEX.txt.
+
+    Retourne [(mode, chemin, nombre)] comme avant (compatibilité appelants).
+    """
+    hdir = out_sub(prj, OUT_HASHES_DIR)
+    written = []                       # [(HashTarget, dossier)]
+    for t, d in engine_hash_dirs(prj):
+        p = engine_write_hash_folder(prj, t, d)
+        if p:
+            written.append((t, p))
+    engine_write_hash_index(prj, written)
+    # fichiers groupés par mode (pour hashcat, uniquement les lignes valides)
+    by_mode = {}
+    for t in prj.targets.values():
+        if t.status in ("READY", "CRACKED", "RESOLVED"):
+            ok, _why = engine_validate_hash_line(t.mode, t.line)
+            if ok:
+                by_mode.setdefault(int(t.mode), []).append(t.line)
+    files = []
+    cmds = []
+    wl = prj.wordlist or "<wordlist>"
+    for mode, lines in sorted(by_mode.items()):
+        lines = list(dict.fromkeys(lines))
+        path = out_sub(prj, OUT_HASHES_DIR, "hashcat-m%d.hash" % mode)
+        try:
+            ensure_parent(path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            files.append((mode, path, len(lines)))
+            cmds.append(engine_hashcat_cmd(mode, path, wl))
+        except OSError as exc:
+            prj.add_error("hashes", f"écriture {path} : {exc}")
+    if cmds:
+        idx = out_sub(prj, OUT_HASHES_DIR, "commandes.txt")
+        try:
+            ensure_parent(idx)
+            with open(idx, "w", encoding="utf-8") as f:
+                f.write("# Commandes hashcat générées par le moteur — "
+                        "1 ligne par mode\n")
+                f.write("# (wordlist : %s)\n" % (prj.wordlist or "AUCUNE — "
+                        "statut NO_WORDLIST, fournissez -w"))
+                f.write("# Chaque hash a AUSSI son dossier : hashes/"
+                        "m<MODE>-…/commande.txt\n")
+                f.write("\n".join(cmds) + "\n")
+            files.append((0, idx, len(cmds)))
+        except OSError as exc:
+            prj.add_error("hashes", f"écriture commandes.txt : {exc}")
+    if echo:
+        if written:
+            print(f"  [hashes] {len(written)} dossier(s) de hash → {hdir}")
+            for t, d in written:
+                st = t.status
+                val = (" → mot de passe : %s" % t.password
+                       if t.status in ("CRACKED", "RESOLVED") and t.password
+                       else "")
+                print(f"    -m {int(t.mode):<6} [{st:<8}] "
+                      f"{os.path.basename(d)}{val}")
+        else:
+            print("  [hashes] aucun hash hashcat extrait de ce projet")
+        for mode, path, n in files:
+            if mode:
+                print(f"    -m {mode:<6} {n:>4} hash(es) → {path}")
+        print(f"    index → {out_sub(prj, OUT_HASHES_DIR, OUT_HASHES_INDEX)}")
+    prj.settings["generated_files"] = sorted(
+        set(prj.settings.get("generated_files", []))
+        | {p for _m, p, _n in files}
+        | {d for _t, d in written}
+        | {out_sub(prj, OUT_HASHES_DIR, OUT_HASHES_INDEX)})
+    return files
+
+def engine_wordlist_setup(prj, wordlist_arg, interactive=False, echo=True):
+    """§13 : wordlist fournie → vérifiée (existence, lisibilité, taille,
+    lignes) ; absente → question en interactif (fin d'analyse initiale) ;
+    toujours absente → statut NO_WORDLIST (pas ERROR), l'analyse continue."""
+    def _probe(path):
+        try:
+            if not path or not os.path.isfile(path):
+                return None
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                head = f.read(65536)
+            if not head:
+                return (path, size, 0)
+            nl = head.count(b"\n")
+            est = int(nl * size / max(1, len(head))) if size > len(head) else nl
+            return (path, size, est)
+        except OSError:
+            return None
+
+    info_ = _probe(wordlist_arg)
+    if info_ is None and interactive:
+        try:
+            rep_ = input("  Chemin de la wordlist pour les cibles hashcat "
+                         "(Entrée = aucune) : ").strip().strip('"').strip("'")
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            rep_ = ""
+        info_ = _probe(rep_)
+        if rep_ and info_ is None:
+            print(f"    (introuvable/illisible : {rep_} — NO_WORDLIST, "
+                  "l'analyse continue)")
+    if info_ is not None:
+        prj.wordlist, prj.wordlist_bytes, prj.wordlist_lines = info_
+        prj.wordlist_status = "WORDLIST_OK"
+        if echo:
+            print(f"  [wordlist] {prj.wordlist} — {prj.wordlist_bytes/1e6:.1f} Mo, "
+                  f"~{prj.wordlist_lines} ligne(s) — associée aux cibles "
+                  f"compatibles (toutes les cibles dictionnaires)")
+    else:
+        prj.wordlist = None
+        prj.wordlist_status = "NO_WORDLIST"
+        if echo:
+            print("  [wordlist] NO_WORDLIST — aucune wordlist fournie ; les "
+                  "cibles restent prêtes, le crackage dictionnaire externe "
+                  "est listé dans PROCHAINES ACTIONS (§13 : pas une erreur)")
+    return prj.wordlist_status
+
+
+def engine_scope_status(prj, ip):
+    """§8/§36 : IN_SCOPE / OUT_OF_SCOPE / NO_SCOPE. En PENTEST avec scope
+    défini, une IP hors scope est marquée OUT_OF_SCOPE et n'est jamais
+    proposée comme cible d'action. (Le moteur est de toute façon 100 %
+    passif : aucune action réseau active n'existe.)"""
+    if not prj.scope:
+        return "NO_SCOPE"
+    try:
+        addr = _ipaddress.ip_address(str(ip))
+    except ValueError:
+        return "NO_SCOPE"
+    for ex in prj.excluded:
+        try:
+            if addr in _ipaddress.ip_network(ex, strict=False):
+                return "OUT_OF_SCOPE"
+        except ValueError:
+            if str(ip) == ex:
+                return "OUT_OF_SCOPE"
+    for sc in prj.scope:
+        try:
+            if addr in _ipaddress.ip_network(sc, strict=False):
+                return "IN_SCOPE"
+        except ValueError:
+            if str(ip) == sc:
+                return "IN_SCOPE"
+    return "OUT_OF_SCOPE"
+
+
+def engine_apply_scope(prj, echo=True):
+    n_out = 0
+    if not prj.scope:
+        return 0
+    for (kind, val), ent in list(prj.entities.items()):
+        if kind == "IP":
+            st = engine_scope_status(prj, val)
+            ent.attrs["scope"] = st
+            if st == "OUT_OF_SCOPE":
+                n_out += 1
+    if echo and n_out:
+        print(f"  [scope] {n_out} IP(s) hors périmètre marqué(es) "
+              "OUT_OF_SCOPE — exclues des actions recommandées (§8)")
+    return n_out
+
+
+def engine_hashcat_launch(prj, opts, interactive=False, echo=True):
+    """v1.1 — cassage GPU des cibles READY avec hashcat (demande utilisateur :
+    « demande chemin hashcat pour casser avec, il est plus optimisé que CPU »).
+
+    Chemin : --hashcat (CLI) > question interactive (engine_ask_project) >
+    donnees.json (settings.hashcat_path, mémorisé d'un run à l'autre).
+    Déroulé : binaire validé (--version) et mémorisé → pour chaque mode avec
+    cibles READY ET wordlist associée : lancement sur confirmation
+    (interactif) ou avec --hashcat-run, commande identique à celle de
+    hashes/commandes.txt, sortie journalisée dans solveurs/hashcat-m<mode>.log.
+    Après run : les mots de passe cassés (hashcat --show) entrent en KB
+    « password » VALIDATED (hashcat a vérifié le hash — preuve §42) et les
+    cibles passent CRACKED. Toute erreur est tracée et n'interrompt jamais le
+    projet (§30). Retourne le nombre de mots de passe cassés."""
+    hc = str(opts.get("hashcat") or prj.settings.get("hashcat_path") or "")
+    hc = hc.strip().strip('"').strip("'")
+    if not hc:
+        return 0
+    if not os.path.isfile(hc):
+        _w = shutil.which(hc)
+        if _w:
+            hc = _w
+        else:
+            prj.add_error("hashcat", f"hashcat introuvable : {hc}")
+            if echo:
+                print(f"  [hashcat] introuvable : {hc} — ignoré (le projet "
+                      "continue ; internes CPU inchangés)")
+            return 0
+    # v1.2 — chemin ABSOLU : le lancement change de répertoire courant
+    # (dossier de hashcat, bug ./OpenCL/ de la v1.1.1) ; un chemin relatif
+    # ne résoudrait plus depuis ce dossier.
+    hc = os.path.abspath(hc)
+    # v1.1.1 — CORRECTION DU RUN RÉEL : sous Windows, hashcat cherche son
+    # dossier « ./OpenCL/ » relativement au répertoire COURANT, pas à
+    # l'exécutable → lancé depuis le dossier du projet : « ./OpenCL/: No such
+    # file or directory », rc=4294967295 (-1 non signé), 0 mot de passe cassé.
+    # Tous les appels (--version, session, --show) partent désormais du
+    # dossier de hashcat. Hash/wordlist/journaux restent passés en chemins
+    # absolus → aucun autre comportement changé.
+    hc_dir = os.path.dirname(hc) or None
+    ver = ""
+    try:
+        _r = subprocess.run([hc, "--version"], capture_output=True,
+                            text=True, timeout=30, cwd=hc_dir)
+        _out = (_r.stdout or _r.stderr or "").strip().splitlines()
+        ver = _out[0] if _out else ""
+    except Exception as exc:
+        prj.add_error("hashcat", f"--version impossible : {exc}")
+        if echo:
+            print(f"  [hashcat] inutilisable ({exc}) — ignoré (le projet "
+                  "continue)")
+            return 0
+    prj.settings["hashcat_path"] = hc
+    prj.settings["hashcat_version"] = ver
+    if echo:
+        print(f"  [hashcat] {hc}" + (f" — version {ver}" if ver else ""))
+    ready = {}
+    for t in prj.targets.values():
+        if t.status == "READY":
+            ready.setdefault(t.mode, []).append(t)
+    if not ready:
+        if echo:
+            print("  [hashcat] aucune cible READY — rien à casser "
+                  "(les cibles RESOLVED le sont déjà par les solveurs)")
+        return 0
+    if not prj.wordlist:
+        if echo:
+            print("  [hashcat] aucune wordlist associée au projet — lancement "
+                  "ignoré (§13 : passez -w ou répondez à la question)")
+        return 0
+    do_run = bool(opts.get("hashcat_run"))
+    if not do_run and interactive:
+        try:
+            _rep = input("  Lancer hashcat (GPU) maintenant sur "
+                         f"{sum(len(v) for v in ready.values())} cible(s) "
+                         f"READY ({', '.join('-m %d' % m for m in sorted(ready))})"
+                         " avec la wordlist du projet ? [o/N] : ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            _rep = ""
+        do_run = _rep in ("o", "oui", "y", "yes")
+    if not do_run:
+        if echo:
+            print("  [hashcat] prêt mais NON lancé (pas de confirmation ni de "
+                  "--hashcat-run) — commandes exactes dans "
+                  + out_sub(prj, OUT_HASHES_DIR, "commandes.txt"))
+        return 0
+    cracked_total = 0
+    for mode in sorted(ready):
+        hpath = os.path.abspath(
+            out_sub(prj, OUT_HASHES_DIR, "hashcat-m%d.hash" % mode))
+        if not os.path.isfile(hpath):
+            prj.add_error("hashcat", f"fichier de hashes absent : {hpath}")
+            continue
+        cmd = [hc, "-m", str(mode), "-a", "0", "-O", "-w", "3",
+               hpath, os.path.abspath(prj.wordlist)]
+        logp = os.path.abspath(engine_hashcat_log_path(prj, mode))
+        if echo:
+            print("  [hashcat] " + " ".join('"%s"' % c if " " in c else c
+                                            for c in cmd))
+        prj.log_action(f"hashcat -m {mode}",
+                       "cibles READY + wordlist associée (GPU > CPU)",
+                       evidence=hpath, inputs=" ".join(cmd),
+                       status="RUNNING", echo=False)
+        rc = -1
+        try:
+            ensure_parent(logp)
+            with open(logp, "w", encoding="utf-8", errors="replace") as lf:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, text=True,
+                                        encoding="utf-8", errors="replace",
+                                        cwd=hc_dir)
+                try:
+                    for line in proc.stdout:
+                        if echo:
+                            print("    | " + line.rstrip())   # v1.2 : intégral
+                        lf.write(line)
+                except KeyboardInterrupt:
+                    proc.terminate()
+                    if echo:
+                        print(f"  [hashcat] interrompu (Ctrl+C) — session "
+                              f"partielle : {logp}")
+                rc = proc.wait()
+        except Exception as exc:
+            prj.add_error("hashcat", f"lancement -m {mode} : {exc}")
+            continue
+        # Mots de passe cassés : hashcat --show (le hash est vérifié par
+        # hashcat lui-même = preuve cryptographique, §42).
+        n_cr = 0
+        try:
+            _sh = subprocess.run([hc, "-m", str(mode), "--show", hpath],
+                                 capture_output=True, text=True, timeout=60,
+                                 cwd=hc_dir)
+            shown = [l for l in (_sh.stdout or "").splitlines() if l.strip()]
+            for line in shown:
+                if ":" not in line:
+                    continue
+                pw = line.rsplit(":", 1)[-1]
+                if not pw:
+                    continue
+                it = prj.kb.add(pw, "password", status=EV_VALIDATED,
+                                confidence=1.0,
+                                source=f"hashcat -m {mode} sur "
+                                       f"{os.path.basename(hpath)} "
+                                       "(hash vérifié par hashcat)",
+                                tags=["hashcat"])
+                if it is not None:
+                    n_cr += 1
+            for t in ready[mode]:
+                for l in shown:
+                    if l == t.line or l.startswith(t.line + ":") \
+                            or l.split(":")[0] == t.line:
+                        t.status = "CRACKED"
+                        t.password = l.rsplit(":", 1)[-1]
+                        t.why = f"cassé par hashcat -m {mode} (GPU/CPU externe)"
+                        # v1.2 — le dossier de CE hash est mis à jour tout de
+                        # suite : resultat.txt porte le mot de passe EN CLAIR.
+                        engine_write_hash_folder(
+                            prj, t,
+                            hash_dir(prj, t.mode, t.line, user=t.user,
+                                     capture=t.capture))
+                        break
+            engine_write_hash_index(prj, list(engine_hash_dirs(prj)))
+        except Exception as exc:
+            prj.add_error("hashcat", f"--show -m {mode} : {exc}")
+        cracked_total += n_cr
+        # v1.1.1 — rc signé : -1 remonte 4294967295 sur Windows (32 bits non
+        # signé) — illisible tel quel dans le rapport.
+        rc_d = rc - 2 ** 32 if isinstance(rc, int) and rc > 0x7FFFFFFF else rc
+        prj.log_action(f"hashcat -m {mode}", "lancement terminé",
+                       evidence=logp,
+                       output=f"rc={rc_d}, {n_cr} mot(s) de passe cassé(s)",
+                       status="DONE" if rc == 0 else "FAILED", echo=False)
+        if echo:
+            print(f"  [hashcat] -m {mode} : rc={rc_d} — {n_cr} mot(s) de passe "
+                  f"cassé(s) → knowledge base · journal : {logp}")
+        if rc != 0 and n_cr == 0:
+            # Diagnostic honnête (§24/§42) : la cause exacte est dans le
+            # journal — on la remonte au lieu d'un rc brut incompréhensible.
+            _hint = ""
+            try:
+                with open(logp, encoding="utf-8", errors="replace") as _lf:
+                    _head = _lf.read(4000)
+                if "OpenCL" in _head:
+                    _hint = ("OpenCL introuvable — vérifiez l'installation de "
+                             "hashcat (dossier OpenCL/ à côté de "
+                             "l'exécutable) et le pilote GPU ; le lancement "
+                             "part déjà du dossier de hashcat (v1.1.1)")
+            except OSError:
+                pass
+            if _hint:
+                prj.add_error("hashcat", f"-m {mode} : {_hint}")
+                if echo:
+                    print(f"  [hashcat] échec -m {mode} : {_hint}")
+    return cracked_total
+
+
+# ============================================================================
+#  MOTEUR — DÉCISION · ROUNDS · PROPAGATION · POST-CRACK · CHAÎNES · ACTIONS
+# ----------------------------------------------------------------------------
+#  Mission §14 (orchestrateur : lancer le bon solveur, dire POURQUOI),
+#  §15 (propagation des résultats vers la KB), §16 (post-crack : une clé
+#  trouvée sert à déchiffrer), §17/§20 (dépendances / chaînes de résolution),
+#  §18 (boucle par rounds jusqu'à état stable), §19 (prochaines actions
+#  classées, coûts chiffrés), §21 (validation : jamais « CRACKED » sans
+#  vérification cryptographique), §24 (jamais « NOT FOUND » nu : raison).
+#  Réutilise les solveurs existants (run_integrated_solvers) et leurs
+#  validations internes (ICV WEP, HMAC RADIUS, confirm SAE, verify() auth).
+# ============================================================================
+
+def engine_extract_strings(blob, minlen=6, limit=40):
+    """Preuves textuelles dans un payload déchiffré : séquences imprimables.
+    Retourne la liste des chaînes trouvées."""
+    strs = []
+    try:
+        for r in re.findall(rb"[ -~]{%d,}" % max(3, minlen), blob)[:limit * 3]:
+            s = r.decode("ascii", "replace")
+            if s and s not in strs:
+                strs.append(s)
+            if len(strs) >= limit:
+                break
+    except Exception:
+        pass
+    return strs
+
+
+def _engine_solver_ctx(prj, opts):
+    """v1.1.1 — contexte d'exécution des solveurs : tout ce qui peut changer
+    un résultat (§35 : mêmes entrées → même résultat). Sert à décider si un
+    échec précédent (NOT_FOUND/TIMEOUT/PARTIAL) mérite d'être rejoué."""
+    opts = opts or {}
+    kb_sae, kb_auth = engine_masks_from_kb(prj)
+    return "|".join(str(x) for x in (
+        prj.wordlist or "", bool(opts.get("deep")), bool(opts.get("wep_deep")),
+        int(opts.get("budget") or 0),
+        opts.get("sae_mask") or kb_sae or "", opts.get("auth_mask") or kb_auth or "",
+        opts.get("tshark") or "", len(prj.kb)))
+
+
+def _engine_prev_results(prj, ci):
+    """v1.1.1 — dernier résultat RUN par solveur pour CETTE capture OU une
+    copie identique (même sha256, autre dossier). Run réel : rad.pcap ×3,
+    kerberos_auth ×3, wpa2-entrp ×2, sae.pcap ×2, ch6/8/9/10 ×2 — chaque
+    copie rejouait des cassage de 250 s à 38 min pour le MÊME résultat."""
+    sha = str(getattr(ci, "sha16", "") or "")
+    sha_map = prj.settings.get("solver_sha", {}) or {}
+    names = {ci.name}
+    if sha:
+        names.update(n for n, sx in sha_map.items() if sx and sx == sha)
+    best = {}
+    for r in prj.solver_runs:
+        if r.decision != "RUN" or r.capture not in names:
+            continue
+        cur = best.get(r.solver)
+        if cur is None or (r.run or "") >= (cur.run or ""):
+            best[r.solver] = r
+    return best
+
+
+# Statuts dont le résultat est DÉFINITIF pour un contenu identique :
+# positif (VALIDATED/FOUND) ou « rien d'applicable » (NOT_APPLICABLE).
+_ENGINE_REUSE_ALWAYS = (ST_VALIDATED, ST_FOUND, ST_NOT_APPLICABLE)
+# Statuts d'échec rejoués SEULEMENT si le contexte a changé (wordlist,
+# --deep, budget, masks, tshark, connaissances) — §35 déterminisme.
+_ENGINE_REUSE_IF_SAME_CTX = (ST_NOT_FOUND, ST_TIMEOUT, ST_PARTIAL)
+
+
+def engine_verify_eapol_mic_multi(pmk, ap, cli, anonce, snonce, msg2_eapol):
+    """v1.1.1 — vérification du MIC EAPOL M2 multi-AKM.
+    Bug du run réel (sae.pcap) : le solveur SAE avait retrouvé le PMK
+    (f56268…) — TK dérivé, 17 trames CCMP déchiffrées, flag extrait — mais
+    le post-crack annonçait « PMK ne vérifie pas le MIC » car SEUL le KDF
+    SHA-1 (WPA2, AKM 2/4) était essayé. Les handshakes SAE/802.11w
+    (AKM 6/8) utilisent le KDF SHA-256. Ordre des essais (déterministe) :
+      1. KDF SHA-1 (prf512) + MIC HMAC-SHA1        — WPA2 classique
+      2. KDF SHA-256 48 o + MIC HMAC-SHA256[:16]   — SAE (KCK 128 bits)
+      3. KDF SHA-256 64 o + MIC HMAC-SHA256[:16]   — 802.11w (KCK 256 bits)
+      4. KDF SHA-256 48 o + MIC HMAC-SHA1[:16]     — variante mixte
+    Retourne (ok, ptk, kck, kek, tk, kdf). Rien n'est affirmé sans succès
+    cryptographique (§42)."""
+    last = (False, b"", b"", b"", b"", "")
+    try:
+        ok, ptk, kck, kek, tk = compute_ptk_and_verify_eapol_mic(
+            pmk, ap, cli, anonce, snonce, msg2_eapol)
+        if ok:
+            return True, ptk, kck, kek, tk, "KDF SHA-1 (WPA2)"
+        last = (False, ptk, kck, kek, tk, "")
+    except Exception:
+        pass
+    macs = min(ap, cli) + max(ap, cli)
+    nonces = min(anonce, snonce) + max(anonce, snonce)
+    zeroed = msg2_eapol[:81] + b"\x00" * 16 + msg2_eapol[97:]
+    captured = msg2_eapol[81:97]
+    for blen, lbl in ((48, "KDF SHA-256 (SAE)"), (64, "KDF SHA-256 (802.11w)")):
+        try:
+            ptk = sha256_prf(pmk, "Pairwise key expansion", macs + nonces, blen)
+            kck = ptk[:16] if blen == 48 else ptk[:32]
+            kek = ptk[16:32] if blen == 48 else ptk[32:64]
+            tk = ptk[32:48] if blen == 48 else ptk[64:80]
+            if hmac.new(kck, zeroed, hashlib.sha256).digest()[:16] == captured:
+                return True, ptk, kck, kek, tk, lbl
+            last = (False, ptk, kck, kek, tk, "")
+        except Exception:
+            continue
+    try:
+        ptk = sha256_prf(pmk, "Pairwise key expansion", macs + nonces, 48)
+        kck, kek, tk = ptk[:16], ptk[16:32], ptk[32:48]
+        if hmac.new(kck, zeroed, hashlib.sha1).digest()[:16] == captured:
+            return True, ptk, kck, kek, tk, "KDF SHA-256 + MIC SHA-1 (mixte)"
+    except Exception:
+        pass
+    return last
+
+
+def _engine_add_decryption(prj, rec):
+    """v1.1.1 — déchiffrements SANS DOUBLON : même capture + même méthode +
+    même clé = UNE fiche (run réel : rad.pcap présent 3× dans l'arborescence
+    → 3 fiches identiques, §2 et messages-dechiffres.txt répétaient tout).
+    La fiche la plus riche gagne (trames vérifiées, preuves fusionnées).
+    Retourne True si la fiche est nouvelle."""
+    def _k(d):
+        return (d.get("capture"), d.get("method"),
+                d.get("key_tk") or d.get("key_wep") or "")
+    k = _k(rec)
+    for i, d in enumerate(prj.decryptions):
+        if _k(d) != k:
+            continue
+        seen = set()
+        merged = []
+        for e in list(d.get("evidence") or []) + list(rec.get("evidence") or []):
+            sig = (e.get("frame"), e.get("text")) if isinstance(e, dict) \
+                else (None, str(e))
+            if sig not in seen:
+                seen.add(sig)
+                merged.append(e)
+        rec = dict(rec)
+        rec["evidence"] = merged      # v1.2 : TOUTES les preuves, sans plafond
+        for f in ("frames_decrypted", "frames_verified_llc"):
+            rec[f] = max(int(d.get(f) or 0), int(rec.get(f) or 0))
+        if d.get("validation") == VAL_VALIDATED:
+            rec["validation"] = VAL_VALIDATED
+        prj.decryptions[i] = rec
+        return False
+    prj.decryptions.append(rec)
+    return True
+
+
+def engine_decide(prj, ci, tshark_path, opts=None):
+    """§14 : pour une capture, décide solveur par solveur — RUN ou SKIP avec
+    raison + preuve + confiance. Aucun solveur « pertinent » n'est lancé sans
+    données suffisantes ; aucun skip n'est silencieux (§24)."""
+    det = ci.det or {}
+    decs = []
+    # v1.1 — optimisation temps (demande utilisateur) : un export JSON
+    # doublon d'une capture brute présente dans le projet (même nom de base,
+    # même nb de paquets) ne rejoue pas les solveurs — la brute est plus
+    # complète (RADIUS/EAPOL/WEP/SAE y sont déjà passés) et l'export JSON
+    # géant coûte cher à relire (run réel : 84 s d'auth sur ch10.cap +
+    # 7,8 s sur ch10.json, 1,3 Go). Skip tracé (§24 : jamais silencieux).
+    _dupe_raw = None
+    if det.get("is_json"):
+        for _dp in prj.settings.get("probable_duplicates", []):
+            _a, _b = str(_dp.get("a", "")), str(_dp.get("b", ""))
+            _twin = _b if _a == ci.name else (_a if _b == ci.name else "")
+            if _twin and not _twin.lower().endswith(".json"):
+                _dupe_raw = _twin
+                break
+    # --- auth (sous-code 1) ---
+    if _dupe_raw:
+        decs.append({"solver": "auth", "run": False,
+                     "reason": f"doublon JSON de {_dupe_raw} (même capture, "
+                               f"{det.get('packets', 0)} paquets) — solveurs "
+                               "lancés sur la capture brute (gain de temps)",
+                     "evidence": f"{ci.name} ↔ {_dupe_raw}",
+                     "confidence": "HIGH", "skip_status": ST_NOT_APPLICABLE})
+    elif det.get("is_json"):
+        if (det.get("packets") or 0) > 0:
+            decs.append({"solver": "auth", "run": True,
+                         "reason": "export tshark JSON : détecteurs auth applicables",
+                         "evidence": f"{ci.name} — {det.get('packets')} paquet(s), "
+                                     f"protocoles : "
+                                     + (", ".join(det.get("auth_protos") or {}) or "?"),
+                         "confidence": "HIGH", "skip_status": ST_NOT_APPLICABLE})
+        else:
+            decs.append({"solver": "auth", "run": False,
+                         "reason": "export JSON vide : aucune donnée à analyser",
+                         "evidence": ci.name, "confidence": "HIGH",
+                         "skip_status": ST_INSUFFICIENT})
+    elif prj.transient.get(ci.path) or tshark_path:
+        protos = ", ".join(det.get("auth_protos") or {}) or "à déterminer par tshark"
+        decs.append({"solver": "auth", "run": True,
+                     "reason": "tshark disponible : export JSON à la volée pour les "
+                               "détecteurs (XMPP/HTTP/POP3/IMAP/SMTP/FTP/Telnet)",
+                     "evidence": f"{ci.name} — protocoles : {protos}",
+                     "confidence": "MEDIUM", "skip_status": ST_NOT_APPLICABLE})
+    else:
+        decs.append({"solver": "auth", "run": False,
+                     "reason": "pcap brut sans tshark : détecteurs auth indisponibles "
+                               "(installez tshark ou fournissez un export « tshark -T json »)",
+                     "evidence": ci.name, "confidence": "HIGH",
+                     "skip_status": ST_UNAVAILABLE})
+    # --- wpa2e (sous-code 2) ---
+    if det.get("is_json"):
+        decs.append({"solver": "wpa2e", "run": False,
+                     "reason": "export JSON : RADIUS/EAPOL nécessitent le pcap brut",
+                     "evidence": ci.name, "confidence": "HIGH",
+                     "skip_status": ST_NOT_APPLICABLE})
+    elif det.get("radius") or det.get("eapol"):
+        ev = f"{ci.name} — RADIUS : {det.get('radius', 0)} trame(s)"
+        if det.get("radius"):
+            ev += (" (Message-Authenticator : OUI → secret cassable hors ligne)"
+                   if det.get("radius_msgauth") else " (Message-Authenticator absent)")
+        if det.get("eapol"):
+            ev += " ; handshake 4-way : " + ",".join(
+                "M%d" % m for m in det["eapol"])
+        decs.append({"solver": "wpa2e", "run": True,
+                     "reason": "trames RADIUS et/ou handshake EAPOL détectés",
+                     "evidence": ev, "confidence": "HIGH",
+                     "skip_status": ST_NOT_APPLICABLE})
+    else:
+        decs.append({"solver": "wpa2e", "run": False,
+                     "reason": "aucune trame RADIUS ni handshake EAPOL 4-way",
+                     "evidence": ci.name, "confidence": "HIGH",
+                     "skip_status": ST_INSUFFICIENT})
+    # --- wep (sous-code 3) ---
+    if det.get("is_json"):
+        decs.append({"solver": "wep", "run": False,
+                     "reason": "export JSON : le cassage WEP nécessite le pcap brut",
+                     "evidence": ci.name, "confidence": "HIGH",
+                     "skip_status": ST_NOT_APPLICABLE})
+    elif det.get("wep_frames"):
+        reuse = det.get("wep_iv_reuse", 0)
+        decs.append({"solver": "wep", "run": True,
+                     "reason": "trames de données WEP présentes — attaque par "
+                               "keystream réutilisé applicable",
+                     "evidence": f"{ci.name} — {det['wep_frames']} trames WEP, "
+                                 f"IV réutilisés : {reuse} "
+                                 f"({'attaque favorable' if reuse > 0 else 'peu de réutilisations'})",
+                     "confidence": "HIGH" if reuse > 100 else "MEDIUM",
+                     "skip_status": ST_NOT_APPLICABLE})
+    else:
+        decs.append({"solver": "wep", "run": False,
+                     "reason": "aucune trame de données WEP",
+                     "evidence": ci.name, "confidence": "HIGH",
+                     "skip_status": ST_INSUFFICIENT})
+    # --- sae (sous-code 4) ---
+    if det.get("is_json"):
+        decs.append({"solver": "sae", "run": False,
+                     "reason": "export JSON : SAE nécessite le pcap brut",
+                     "evidence": ci.name, "confidence": "HIGH",
+                     "skip_status": ST_NOT_APPLICABLE})
+    elif det.get("sae_frames"):
+        decs.append({"solver": "sae", "run": True,
+                     "reason": "échange SAE (WPA3) détecté — récupération PWE "
+                               "par mask possible",
+                     "evidence": f"{ci.name} — {det['sae_frames']} trame(s) "
+                                 f"commit/confirm (algo 3)",
+                     "confidence": "MEDIUM", "skip_status": ST_NOT_APPLICABLE})
+    else:
+        decs.append({"solver": "sae", "run": False,
+                     "reason": "aucune trame SAE (WPA3)",
+                     "evidence": ci.name, "confidence": "HIGH",
+                     "skip_status": ST_INSUFFICIENT})
+    # v1.1.1 — RÉUTILISATION INTER-RUNS (§31/§35, correction du run réel) :
+    # un résultat DÉFINITIF (VALIDATED/FOUND/NOT_APPLICABLE) sur une capture
+    # au contenu identique (même sha256 — y compris une copie dans un autre
+    # dossier) n'est pas rejoué (run réel : WEP ch10.cap 250 s ×2, export
+    # auth 65 s ×2, rad.pcap ×3…). Un échec (NOT_FOUND/TIMEOUT/PARTIAL)
+    # n'est rejoué que si les entrées ont changé (wordlist/--deep/budget/
+    # masks/tshark/connaissances) — sinon §35 : même résultat attendu (run
+    # réel : 38 min de brute-force WEP relancées à l'identique). Chaque
+    # réutilisation est TRACÉE (§24 : jamais silencieuse), visible au §11.
+    prev = _engine_prev_results(prj, ci)
+    if prev:
+        ctx = _engine_solver_ctx(prj, opts)
+        ctx_prev = prj.settings.get("solver_ctx", {}) or {}
+        _sha12 = str(getattr(ci, "sha16", "") or "")   # v1.2 : empreinte entière
+        for d in decs:
+            if not d["run"]:
+                continue
+            p_ = prev.get(d["solver"])
+            if p_ is None:
+                continue
+            same_ctx = bool(ctx) and ctx_prev.get(p_.capture) == ctx
+            if p_.status in _ENGINE_REUSE_ALWAYS or \
+                    (p_.status in _ENGINE_REUSE_IF_SAME_CTX and same_ctx):
+                d["run"] = False
+                d["skip_status"] = p_.status
+                d["reason"] = (
+                    f"résultat du run précédent réutilisé : {p_.status}"
+                    + (" (définitif — §31)"
+                       if p_.status in _ENGINE_REUSE_ALWAYS
+                       else " (mêmes entrées → même résultat, §35)")
+                    + (f" — capture identique ({_sha12})" if _sha12 else "")
+                    + (f", déjà traitée via {p_.capture}"
+                       if p_.capture != ci.name else ""))
+    return decs
+
+
+def engine_masks_from_kb(prj):
+    """Masks issus des connaissances (§7) : type=mask. Le contexte (note JSON
+    « sae »/«wpa3») distingue SAE et auth ; à défaut, un mask de 64 chiffres
+    hexadécimaux est reconnu comme mask SAE (32 octets, format du solveur
+    WPA3), tout autre mask va au crackage applicatif. Retourne
+    (sae_mask, auth_mask)."""
+    sae = auth = None
+    for it in prj.kb.by_type("mask"):
+        ctx = (it.note or "").lower() + " " + " ".join(it.tags).lower()
+        v = it.value.strip()
+        hex64 = (len(v) == 64
+                 and all(c in "0123456789abcdefABCDEF" for c in v))
+        if "sae" in ctx or "wpa3" in ctx or (hex64 and "auth" not in ctx):
+            sae = sae or v
+        else:
+            auth = auth or v
+    return sae, auth
+
+
+def engine_ask_project(prj, opts, interactive, echo=True):
+    """Questions ciblées niveau PROJET (mêmes règles que v3.1 : TTY
+    uniquement, défaut = Entrée, EOF sûr). Le hash est rendu avant la
+    question mask (§7/exemple WPA3)."""
+    if not interactive:
+        return
+    any_sae = any((c.det or {}).get("sae_frames") for c in prj.captures)
+    any_auth = any(c.status == "ANALYZED" or (c.det or {}).get("auth_protos")
+                   for c in prj.captures)
+    any_msgauth = any((c.det or {}).get("radius_msgauth")
+                      for c in prj.captures)
+    any_wep = any((c.det or {}).get("wep_frames") for c in prj.captures)
+
+    def _ask_ligne(prompt):
+        try:
+            return input(prompt).strip().strip('"').strip("'")
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            return ""
+
+    kb_sae, kb_auth = engine_masks_from_kb(prj)
+    if any_auth and not opts.get("auth_mask") and not kb_auth:
+        rep_ = _ask_ligne("  Mask de crackage APPLICATIF (syntaxe hashcat, "
+                          "ex. 'frag?l?l?l') — pour les protocoles auth "
+                          "(FTP/SMTP/HTTP…) ; le mask WPA3/SAE est demandé "
+                          "plus bas, séparément [aucun] : ")
+        if rep_:
+            if re.fullmatch(r"(0[xX])?[0-9a-fA-F]{64}", rep_):
+                # un PMK/mask SAE (64 hex) collé ici par erreur → rerouté
+                _hex = rep_[2:] if rep_.lower().startswith("0x") else rep_
+                print("    → 64 caractères hexadécimaux détectés : c'est un "
+                      "mask SAE/WPA3, pas un mask applicatif. Il sera utilisé "
+                      "pour le SAE (question suivante sautée).")
+                opts["sae_mask"] = _hex
+                prj.log_action("Mask SAE (rerouté depuis la question auth)",
+                               "64 hex collés dans le prompt auth — corrigé "
+                               "automatiquement",
+                               inputs="USER_SUPPLIED",
+                               output=_hex, echo=False)
+            else:
+                opts["auth_mask"] = rep_
+                prj.log_action("Mask auth (question)", "cibles auth détectées",
+                               inputs="USER_SUPPLIED", output=rep_, echo=False)
+    if any_msgauth:
+        rep_ = _ask_ligne("  Candidats pour le(s) secret(s) RADIUS "
+                          "(séparés par virgules) [aucun] : ")
+        if rep_:
+            for c in [x.strip() for x in rep_.replace(";", ",").split(",")
+                      if x.strip()]:
+                prj.kb.add(c, "password_candidate", status=EV_USER,
+                           confidence=0.9, source="question interactive",
+                           tags=["RADIUS", "supplied"])
+            prj.log_action("Candidats RADIUS (question)",
+                           "Message-Authenticator détecté",
+                           inputs="USER_SUPPLIED", output=rep_, echo=False)
+    if any_wep and not opts.get("deep") and not opts.get("wep_deep"):
+        tot = sum((c.det or {}).get("wep_frames", 0) for c in prj.captures)
+        rep_ = _ask_ligne(f"  WEP : {tot} trame(s) au total — lancer l'échelle "
+                          "COMPLÈTE (comme --deep pour WEP, long) ? [o/N] : ").lower()
+        if rep_ in ("o", "oui", "y", "yes"):
+            opts["wep_deep"] = True
+            prj.log_action("WEP échelle complète (question)",
+                           "trames WEP + IV réutilisés détectés",
+                           output="deep WEP activé", echo=False)
+    if any_sae and not opts.get("sae_mask") and not kb_sae:  # (sae_mask peut venir du reroutage auth)
+        lines = [t.line for t in prj.targets.values() if t.mode == 22000]
+        if lines:
+            print("  Hash(s) WPA disponibles (hashcat -m 22000) :")
+            for ln in lines:
+                print("    " + ln)
+        else:
+            print("  (aucun hash -m 22000 extrait — handshake EAPOL absent "
+                  "ou tshark indisponible)")
+        rep_ = _ask_ligne("  Mask SAE (64 hex, ex. PMK ou masque PWE) "
+                          "[%s] : " % SAE_DEFAULT_MASK)
+        if rep_:
+            if rep_.lower().startswith("0x"):
+                rep_ = rep_[2:]
+            opts["sae_mask"] = rep_
+            prj.log_action("Mask SAE (question)", "trames SAE détectées — "
+                           "le hash a été rendu avant la question",
+                           inputs="USER_SUPPLIED", output=rep_,
+                           echo=False)
+    # v1.1 — nombre de cœurs CPU (crackage interne) et chemin hashcat
+    # (cassage GPU, plus rapide que le CPU — demande utilisateur). Les deux
+    # sont mémorisés dans donnees.json (settings) et redemandés à chaque
+    # lancement interactif (Entrée = valeur mémorisée / tous les cœurs).
+    if not opts.get("cores"):
+        _n_cpu = os.cpu_count() or 2
+        _mem = prj.settings.get("cores") or ""
+        rep_ = _ask_ligne(f"  Nombre de cœurs CPU pour le crackage "
+                          f"(Entrée = {'%s (mémorisé)' % _mem if _mem else 'tous (%d)' % _n_cpu}) : ")
+        if rep_:
+            try:
+                _c = int(rep_)
+                if 1 <= _c <= 4096:
+                    opts["cores"] = _c
+                    prj.settings["cores"] = _c
+                else:
+                    print("    → valeur hors plage (1–4096) — ignorée")
+            except ValueError:
+                print("    → entier attendu — valeur ignorée")
+        elif _mem:
+            opts["cores"] = int(_mem)
+    if not opts.get("hashcat"):
+        _mem = prj.settings.get("hashcat_path") or ""
+        rep_ = _ask_ligne("  Chemin de hashcat pour casser avec le GPU "
+                          "(ex. C:\\hashcat\\hashcat.exe — plus optimisé que "
+                          "le CPU ; Entrée = "
+                          + (f"{_mem} (mémorisé)" if _mem else "ne pas utiliser")
+                          + ") : ")
+        if rep_:
+            opts["hashcat"] = rep_
+        elif _mem:
+            opts["hashcat"] = _mem
+
+
+def engine_propagate(prj, ci, report, echo=True):
+    """§15 : chaque résultat de solveur devient une connaissance (statut
+    VALIDATED seulement quand le sous-code a vérifié cryptographiquement :
+    ICV WEP, HMAC-MD5 RADIUS, confirm SAE, verify() auth — §21/§42)."""
+    new = 0
+    keymap = (("radius_secret", "secret"), ("pmk", "pmk"), ("kek", "kek"),
+              ("tk", "tk"), ("gtk", "gtk"),
+              ("key_hex", "key"), ("key_ascii", "word"))
+    for oc in report.outcomes:
+        fnd = oc.findings or {}
+        # §42 : un TK/KEK dérivé d'un PMK dont le MIC EAPOL n'a PAS été
+        # vérifié n'est pas une clé établie — OBSERVED, jamais VALIDATED
+        # (run réel : TK « 4fbd… » affiché VALIDATED alors que le MIC du
+        # handshake SAE était en échec avec le PMK RADIUS).
+        _mic_ko = (oc.name == "wpa2e" and fnd.get("mic_ok") is False)
+        for k, kbty in keymap:
+            v = fnd.get(k)
+            if v:
+                if _mic_ko and kbty in ("tk", "kek"):
+                    it = prj.kb.add(v, kbty, status=EV_OBSERVED, confidence=0.4,
+                                    source=f"solveur {oc.name} sur {ci.name} ({k}) — "
+                                           "dérivé mais MIC EAPOL NON vérifié "
+                                           "(clé non établie, §42)",
+                                    capture=ci.name, tags=[oc.name])
+                else:
+                    it = prj.kb.add(v, kbty, status=EV_VALIDATED, confidence=1.0,
+                                    source=f"solveur {oc.name} sur {ci.name} ({k}) — "
+                                           "vérification cryptographique du sous-code",
+                                    capture=ci.name, tags=[oc.name])
+                if it is not None:
+                    new += 1
+        # v1.1 — les déchiffrements faits par l'ADAPTATEUR lui-même (SAE :
+        # TK vérifié par confirm ; WPA2-E : MIC vérifié) remontent dans
+        # prj.decryptions → visibles au rapport §DÉCHIFFREMENTS et écrits
+        # dans messages-dechiffres.txt (« tous les messages déchiffrés et
+        # écrits » — demande utilisateur). Déjà vus (capture, méthode) :
+        # la dernière entrée remplace à la sauvegarde.
+        if oc.name in ("sae", "wpa2e") and fnd.get("tk")                 and int(fnd.get("decrypted_frames") or 0) > 0                 and not (oc.name == "wpa2e" and _mic_ko):
+            _meth = ("CCMP/AES (TK SAE — confirm vérifié)" if oc.name == "sae"
+                     else "CCMP/AES (TK dérivé — MIC vérifié, adaptateur)")
+            _engine_add_decryption(prj, {
+                "capture": ci.name, "method": _meth,
+                "key_tk": fnd["tk"],
+                "frames_decrypted": int(fnd.get("decrypted_frames") or 0),
+                "frames_verified_llc": 0,
+                "validation": VAL_VALIDATED,
+                "evidence": [{"text": str(x)}
+                             for x in (fnd.get("evidence_strings") or [])],
+            })
+        if oc.name == "auth":
+            for c in fnd.get("credentials", []) or []:
+                pw = c.get("password"); us = c.get("username")
+                if pw:
+                    prj.kb.add(pw, "password", status=EV_VALIDATED,
+                               confidence=1.0,
+                               source=f"solveur auth sur {ci.name} — verify() "
+                                      f"[{c.get('proto')}/{c.get('mechanism')}] {us}",
+                               capture=ci.name, tags=["auth"])
+                    prj.kb.add(f"{us}:{pw}", "credential", status=EV_VALIDATED,
+                               confidence=1.0, capture=ci.name,
+                               source=f"solveur auth ({c.get('proto')})",
+                               tags=["auth"])
+                    new += 1
+            engine_targets_from_solver_outcomes(prj, ci, report)
+        if fnd.get("pmk"):
+            for t in prj.targets.values():
+                if t.mode == 22000 and t.capture == ci.name \
+                        and t.status == "READY":
+                    t.status = "RESOLVED"
+                    t.validation = VAL_VALIDATED
+                    t.password = fnd["pmk"]
+                    t.why += " — PMK récupéré par le solveur (chaîne RADIUS/SAE), pas de cassage PSK nécessaire"
+        if oc.name == "wep" and fnd.get("key_hex"):
+            for t in prj.targets.values():
+                pass    # WEP : pas de mode hashcat — la clé est la résolution
+    return new
+
+
+def engine_ssid_from_target(t):
+    """SSID (bytes→str) d'une cible -m 22000 : WPA*01/02*…*ESSIDhex (champ 5)."""
+    try:
+        f = t.line.split("*")
+        if len(f) >= 6 and f[1] in ("01", "02"):
+            return bytes.fromhex(f[5]).decode("utf-8", "replace")
+    except Exception:
+        pass
+    return None
+
+
+def engine_handshake_for(prj, ci):
+    """Handshake 4-way d'une capture pcap (cache transient) — (ap, cli, hs)."""
+    hk = ci.path + "::hs"
+    if hk not in prj.transient:
+        try:
+            prj.transient[hk] = extract_handshake_from_pcap(ci.path)
+        except Exception:
+            prj.transient[hk] = None
+    return prj.transient[hk]
+
+
+def engine_decrypt_ccmp(prj, ci, tk, origin):
+    """§16 : déchiffrement CCMP des trames protégées avec un TK validé.
+    Validation honnête (§42) : trame compte comme vérifiée si le plaintext
+    commence par l'en-tête LLC AA-AA-03 (structure attendue)."""
+    try:
+        pairs = decrypt_all_protected_data(ci.path, tk)
+    except Exception as exc:
+        prj.add_error("post-crack CCMP", exc, capture=ci.name)
+        return 0
+    verified = 0; all_strs = []
+    for frame_num, plain in pairs or []:
+        if plain[:3] == b"\xaa\xaa\x03":
+            verified += 1
+        s = engine_extract_strings(plain)
+        all_strs += [(frame_num, x) for x in s]
+    if not pairs:
+        return 0
+    _engine_add_decryption(prj, {
+        "capture": ci.name, "method": "CCMP/AES (TK dérivé — " + origin + ")",
+        "key_tk": tk.hex(), "frames_decrypted": len(pairs),
+        "frames_verified_llc": verified,
+        "validation": VAL_VALIDATED if verified else VAL_INCONCLUSIVE,
+        "evidence": [{"frame": n, "text": s} for n, s in all_strs],
+    })
+    for _n, s in all_strs:
+        prj.kb.add(s, "word", status=EV_OBSERVED, confidence=0.6,
+                   capture=ci.name,
+                   source=f"payload CCMP déchiffré (frame {_n})",
+                   tags=["decrypted"])
+    prj.add_timeline(f"déchiffrement CCMP : {len(pairs)} trame(s), "
+                     f"{verified} vérifiée(s) LLC", capture=ci.name,
+                     kind="decryption")
+    prj.log_action("Déchiffrement CCMP", f"TK disponible ({origin})",
+                   evidence=f"{ci.name} — {len(pairs)} trame(s) protégée(s)",
+                   output=f"{verified} trame(s) structure LLC valide, "
+                          f"{len(all_strs)} chaîne(s) extraite(s)",
+                   status="DONE")
+    return len(all_strs) + (1 if verified else 0)
+
+
+def engine_wep_decrypt_sample(prj, ci, key, max_frames=200):
+    """§16 : réutilisation d'une clé WEP validée (ICV) pour déchiffrer le
+    trafic de la capture — RC4 + contrôle CRC32 par trame (validation
+    structurelle, §21/§42)."""
+    try:
+        paquets = lire_pcap(ci.path)
+    except Exception as exc:
+        prj.add_error("post-crack WEP", exc, capture=ci.name)
+        return 0
+    n_ok = 0; all_strs = []
+    for linktype, brut in paquets:
+        try:
+            tr = extraire_trame_wep(enlever_entete_radio(linktype, brut))
+            if not tr:
+                continue
+            iv, flux = tr[0], tr[1]
+            ks = rc4_flux(rc4_ksa(iv + key), len(flux))
+            plain = bytes(a ^ b for a, b in zip(flux, ks))
+            if len(plain) < 12:
+                continue
+            body, icv = plain[:-4], struct.unpack("<I", plain[-4:])[0]
+            if (zlib.crc32(body) & 0xFFFFFFFF) != icv:
+                continue
+            n_ok += 1
+            payload = body[8:] if body[:3] == b"\xaa\xaa\x03" else body
+            all_strs += engine_extract_strings(payload)
+            if n_ok >= max_frames:
+                break
+        except Exception:
+            continue
+    if not n_ok:
+        return 0
+    _engine_add_decryption(prj, {
+        "capture": ci.name, "method": "WEP RC4 (clé validée ICV) + CRC32 par trame",
+        "key_wep": " ".join("%02X" % b for b in key),
+        "frames_decrypted": n_ok, "frames_verified_llc": n_ok,
+        "validation": VAL_VALIDATED,
+        "evidence": [{"text": s} for s in dict.fromkeys(all_strs)],
+    })
+    for s in dict.fromkeys(all_strs):
+        prj.kb.add(s, "word", status=EV_OBSERVED, confidence=0.6,
+                   capture=ci.name, source="payload WEP déchiffré (CRC32 OK)",
+                   tags=["decrypted", "wep"])
+    prj.log_action("Déchiffrement WEP", "clé WEP-40 validée (ICV) réutilisée",
+                   evidence=f"{ci.name} — {n_ok} trame(s) CRC32 valide(s)",
+                   output=f"{len(set(all_strs))} chaîne(s) extraite(s) "
+                          f"→ knowledge base",
+                   status="DONE")
+    return len(set(all_strs)) + 1
+
+
+def engine_post_crack(prj, echo=True):
+    """§16 : « qu'est-ce que cette nouvelle information permet MAINTENANT de
+    résoudre ? » — PMK (RADIUS/SAE) → vérification MIC sur handshake → TK →
+    CCMP ; mot de passe → PMK PSK (PBKDF2 4096) → idem ; clé WEP → RC4.
+    Chaque tentative est tracée (essayée/réussie/échouée) et bornée."""
+    tried = prj.settings.setdefault("post_crack_tried", [])
+    new = 0
+    pw_list = engine_candidate_passwords(prj, limit=200)
+    for ci in prj.captures:
+        if ci.status == "ERROR" or ci.path.lower().endswith(".json"):
+            continue
+        # --- PMK/PSK → MIC → TK → CCMP ---
+        hs_info = engine_handshake_for(prj, ci)
+        if hs_info:
+            ap, cli, hs = hs_info
+            m2 = hs.get(2) if hs else None
+            anonce_src = (hs.get(1) or hs.get(3)) if hs else None
+            if m2 is not None and anonce_src is not None \
+                    and getattr(m2, "nonce", None) and ap and cli:
+                anonce = anonce_src.nonce; snonce = m2.nonce
+                raw2 = getattr(m2, "raw_eapol", b"")
+                # 1) PMK déjà validés (chaîne RADIUS/SAE d'une AUTRE capture §15)
+                for pmk_hex in prj.kb.values("pmk", statuses=(EV_VALIDATED,)):
+                    sig = f"pmk|{pmk_hex}|{ci.name}"
+                    if sig in tried:
+                        continue
+                    tried.append(sig)
+                    try:
+                        pmk = bytes.fromhex(pmk_hex)
+                    except ValueError:
+                        continue
+                    if len(pmk) != 32:
+                        continue
+                    try:
+                        # v1.1.1 — multi-AKM (SHA-1 WPA2 + SHA-256 SAE/
+                        # 802.11w) : le run réel annonçait à tort « le PMK
+                        # SAE ne vérifie pas le MIC » alors que le solveur
+                        # SAE déchiffrait 17 trames avec le TK de ce PMK.
+                        ok, ptk, kck, kek, tk, kdf = \
+                            engine_verify_eapol_mic_multi(
+                                pmk, ap, cli, anonce, snonce, raw2)
+                    except Exception as exc:
+                        prj.add_error("post-crack PMK", exc, capture=ci.name)
+                        continue
+                    if ok:
+                        prj.kb.add(tk.hex(), "tk", status=EV_VALIDATED,
+                                   capture=ci.name,
+                                   source=f"MIC EAPOL M2 vérifié ({kdf}) avec PMK {pmk_hex}")
+                        prj.kb.add(kek.hex(), "kek", status=EV_VALIDATED,
+                                   capture=ci.name, source="dérivation PTK (MIC vérifié)")
+                        prj.log_action("Vérification MIC EAPOL (PMK connu)",
+                                       "PMK validé ailleurs dans le projet (§15 propagation)",
+                                       evidence=f"{ci.name} — handshake "
+                                                f"M{'1' if 1 in hs else '3'}/M2",
+                                       output=f"MIC VALIDE ({kdf}) → TK/KEK dérivés",
+                                       status="DONE")
+                        new += 1 + engine_decrypt_ccmp(
+                            prj, ci, tk, f"PMK {pmk_hex} MIC vérifié")
+                        # v1.1.1 — la cible -m 22000 du MÊME handshake est
+                        # résolue quel que soit son fichier d'origine : run
+                        # réel, la cible venait de « eapol.json » (export
+                        # tshark, ligne incomplète) alors que le MIC était
+                        # vérifiable depuis la capture brute jumelle → cible
+                        # laissée READY à tort et passée à hashcat pour rien.
+                        # Identification par le MIC de M2 (unique par
+                        # handshake), jamais par supposition (§42).
+                        _mic_l = (getattr(m2, "mic", b"") or b"").hex().lower()
+                        for t in prj.targets.values():
+                            if t.mode != 22000 or t.status not in ("READY",
+                                                                   "INVALID"):
+                                continue
+                            _f = (t.line or "").split("*")
+                            if t.capture == ci.name or (
+                                    _mic_l and len(_f) > 2
+                                    and _f[2].lower() == _mic_l):
+                                t.status = "RESOLVED"
+                                t.validation = VAL_VALIDATED
+                                t.password = pmk_hex
+                                t.why += (" — PMK validé par MIC EAPOL "
+                                          f"({kdf}) sur {ci.name} "
+                                          "(propagation inter-captures)")
+                    else:
+                        prj.add_missing("MIC EAPOL", f"PMK {pmk_hex} ne "
+                                        "vérifie pas le MIC de cette capture "
+                                        "(essai tracé, rien affirmé)",
+                                        capture=ci.name)
+                # 2) PSK : mots de passe connus/candidats × SSID
+                ssids = [s for s in ci.ssids if s]
+                for t in prj.targets.values():
+                    if t.mode == 22000 and t.capture == ci.name:
+                        s = engine_ssid_from_target(t)
+                        if s and s not in ssids:
+                            ssids.append(s)
+                if not ssids:
+                    prj.add_missing("SSID", "test PSK impossible sans SSID "
+                                    "(pas de beacon, pas de hash -m 22000)",
+                                    capture=ci.name,
+                                    needed="capture contenant les beacons ou export tshark")
+                for ssid in ssids[:2]:
+                    for pw in pw_list:
+                        sig = f"psk|{ssid}|{pw}|{ci.name}"
+                        if sig in tried:
+                            continue
+                        tried.append(sig)
+                        try:
+                            pmk = hashlib.pbkdf2_hmac("sha1", pw.encode(),
+                                                      ssid.encode(), 4096, 32)
+                            ok, ptk, kck, kek, tk, kdf = \
+                                engine_verify_eapol_mic_multi(
+                                    pmk, ap, cli, anonce, snonce, raw2)
+                        except Exception as exc:
+                            prj.add_error("post-crack PSK", exc,
+                                          capture=ci.name)
+                            continue
+                        if ok:
+                            # VALIDÉ cryptographiquement (§21) — pas avant.
+                            prj.kb.promote("password", pw, EV_VALIDATED, 1.0,
+                                           note=f"PSK WPA du réseau {ssid} "
+                                                f"(MIC EAPOL vérifié)")
+                            prj.kb.add(pmk.hex(), "pmk", status=EV_VALIDATED,
+                                       capture=ci.name,
+                                       source=f"PBKDF2-SHA1(PSK,SSID={ssid},4096) — MIC vérifié")
+                            _mic_l = (getattr(m2, "mic", b"")
+                                      or b"").hex().lower()
+                            for t in prj.targets.values():
+                                if t.mode != 22000 or t.status not in (
+                                        "READY", "INVALID"):
+                                    continue
+                                _f = (t.line or "").split("*")
+                                if t.capture == ci.name or (
+                                        _mic_l and len(_f) > 2
+                                        and _f[2].lower() == _mic_l):
+                                    t.status = "CRACKED"; t.password = pw
+                                    t.validation = VAL_VALIDATED
+                                    t.why += (f" — PSK vérifié par MIC EAPOL "
+                                              f"({kdf}, SSID {ssid})")
+                            prj.log_action("PSK WPA validé",
+                                           "candidat mot de passe × handshake 4-way",
+                                           evidence=f"{ci.name} — SSID {ssid}, MIC M2",
+                                           output=f"PSK = {pw!r} → PMK/TK dérivés ({kdf})",
+                                           status="DONE")
+                            new += 1 + engine_decrypt_ccmp(
+                                prj, ci, tk, f"PSK {pw!r} (MIC vérifié)")
+                            break
+                    else:
+                        continue
+                    break
+        # --- clé WEP validée → déchiffrement du trafic ---
+        if (ci.det or {}).get("wep_frames"):
+            for key_hex in prj.kb.values("key", statuses=(EV_VALIDATED,)):
+                sig = f"wep|{key_hex}|{ci.name}"
+                if sig in tried or len(key_hex) != 10:
+                    continue
+                tried.append(sig)
+                try:
+                    keyb = bytes.fromhex(key_hex)
+                except ValueError:
+                    continue
+                new += engine_wep_decrypt_sample(prj, ci, keyb)
+    return new
+
+
+def engine_build_chains(prj):
+    """§17/§20 : chaînes de résolution traçables — chaque étape classée
+    CONFIRMED (vérifié cryptographiquement), PROBABLE, FAILED (avec raison)."""
+    chains = []
+    # réussites : cibles CRACKED/RESOLVED + déchiffrements
+    for t in prj.targets.values():
+        if t.status in ("CRACKED", "RESOLVED"):
+            ch = ResolutionChain(
+                name=f"{t.capture} → hashcat -m {t.mode}"
+                     + (f" ({t.user})" if t.user else ""))
+            ch.steps.append(ChainStep("capture analysée", "CONFIRMED",
+                                      t.capture, "analyse moteur"))
+            ch.steps.append(ChainStep(f"cible -m {t.mode} extraite",
+                                      "CONFIRMED",
+                                      f"frame {t.frame}" if t.frame else "",
+                                      "pipeline principal"))
+            if t.status == "CRACKED":
+                ch.steps.append(ChainStep("mot de passe vérifié (MIC EAPOL)",
+                                          "CONFIRMED", t.password and "PSK validé" or "",
+                                          "post-crack moteur"))
+            else:
+                ch.steps.append(ChainStep("PMK obtenu par solveur (chaîne "
+                                          "RADIUS/SAE) et validé par MIC",
+                                          "CONFIRMED", "", "solveur intégré"))
+            dec = [d for d in prj.decryptions if d.get("capture") == t.capture]
+            if dec:
+                d0 = dec[-1]
+                ch.steps.append(ChainStep(
+                    f"déchiffrement {d0['method']}",
+                    "CONFIRMED" if d0.get("validation") == VAL_VALIDATED else "PROBABLE",
+                    f"{d0.get('frames_decrypted', 0)} trame(s)",
+                    "post-crack moteur"))
+                _ev = d0.get("evidence") or []
+                if _ev:
+                    ch.steps.append(ChainStep("preuve : texte déchiffré",
+                                              "CONFIRMED",
+                                              str(_ev[0].get("text", "")),
+                                              "payload déchiffré"))
+            ch.outcome = "CONFIRMED"
+            chains.append(ch)
+    # réussites sans cible hashcat (secret RADIUS, clé WEP, PMK SAE…) —
+    # groupées par capture : une chaîne lisible par capture, chaque élément
+    # validé y figure comme étape (traçabilité §20).
+    groups = {}
+    for it in prj.kb.all_items():
+        if it.status == EV_VALIDATED and it.type in ("secret", "key",
+                                                     "password", "pmk") \
+                and "solveur" in (it.source or ""):
+            groups.setdefault(it.capture or "?", []).append(it)
+    for cap, items in sorted(groups.items()):
+        ch = ResolutionChain(
+            name=f"{cap} → {len(items)} élément(s) validé(s) par solveur")
+        ch.steps.append(ChainStep("solveur intégré exécuté", "CONFIRMED",
+                                  cap, "orchestrateur"))
+        for it in items:
+            ch.steps.append(ChainStep(
+                f"{it.type} vérifié cryptographiquement", "CONFIRMED",
+                it.value, it.source or ""))
+        dec = [d for d in prj.decryptions if d.get("capture") == cap]
+        if dec:
+            d0 = dec[-1]
+            ch.steps.append(ChainStep(f"déchiffrement {d0['method']}",
+                                      "CONFIRMED" if d0.get("validation") == VAL_VALIDATED else "PROBABLE",
+                                      f"{d0.get('frames_decrypted', 0)} trame(s)",
+                                      "post-crack"))
+        ch.outcome = "CONFIRMED"
+        chains.append(ch)
+    # déchiffrements sans cible hashcat résolue (ex. TK issu d'une autre
+    # capture) : leur propre chaîne traçable (§17)
+    covered = {t.capture for t in prj.targets.values()
+               if t.status in ("CRACKED", "RESOLVED")}
+    for d in prj.decryptions:
+        cap = d.get("capture", "?")
+        if cap in covered:
+            continue
+        conf = "CONFIRMED" if d.get("validation") == VAL_VALIDATED else "PROBABLE"
+        ch = ResolutionChain(
+            name=f"{cap} → déchiffrement ({d.get('method', '?')})")
+        keymat = d.get("key_tk") or d.get("key_wep") or ""
+        ch.steps.append(ChainStep("matériel cryptographique validé",
+                                  conf, str(keymat), "knowledge base"))
+        ch.steps.append(ChainStep(
+            "vérification structurelle des trames", conf,
+            f"{d.get('frames_verified_llc', 0)}/{d.get('frames_decrypted', 0)}"
+            " trame(s) (LLC/CRC32)", "post-crack moteur"))
+        _ev = d.get("evidence") or []
+        if _ev:
+            ch.steps.append(ChainStep("preuve : texte déchiffré", "CONFIRMED",
+                                      str(_ev[0].get("text", "")),
+                                      "payload déchiffré"))
+        ch.outcome = conf
+        chains.append(ch)
+    # échecs tracés (§24) : raisons complètes, jamais « NOT FOUND » nu
+    # (dernier run seulement — les échecs des runs précédents, déjà corrigés
+    # ou remplacés, ne réapparaissent plus comme actuels)
+    for s in engine_latest_runs(prj):
+        if s.status in (ST_NOT_FOUND, ST_TIMEOUT, ST_ERROR, ST_UNAVAILABLE):
+            ch = ResolutionChain(name=f"{s.capture} → {s.solver} (échec)")
+            ch.steps.append(ChainStep("solveur exécuté" if s.decision == "RUN"
+                                      else "solveur non lancé", "FAILED",
+                                      s.reason, s.evidence))
+            if s.detail:
+                ch.steps.append(ChainStep("détail", "FAILED", s.detail, ""))
+            ch.outcome = "FAILED"
+            if not any(c.name == ch.name and c.outcome == "FAILED"
+                       for c in chains):
+                chains.append(ch)
+    # v1.1.1 — chaînes SANS DOUBLON : la même capture présente plusieurs fois
+    # dans l'arborescence (run réel : rad.pcap ×3) produisait des chaînes
+    # strictement identiques, répétées trois fois au §9 du rapport.
+    _seen_ch = set()
+    _uniq_ch = []
+    for ch in chains:
+        sig = (ch.name, getattr(ch, "outcome", ""),
+               tuple((st.action, st.status, st.detail) for st in ch.steps))
+        if sig not in _seen_ch:
+            _seen_ch.add(sig)
+            _uniq_ch.append(ch)
+    prj.chains = _uniq_ch
+    return chains
+
+
+def engine_wep_cost_estimate(prj):
+    """Coût chiffré de l'échelle WEP complète (§19 : coût lisible, pas de
+    score arbitraire) — basé sur ALPHABETS du sous-code 3 et un débit
+    mesuré typique (~200 000 clés/s sur machine multicœur)."""
+    try:
+        total = sum(len(a) ** 5 for _n, a in ALPHABETS)
+    except Exception:
+        return None
+    rate = 200000.0
+    secs = total / rate
+    return {"total_keys": total, "rate": rate,
+            "human": (f"{total/1e6:.0f} M clés ≈ {secs/60:.0f} min"
+                      if secs < 7200 else
+                      f"{total/1e9:.2f} G clés ≈ {secs/3600:.1f} h")}
+
+
+def engine_next_actions(prj):
+    """§19 : prochaines actions classées — confiance, complétude des données,
+    coût chiffré, preuve. Aucun score opaque."""
+    acts = []
+    ready = {}
+    for t in prj.targets.values():
+        if t.status == "READY":
+            ready.setdefault(t.mode, []).append(t)
+    for mode, ts in sorted(ready.items()):
+        caps = ", ".join(sorted({t.capture for t in ts}))
+        acts.append({
+            "action": f"hashcat -m {mode} ({len(ts)} hash(es))",
+            "why": "cible au format validé, aucun solveur interne ne couvre ce mode",
+            "confidence": "HIGH (format vérifié)",
+            "data": "complète",
+            "cost": "faible (hashcat externe, GPU recommandé)",
+            "evidence": caps,
+            "command": engine_hashcat_cmd(
+                mode, out_sub(prj, OUT_HASHES_DIR, "hashcat-m%d.hash" % mode),
+                prj.wordlist),
+        })
+    if ready and not prj.wordlist:
+        acts.append({"action": "fournir une wordlist (-w ou question interactive)",
+                     "why": "NO_WORDLIST : le crackage dictionnaire externe est bloqué",
+                     "confidence": "HIGH", "data": "manquante",
+                     "cost": "nul", "evidence": f"{len(ready)} mode(s) en attente"})
+    for s in engine_latest_runs(prj):
+        if s.solver == "wep" and s.status in (ST_TIMEOUT, ST_NOT_FOUND) \
+                and s.decision == "RUN":
+            est = engine_wep_cost_estimate(prj)
+            acts.append({
+                "action": "relancer WEP en échelle complète (question interactive "
+                          "ou --deep)",
+                "why": s.detail or s.reason,
+                "confidence": "HIGH si IV réutilisés" ,
+                "data": "complète",
+                "cost": (est or {}).get("human", "élevé") + " (pire cas, tous alphabets)",
+                "evidence": s.evidence or s.capture,
+            })
+        if s.solver == "sae" and s.status == ST_NOT_FOUND:
+            acts.append({
+                "action": "fournir le mask SAE du challenge (--sae-mask, fichier "
+                          "--knowledge ou question interactive)",
+                "why": "aucun PWE ne vérifie le confirm avec le mask par défaut",
+                "confidence": "MEDIUM", "data": "mask manquant",
+                "cost": "faible (2 multiplications scalaires par mask)",
+                "evidence": s.evidence or s.capture,
+            })
+        if s.solver == "auth" and s.status == ST_UNAVAILABLE:
+            acts.append({
+                "action": "installer tshark (ou fournir un export « tshark -T json »)",
+                "why": "détecteurs auth indisponibles sur pcap brut sans tshark",
+                "confidence": "HIGH", "data": "outil manquant",
+                "cost": "nul", "evidence": s.capture,
+            })
+    for m in prj.missing[-8:]:
+        acts.append({"action": f"compléter : {m['what']}",
+                     "why": m["why"], "confidence": "MEDIUM",
+                     "data": "manquante", "cost": "variable",
+                     "evidence": m.get("capture", ""),
+                     "needed": m.get("needed", "")})
+    # déduplication : même action sur plusieurs captures → une entrée,
+    # preuves cumulées (rapport lisible, rien perdu)
+    seen = {}; out = []
+    for a in acts:
+        k = a["action"]
+        if k in seen:
+            ev = seen[k].get("evidence", "")
+            if a.get("evidence") and a["evidence"] not in ev:
+                seen[k]["evidence"] = (ev + ", " + a["evidence"]) if ev \
+                    else a["evidence"]
+            continue
+        seen[k] = a
+        out.append(a)
+    return out
+
+
+def engine_run_capture_solvers(prj, ci, decisions, opts, rnd, echo=True):
+    """Lance run_integrated_solvers sur les solveurs DÉCIDÉS pertinents,
+    journalise [AUTO] (§34), mappe les statuts (§14) et propage (§15)."""
+    only = [d["solver"] for d in decisions if d["run"]]
+    # v1.1.1 — empreinte (sha256) + contexte d'entrées enregistrés pour la
+    # réutilisation inter-runs (_engine_prev_results / _engine_solver_ctx).
+    try:
+        _sha = str(getattr(ci, "sha16", "") or "")
+        if _sha:
+            prj.settings.setdefault("solver_sha", {})[ci.name] = _sha
+        if only:
+            prj.settings.setdefault("solver_ctx", {})[ci.name] = \
+                _engine_solver_ctx(prj, opts)
+    except Exception:
+        pass
+    for d in decisions:
+        if not d["run"]:
+            prj.solver_runs.append(SolverRun(
+                capture=ci.name, solver=d["solver"], decision="SKIP",
+                reason=d["reason"], evidence=d["evidence"],
+                status=d["skip_status"], detail="",
+                run=prj.settings.get("last_run", "")))
+    if not only:
+        return 0
+    kb_sae, kb_auth = engine_masks_from_kb(prj)
+    sae_mask = opts.get("sae_mask") or kb_sae
+    auth_mask = opts.get("auth_mask") or kb_auth
+    res, pkts = prj.transient.get(ci.path, (None, None))
+    base = out_sub(prj, OUT_SOLVE_DIR,
+                   Path(ci.name).stem + f"-r{rnd}")
+    _n_cand = len(engine_candidate_passwords(prj))
+    for d in decisions:
+        if d["run"]:
+            prj.log_action(f"Lancer le solveur {d['solver']} sur {ci.name}",
+                           d["reason"], evidence=d["evidence"],
+                           inputs=f"wordlist={prj.wordlist or 'aucune'}, "
+                                  f"candidats={_n_cand}",
+                           status="RUNNING", echo=echo)
+    t0 = time.time()
+    try:
+        report = run_integrated_solvers(
+            ci.path, result=res, packets=pkts, tshark_path=opts.get("tshark"),
+            wordlist=prj.wordlist or "", deep=bool(opts.get("deep")),
+            solve_timeout=int(opts.get("budget") or 0),
+            quiet=bool(opts.get("quiet")), verbose=bool(opts.get("verbose")),
+            artifact_path=base + "-solve.txt",
+            sae_mask=sae_mask, auth_mask=auth_mask, ask=False,
+            only=only, extra_candidates=engine_candidate_passwords(prj),
+            wep_deep=bool(opts.get("wep_deep")),
+            cores=(opts.get("cores") or prj.settings.get("cores") or None))
+    except Exception as exc:      # filet — le moteur continue (§30)
+        prj.add_error("solveurs", exc, capture=ci.name)
+        return 0
+    dt = time.time() - t0
+    new = 0
+    by_name = {oc.name: oc for oc in report.outcomes}
+    for d in decisions:
+        if not d["run"]:
+            continue
+        oc = by_name.get(d["solver"])
+        if oc is None:
+            continue
+        status = SOLVER_STATUS_MAP.get(oc.status, oc.status.upper())
+        detail = oc.summary or oc.error or ""
+        if status == ST_NOT_FOUND and "budget" in detail.lower():
+            status = ST_TIMEOUT
+        fnd = dict(oc.findings or {})
+        fnd.pop("failed_targets", None)     # déjà converti en cibles hashcat
+        prj.solver_runs.append(SolverRun(
+            capture=ci.name, solver=d["solver"], decision="RUN",
+            reason=d["reason"], evidence=d["evidence"], status=status,
+            detail=detail, seconds=oc.elapsed or 0.0, findings=fnd,
+            run=prj.settings.get("last_run", "")))
+        if status in (ST_NOT_FOUND, ST_TIMEOUT):
+            prj.add_missing(f"solveur {d['solver']} ({ci.name})",
+                            detail or "non trouvé", capture=ci.name,
+                            needed=("wordlist plus riche / --deep / mask"
+                                    if d["solver"] in ("auth", "wep", "sae")
+                                    else "secret RADIUS : candidats ou wordlist"))
+    new += engine_propagate(prj, ci, report, echo=echo)
+    for d in decisions:
+        if d["run"]:
+            oc = by_name.get(d["solver"])
+            st = SOLVER_STATUS_MAP.get(oc.status, "?") if oc else "?"
+            prj.log_action(f"Solveur {d['solver']} sur {ci.name}",
+                           d["reason"], evidence=d["evidence"],
+                           output=f"{st}" + (f" — {oc.summary or oc.error}"
+                                             if oc and (oc.summary or oc.error)
+                                             else ""),
+                           status="DONE", echo=False)
+    return new
+
+
+def engine_rounds(prj, opts, echo=True):
+    """§18 : cycles analyse → cibles → solveurs → propagation → post-crack →
+    nouveaux candidats → … jusqu'à ÉTAT STABLE (plus aucune information utile
+    produite) ou limite de rounds."""
+    max_rounds = max(1, int(opts.get("rounds") or 4))
+    # Bug du run réel (build 18695) : opts["tshark"] vaut None sauf --tshark
+    # explicite → les DÉCISIONS solveurs annonçaient « pcap brut sans tshark :
+    # détecteurs auth indisponibles » (auth SKIP/UNAVAILABLE) alors que tshark
+    # EST installé (le solveur SAE le retrouvait tout seul). Résolution ici :
+    # --tshark explicite > recherche standard (find_tshark).
+    tshark = opts.get("tshark") or find_tshark()
+    # v1.1.1 — le tshark RÉSOLU fait partie du contexte solveur (§35) : sans
+    # cela, l'installation de tshark entre deux runs ne déclencherait pas le
+    # rejeu des échecs (auth UNAVAILABLE).
+    opts = dict(opts or {})
+    opts["tshark"] = tshark or ""
+    # Horodatage du run (hygiène rapport — run réel build 18695) : chaque
+    # SolverRun créée pendant CE run porte cette estampille ; les affichages
+    # (console/RAPPORT/HTML) filtrent sur elle via engine_latest_runs().
+    prj.settings["last_run"] = now_iso()
+    stable = False
+    for rnd in range(max_rounds):
+        kb_before = prj.kb.snapshot_count()
+        val_before = sum(1 for t in prj.targets.values()
+                         if t.status in ("CRACKED", "RESOLVED"))
+        dec_before = len(prj.decryptions)
+        new_solver = 0
+        rerun = (rnd == 0)
+        for ci in prj.captures:
+            if ci.status == "ERROR":
+                continue
+            if rnd > 0:
+                prev = [s for s in engine_latest_runs(prj)
+                        if s.capture == ci.name]
+                unresolved = any(s.status in (ST_NOT_FOUND, ST_TIMEOUT,
+                                              ST_PARTIAL, ST_UNAVAILABLE)
+                                 for s in prev)
+                rerun = prj.kb.new_count > 0 and unresolved
+            if not rerun:
+                continue
+            decisions = engine_decide(prj, ci, tshark, opts)
+            new_solver += engine_run_capture_solvers(prj, ci, decisions,
+                                                     opts, rnd, echo=echo)
+        new_pc = engine_post_crack(prj, echo=echo)
+        n_cand = engine_generate_candidates(prj)
+        new_kb = prj.kb.snapshot_count() - kb_before
+        val_after = sum(1 for t in prj.targets.values()
+                        if t.status in ("CRACKED", "RESOLVED"))
+        prj.kb.new_count = 0
+        stable = (rnd > 0 and new_kb == 0 and new_pc == 0
+                  and val_after == val_before
+                  and len(prj.decryptions) == dec_before)
+        rec = {"round": rnd, "new_knowledge": new_kb,
+               "new_candidates": n_cand, "post_crack_new": new_pc,
+               "solver_new": new_solver, "validated_targets": val_after,
+               "decryptions": len(prj.decryptions), "stable": stable}
+        prj.rounds.append(rec)
+        if echo:
+            print(f"  [round {rnd}] nouvelles connaissances : {new_kb} · "
+                  f"candidats : {n_cand} · post-crack : {new_pc} · "
+                  f"cibles validées : {val_after} · déchiffrements : "
+                  f"{len(prj.decryptions)}"
+                  + ("  → ÉTAT STABLE" if stable else ""))
+        if stable:
+            break
+    if echo and not stable:
+        print(f"  [rounds] limite atteinte ({max_rounds}) sans état stable — "
+              "relancez `solve` pour continuer (§18 : jamais de boucle infinie)")
+    return stable
+
+
+# ============================================================================
+#  MOTEUR — RAPPORTS (CONSOLE · JSON · EXCEL · HTML · MITRE) · PIPELINE §33
+# ----------------------------------------------------------------------------
+#  Mission §22 (rapport explicable : tout est justifié, rien n'est affirmé
+#  sans preuve), §23 (séparation OBSERVED EXPOSURE / EXPLOITABILITY / IMPACT /
+#  CONFIDENCE / VALIDATION — pas de score arbitraire), §25, §26 (MITRE
+#  evidence-based), §28 (donnees.json = source de vérité), §40 (questions à
+#  savoir répondre), §42 (jamais CRACKED/DECRYPTED/CORRELATED/EXPLOITABLE
+#  sans validation ; « je ne peux pas conclure » est une sortie valide).
+# ============================================================================
+
+import html as _htmlmod
+
+
+def engine_mitre(prj):
+    """§26 : cartographie MITRE ATT&CK STRICTEMENT evidence-based — une
+    technique n'apparaît que si une preuve du projet la soutient. Statut
+    OBSERVED (vu/vérifié) vs DERIVED (déduit, non observé dans le trafic)."""
+    out = []
+    n_hashes = len(prj.targets)
+    n_creds = len(prj.kb.by_type("password", "credential"))
+    if n_hashes or n_creds:
+        out.append({"id": "T1040", "name": "Network Sniffing",
+                    "status": "OBSERVED",
+                    "evidence": f"{n_hashes} hash(es) et {n_creds} entrée(s) "
+                                f"d'identifiants extraits de captures réseau",
+                    "confidence": "HIGH"})
+    cracked = [t for t in prj.targets.values()
+               if t.status in ("CRACKED", "RESOLVED")]
+    val_pw = [it for it in prj.kb.all_items() if it.status == EV_VALIDATED
+              and it.type in ("password", "secret", "key", "pmk")]
+    if cracked or val_pw:
+        out.append({"id": "T1110.002", "name": "Brute Force: Password Cracking",
+                    "status": "OBSERVED",
+                    "evidence": "; ".join(
+                        [f"{t.capture} -m {t.mode} résolu ({t.status})"
+                         for t in cracked][:3]
+                        + [f"{it.type} validé ({it.capture or '?'})"
+                           for it in val_pw][:3]) or "cassage vérifié",
+                    "confidence": "HIGH"})
+    keys = prj.kb.values("pmk", "tk", "gtk", "key", statuses=(EV_VALIDATED,))
+    if keys:
+        out.append({"id": "T1621",
+                    "name": "Use Alternate Authentication Material",
+                    "status": "DERIVED (matériel cryptographique validé, "
+                              "réutilisable — usage NON observé)",
+                    "evidence": f"{len(keys)} clé(s) validée(s) : "
+                                + ", ".join(sorted(keys)),
+                    "confidence": "MEDIUM"})
+    if any(t.mode == 13100 for t in prj.targets.values()):
+        out.append({"id": "T1558.003", "name": "Kerberoasting",
+                    "status": "OBSERVED (hash TGS capturé)",
+                    "evidence": "cible(s) hashcat -m 13100 présentes",
+                    "confidence": "HIGH"})
+    if any(t.mode == 18200 for t in prj.targets.values()):
+        out.append({"id": "T1558.004", "name": "AS-REP Roasting",
+                    "status": "OBSERVED (hash AS-REP capturé)",
+                    "evidence": "cible(s) hashcat -m 18200 présentes",
+                    "confidence": "HIGH"})
+    return out
+
+
+def engine_limitations(prj):
+    """§22/§42 : limites explicites du rapport — affichées, jamais cachées."""
+    lim = [
+        "Analyse 100 % passive : le moteur ne déclenche AUCUNE action réseau "
+        "active (§36) ; les cibles hors périmètre sont marquées OUT_OF_SCOPE.",
+        "VALIDATED = vérification cryptographique réelle (ICV WEP, HMAC-MD5 "
+        "RADIUS, confirm SAE, verify() auth, MIC EAPOL, CRC32). Tout le reste "
+        "est OBSERVED / INFERRED / HYPOTHESIS et n'est jamais présenté comme "
+        "un fait (§42).",
+        "Cartographie MITRE limitée aux techniques soutenues par une preuve "
+        "de ce projet ; statut DERIVED = déduction, pas observation (§26).",
+        "Aucun mode hashcat inventé : uniquement les modes du pipeline "
+        "principal et les conversions vérifiées (APOP→20, CRAM-MD5→10200).",
+        "Les corrélations inter-captures reposent sur des identités partagées "
+        "(IP/MAC/user/BSSID/SSID/realm/SPN) ; le seul recouvrement temporel "
+        "ne suffit jamais (§5).",
+    ]
+    if prj.wordlist_status == "NO_WORDLIST":
+        lim.append("NO_WORDLIST : aucun cassage dictionnaire externe exécuté "
+                   "— les cibles restent prêtes (§13).")
+    if any(s.status == ST_UNAVAILABLE for s in engine_latest_runs(prj)):
+        lim.append("tshark absent : détecteurs auth indisponibles sur pcap "
+                   "brut (analyse partielle — §30, rien d'affirmé).")
+    if not prj.captures:
+        lim.append("Aucune capture exploitable : je ne peux pas conclure.")
+    return lim
+
+
+# ----------------------------------------------------------------------------
+# RAPPORT (§22) — un seul générateur de lignes, utilisé pour la console ET
+# pour RAPPORT.txt : exactement le même contenu, lisible partout. Répond aux
+# questions §40, tout en chiffres, rien de caché.
+# ----------------------------------------------------------------------------
+ENGINE_FILE_GUIDE = {
+    OUT_GUIDE_TXT: "CE GUIDE : ce qui a été trouvé, quel fichier ouvrir, comment continuer",
+    OUT_REPORT_TXT: "rapport complet en texte clair — les infos les plus utiles d'abord (le même qu'à l'écran)",
+    OUT_REPORT_HTML: "rapport interactif : DOUBLE-CLIC → navigateur (filtre de recherche en haut)",
+    OUT_REPORT_XLSX: "rapport Excel : feuilles synthèse, captures, connaissances, hashes, solveurs, chaînes, MITRE, actions, journal",
+    OUT_DATA_JSON: "données complètes (source de vérité §28 — pour scripts/outils)",
+    OUT_SECRETS_TXT: "TOUS les secrets trouvés EN CLAIR — réutilisables tels quels (type:valeur = format --knowledge)",
+    OUT_DECRYPTED_TXT: "TOUS les textes extraits des trames déchiffrées (clés vérifiées)",
+    OUT_GRAPH_DOT: "graphe de connaissances (Graphviz : dot -Tpng graphe.dot -o graphe.png)",
+    OUT_HASHES_INDEX: "UN DOSSIER PAR HASH : la liste de tous les hashes, leur état et le mot de passe trouvé EN CLAIR",
+    "commandes.txt": "commandes hashcat prêtes à copier-coller (1 ligne par mode)",
+    "hash.txt": "la ligne de hash au format hashcat, strictement (à donner à hashcat)",
+    "commande.txt": "la commande hashcat exacte pour CE hash (copier-coller)",
+    "resultat.txt": "le résultat pour CE hash : mot de passe EN CLAIR, ou état honnête",
+    "fiche.txt": "la provenance de CE hash : capture, trame, protocole, mode, tentatives",
+}
+
+
+def engine_file_guide(path):
+    """Description lisible d'un fichier de sortie (v1.2 : noms professionnels,
+    reconnaissance par nom de fichier OU par dossier parent)."""
+    base = os.path.basename(str(path)).lower()
+    if base in ENGINE_FILE_GUIDE:
+        return ENGINE_FILE_GUIDE[base]
+    parent = os.path.basename(os.path.dirname(str(path).replace("\\", "/"))).lower()
+    if parent == OUT_HASHES_DIR.lower():
+        return ("dossier d'UN hash : hash.txt (ligne hashcat), commande.txt, "
+                "resultat.txt (mot de passe EN CLAIR), fiche.txt (provenance)")
+    if base.endswith(".hash"):
+        return "hashes hashcat prêts à casser (1 fichier par mode)"
+    if base.endswith("-solve.txt"):
+        return "journal détaillé des solveurs pour cette capture"
+    if base.startswith("hashcat-m") and base.endswith(".log"):
+        return "journal complet de la session hashcat pour ce mode"
+    norm = str(path).replace("\\", "/").lower()
+    if "/" + OUT_CACHE_DIR.lower() + "/" in norm:
+        return "cache d'analyse (relance rapide ; supprimable sans risque)"
+    if "/" + OUT_SOLVE_DIR.lower() + "/" in norm:
+        return "journal détaillé d'un solveur (tout y est, rien n'est résumé)"
+    return ""
+
+
+
+
+def _fmt_ts(ts):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
+    except (TypeError, ValueError, OSError):
+        return "-"
+
+
+def engine_report_lines(prj, opts=None):
+    """Rapport lisible (RAPPORT.txt + console — exactement le même contenu).
+
+    v1.1 — réorganisation complète (demande utilisateur : « trie mieux le
+    rapport, les infos les moins utiles à la fin ») :
+      1 SECRETS CONFIRMÉS   2 MESSAGES DÉCHIFFRÉS   3 HASHES HASHCAT
+      4 PROCHAINES ACTIONS  5 FICHIERS GÉNÉRÉS      6 INVENTAIRE (captures)
+      7 CORRÉLATIONS        8 CONNAISSANCES         9 CHAÎNES
+      10 INVENTAIRE RÉSEAU  11 SOLVEURS (décisions) 12 MITRE
+      13 LIMITES            14 ROUNDS
+    Section 11 compactée : décisions de non-lancement groupées par raison.
+    §42 inchangé : uniquement des faits + preuves, jamais de simulation."""
+    opts = opts or {}
+    L = []
+
+    def say(x=""):
+        L.append(x)
+
+    kb = prj.kb
+    titre = ("RAPPORT MOTEUR — PROJET %s (contexte %s)"
+             % (os.path.basename(prj.root.rstrip("\\/")) or prj.root,
+                prj.context))
+    say("═" * 100)
+    say("  " + titre)
+    say("  généré le %s · moteur v%s · wordlist : %s [%s]"
+        % (now_iso(), ENGINE_VERSION, prj.wordlist or "-", prj.wordlist_status)
+        + (f" · cœurs : {prj.settings['cores']}"
+           if prj.settings.get("cores") else "")
+        + (f" · hashcat : {prj.settings['hashcat_path']}"
+           if prj.settings.get("hashcat_path") else ""))
+    say("═" * 100)
+
+    # ---- 1) SECRETS CONFIRMÉS — l'essentiel d'abord, TOUT EN CLAIR (v1.2) ----
+    _sec_types = ("password", "credential", "secret", "key", "pmk", "tk",
+                  "kek", "gtk", "token", "apikey", "cookie")
+    _ord = {t: i for i, t in enumerate(_sec_types)}
+    secs = sorted([it for it in kb.all_items()
+                   if it.status == EV_VALIDATED and it.type in _ord],
+                  key=lambda it: (_ord.get(it.type, 99), it.value))
+    _res = [t for t in prj.targets.values()
+            if t.status in ("CRACKED", "RESOLVED")]
+    obs_secs = sorted([it for it in kb.all_items()
+                       if it.status == EV_OBSERVED
+                       and it.type in ("token", "apikey", "cookie", "secret",
+                                       "password", "hash")],
+                      key=lambda it: (_ord.get(it.type, 99), it.value))
+    say("")
+    say(f"  1) SECRETS CONFIRMÉS — {len(secs)} vérifié(s), "
+        f"{len(_res)} hash(es) cassé(s)")
+    say(f"      fichier réutilisable : {OUT_SECRETS_TXT} "
+        "(format type:valeur, compatible --knowledge)")
+    for it in secs:
+        say(f"    • {it.type.upper():<10} {it.value}")
+        say(f"               preuve : {it.source or it.capture or '-'}")
+    for t in sorted(_res, key=lambda x: (x.mode, x.capture or "", x.line)):
+        say(f"    • HASH -m {t.mode} [{t.status}] "
+            f"{t.password or '(clé interne — voir knowledge base)'}")
+        say(f"               hash   : {t.line}")
+        say(f"               preuve : {t.why or t.capture or '-'}")
+    if not secs and not _res:
+        say("    (aucun secret vérifié pour l'instant — rien n'est affirmé "
+            "sans preuve, §42)")
+    if obs_secs:
+        say(f"    Secrets VUS EN CLAIR dans le trafic (non cassés, "
+            f"{len(obs_secs)}) :")
+        for it in obs_secs:
+            say(f"      - {it.type.upper():<10} {it.value}")
+            say(f"                   vu dans : {it.source or it.capture or '-'}")
+
+    # ---- 2) MESSAGES DÉCHIFFRÉS (v1.2 : TOUS les textes, en clair) ----
+    n_txt = sum(len(d.get("evidence") or []) for d in prj.decryptions)
+    say("")
+    say(f"  2) MESSAGES DÉCHIFFRÉS — {len(prj.decryptions)} déchiffrement(s), "
+        f"{n_txt} texte(s) extrait(s)")
+    say(f"      tous les textes : {OUT_DECRYPTED_TXT}")
+    for d in prj.decryptions:
+        say(f"    - [{d.get('capture')}] {d.get('method')} : "
+            f"{d.get('frames_decrypted', 0)} trame(s), "
+            f"{d.get('frames_verified_llc', 0)} vérifiée(s) "
+            f"[{d.get('validation')}]")
+        for _e in (d.get("evidence") or []):
+            _t = str(_e.get("text", "")) if isinstance(_e, dict) else str(_e)
+            _f = _e.get("frame") if isinstance(_e, dict) else None
+            say("        " + (f"[trame {_f}] " if _f is not None else "")
+                + f"{_t}")
+
+    # ---- 3) HASHES HASHCAT — UN DOSSIER PAR HASH (v1.2) ----
+    by_mode = {}
+    for t in prj.targets.values():
+        by_mode.setdefault(t.mode, []).append(t)
+    n_ready = sum(1 for t in prj.targets.values() if t.status == "READY")
+    n_cracked = sum(1 for t in prj.targets.values()
+                    if t.status in ("CRACKED", "RESOLVED") and t.password)
+    say("")
+    say(f"  3) HASHES HASHCAT — {len(prj.targets)} hash(es) "
+        f"({len(by_mode)} mode(s)) : {n_cracked} cassé(s), {n_ready} prêt(s) "
+        "à casser")
+    say(f"      UN DOSSIER PAR HASH : {out_sub(prj, OUT_HASHES_DIR)}"
+        + os.sep + "m<MODE>-<utilisateur>-<id>" + os.sep)
+    say(f"      liste complète : {out_sub(prj, OUT_HASHES_DIR, OUT_HASHES_INDEX)}")
+    for mode, ts in sorted(by_mode.items()):
+        _mi = mode_info(mode) or {}
+        say(f"    -m {mode} — {_mi.get('name', '?')} "
+            f"({_mi.get('category', '?')}) — {len(ts)} hash(es)")
+        for t in sorted(ts, key=lambda x: x.line):
+            say(f"        [{t.status:<8}] {t.line}")
+            say(f"                   mot de passe : "
+                f"{t.password or '(non trouvé)'}")
+            _who = " · ".join(x for x in (t.protocol, t.user, t.domain) if x)
+            say(f"                   origine      : {t.capture or '-'}"
+                + (f" (trame {t.frame})" if t.frame is not None else "")
+                + (f" — {_who}" if _who else ""))
+            say(f"                   dossier    : "
+                f"{hash_dir(prj, t.mode, t.line, user=t.user, capture=t.capture)}")
+            if t.status == "INVALID":
+                say(f"                   problème   : {t.why or '-'}")
+    if not prj.targets:
+        say("    aucun hash hashcat extrait de ce projet")
+    if prj.settings.get("hashcat_path"):
+        say(f"    hashcat configuré : {prj.settings['hashcat_path']} "
+            f"({prj.settings.get('hashcat_version') or 'version ?'}) — "
+            "lancement : question du menu ou --hashcat-run ; commandes "
+            f"manuelles : {out_sub(prj, OUT_HASHES_DIR, 'commandes.txt')}")
+
+    # ---- 4) PROCHAINES ACTIONS (§19) ----
+    acts = prj.settings.get("next_actions", [])
+    say("")
+    say(f"  4) PROCHAINES ACTIONS — {len(acts)}")
+    for i, a in enumerate(acts, 1):
+        say(f"    {i}. {a['action']}")
+        say(f"       pourquoi : {a['why']}")
+        say(f"       confiance : {a.get('confidence', '?')} · données : "
+            f"{a.get('data', '?')} · coût : {a.get('cost', '?')}"
+            + (f" · preuve : {a['evidence']}" if a.get("evidence") else ""))
+        if a.get("command"):
+            say(f"       commande : {a['command']}")
+    if not acts:
+        say("    aucune action supplémentaire identifiée — état stable")
+
+    # ---- 5) FICHIERS GÉNÉRÉS — nom + description, tout en clair ----
+    files = prj.settings.get("generated_files", [])
+    say("")
+    say(f"  5) FICHIERS GÉNÉRÉS — {len(files)}")
+    say(f"      TOUT EST DANS : {prj.out_dir}")
+    for f in sorted(files):
+        say(f"    - {f}")
+        g = engine_file_guide(f)
+        if g:
+            say(f"        → {g}")
+
+    # ---- 6) INVENTAIRE (§40 : quelles captures, quoi dedans) ----
+    say("")
+    say(f"  6) INVENTAIRE — {len(prj.captures)} capture(s) analysée(s)")
+    tot_p = sum(c.packets for c in prj.captures)
+    tot_t = sum(c.analysis_seconds for c in prj.captures)
+    for c in prj.captures:
+        win = ("%s → %s" % (_fmt_ts(c.t_first), _fmt_ts(c.t_last))
+               if c.t_first and c.t_last else "?")
+        say(f"    - {c.name} [{c.status}] {c.packets} paquets, "
+            f"{len(c.protocols)} protocoles, {c.n_hashes} hash(es), "
+            f"{c.n_creds} identifiant(s) clair(s), fenêtre {win}"
+            + (f" — ERREUR : {c.error}" if c.error else "")
+            + ("  [cache]" if c.cached else ""))
+    say(f"    TOTAL : {tot_p} paquets analysés en {tot_t:.1f} s")
+    ignored = prj.settings.get("ignored_files", [])
+    if ignored:
+        say(f"    Fichiers IGNORÉS (pas des captures) : {len(ignored)} — "
+            + ", ".join(ig["path"] for ig in ignored)
+            + f" (détail : {OUT_DATA_JSON} → settings.ignored_files)")
+    dupes = prj.settings.get("probable_duplicates", [])
+    if dupes:
+        say(f"    DOUBLONS PROBABLES (même capture en 2 formats) : {len(dupes)}"
+            " — solveurs lancés une seule fois (sur la capture brute)")
+        for dp in dupes:
+            say(f"      - {dp['a']} ↔ {dp['b']} ({dp['packets']} paquets chacun)")
+
+    # ---- 7) CORRÉLATIONS (§40 : quelles captures sont liées, pourquoi) ----
+    say("")
+    say(f"  7) CORRÉLATIONS INTER-CAPTURES — {len(prj.correlations)}")
+    if prj.correlations:
+        for c in prj.correlations:
+            _sh = c.get("shared") or {}
+            say(f"    - {c['capture_a']} ↔ {c['capture_b']} "
+                f"[{c['confidence']}] {c['reason']}")
+            if _sh:
+                for _k, _vs in sorted(_sh.items()):
+                    say(f"        identité partagée : {_k} = "
+                        + ", ".join(str(v) for v in (_vs or [])))
+    else:
+        say("    aucune identité partagée — AUCUNE corrélation affirmée "
+            "(§5/§42 : pas de preuve, pas de conclusion)")
+
+    # ---- 8) CONNAISSANCES (stats — secrets vérifiés : §1) ----
+    by_ty = {}
+    for it in kb.all_items():
+        by_ty.setdefault(it.type, [0, 0])
+        by_ty[it.type][0] += 1
+        if it.status == EV_VALIDATED:
+            by_ty[it.type][1] += 1
+    say("")
+    say(f"  8) KNOWLEDGE BASE — {len(kb)} entrée(s) "
+        f"(secrets vérifiés : §1 · détail : {OUT_DATA_JSON} / commande knowledge)")
+    for ty, (n, nv) in sorted(by_ty.items(), key=lambda x: -x[1][0]):
+        say(f"    - {ty:<20} {n:>5} entrée(s)"
+            + (f" dont {nv} VALIDÉE(S)" if nv else ""))
+    _corr = [it for it in kb.all_items() if it.status == EV_CORRELATED]
+    for it in _corr:
+        say(f"      [CORRELATED] {it.type} = {it.value} — {it.note}")
+
+    # ---- 9) CHAÎNES (§40 : chaînes de résolution) ----
+    say("")
+    say(f"  9) CHAÎNES DE RÉSOLUTION — {len(prj.chains)}")
+    for ch in prj.chains:
+        say(f"    - [{ch.outcome}] {ch.name}")
+        for st in ch.steps:
+            say(f"        {st.status:<9} {st.action}"
+                + (f" — {st.detail}" if st.detail else ""))
+
+    # ---- 10) INVENTAIRE RÉSEAU — TOUTES les valeurs, EN CLAIR (v1.2) ----
+    inv_rows = [(c.name, (c.det or {}).get("inventory")) for c in prj.captures
+                if (c.det or {}).get("inventory")]
+    say("")
+    say(f"  10) INVENTAIRE RÉSEAU — {len(inv_rows)} capture(s) inventoriée(s)")
+    say("      données personnelles (e-mails, téléphones, cartes, IBAN) "
+        "affichées EN CLAIR : aucun masquage (v1.2)")
+    for nm, inv in inv_rows:
+        cats = inv.get("par_categorie") or {}
+        catstr = ", ".join(f"{k}={v}" for k, v in cats.items() if v) or "rien"
+        say(f"    - {nm} : {inv.get('trouvees', 0)} découverte(s) — {catstr}")
+        ex = []
+        for lbl, k in (("hôtes", "hostnames"), ("e-mails", "emails"),
+                       ("utilisateurs", "users_ajoutes"),
+                       ("connaissances ajoutées", "kb_injectees")):
+            if inv.get(k):
+                ex.append(f"{lbl}={inv[k]}")
+        if inv.get("protocoles"):
+            ex.append("protocoles=" + ", ".join(
+                f"{k}({v})" for k, v in sorted(inv["protocoles"].items(),
+                                                key=lambda kv: -kv[1])))
+        if inv.get("anomalies"):
+            _an = inv["anomalies"]
+            if isinstance(_an, dict):
+                try:
+                    ex.append("anomalies=%d" % sum(int(v) for v in _an.values()))
+                except (TypeError, ValueError):
+                    ex.append("anomalies=oui")
+            else:
+                ex.append(f"anomalies={_an}")
+        if inv.get("partiel"):
+            ex.append("⚠ analyse partielle : %s" % inv["partiel"])
+        if ex:
+            for _x in ex:
+                say(f"        {_x}")
+        for _ci in prj.captures:
+            if _ci.name != nm:
+                continue
+            if _ci.hostnames:
+                say("        liste des hôtes      : " + ", ".join(_ci.hostnames))
+            if _ci.emails:
+                say("        liste des e-mails    : " + ", ".join(_ci.emails))
+            if _ci.users:
+                say("        liste des utilisateurs : " + ", ".join(_ci.users))
+    if not inv_rows:
+        say("    aucun inventaire (projet sans analyse réseau ou captures "
+            "illisibles — relancer l'analyse)")
+    say(f"    détail exhaustif fichier par fichier : inventory <capture> "
+        f"(→ {INVENTORY_BASE}.txt + .json/.csv, tout en clair)")
+
+    # ---- 11) SOLVEURS — décisions du DERNIER run, groupées par raison ----
+    runs_now = engine_latest_runs(prj)
+    n_arch = len(prj.solver_runs) - len(runs_now)
+    _runs = [s for s in runs_now if s.decision == "RUN"]
+    _skips = [s for s in runs_now if s.decision != "RUN"]
+    say("")
+    say(f"  11) SOLVEURS — {len(runs_now)} décision(s) sur le dernier run : "
+        f"{len(_runs)} lancement(s), {len(_skips)} non-lancement(s)"
+        + (f" ({prj.settings.get('last_run', '')})"
+           if prj.settings.get("last_run") else ""))
+    # Lancements « stériles » (rien d'applicable dans la capture) groupés ;
+    # les lancements PRODUCTIFS gardent tout leur détail ligne à ligne.
+    _STERILE = (ST_NOT_APPLICABLE, ST_INSUFFICIENT)
+    _prod = [x for x in _runs if x.status not in _STERILE]
+    _ster = [x for x in _runs if x.status in _STERILE]
+    for s in _prod:
+        say(f"    ▶ [{s.capture}] {s.solver:<6} {s.decision:<4} "
+            f"{s.status}" + (f" ({s.seconds:.1f}s)" if s.seconds else ""))
+        say(f"        raison  : {s.reason}")
+        say(f"        preuve  : {s.evidence}")
+        say(f"        détail  : {s.detail}")
+        _f = s.findings or {}
+        if _f:
+            for _k in sorted(_f):
+                _v = _f[_k]
+                if isinstance(_v, (list, tuple)):
+                    say(f"        {_k} : {len(_v)} élément(s) — "
+                        + ", ".join(str(x) for x in _v))
+                else:
+                    say(f"        {_k} : {_v}")
+    if _ster:
+        _names2 = sorted({c.name for c in prj.captures if c.name},
+                         key=len, reverse=True)
+
+        def _rgrp(r):
+            r = r or ""
+            for _nm in _names2:
+                if _nm in r:
+                    r = r.replace(_nm, "…")
+            return r
+
+        _by = {}
+        for x in _ster:
+            _by.setdefault((x.solver, x.status,
+                            _rgrp(x.detail or x.reason)), []).append(x)
+        say(f"    · Lancés mais rien d'applicable dans la capture "
+            f"({len(_ster)}), groupés :")
+        for (sv, st, rs), xs in sorted(_by.items(), key=lambda kv: -len(kv[1])):
+            _cn = sorted({y.capture for y in xs})
+            say(f"      {len(xs):>4} × {sv:<6} RUN → {st} : {rs}")
+            say("           captures : " + ", ".join(_cn))
+    if _skips:
+        _names = sorted({c.name for c in prj.captures if c.name},
+                        key=len, reverse=True)
+
+        def _rgroup(reason):
+            r = reason or ""
+            for _nm in _names:
+                if _nm in r:
+                    r = r.replace(_nm, "…")
+            return r
+
+        by_reason = {}
+        for s in _skips:
+            by_reason.setdefault(_rgroup(s.reason), []).append(s)
+        say(f"    · Non-lancements ({len(_skips)}), groupés par raison "
+            "(un non-lancement n'est pas un échec) :")
+        for reason, ss in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+            _cn = sorted({x.capture for x in ss})
+            say(f"      {len(ss):>4} × {reason}")
+            say("           captures : " + ", ".join(_cn))
+    if n_arch > 0:
+        say(f"    (+ {n_arch} décision(s) des runs précédents : archivées "
+            f"dans {OUT_DATA_JSON})")
+
+    # ---- 12) MITRE (§26) ----
+    mitre = prj.settings.get("mitre", [])
+    say("")
+    say(f"  12) MITRE ATT&CK (evidence-based) — {len(mitre)} technique(s)")
+    for mm in mitre:
+        say(f"    - {mm['id']} {mm['name']} [{mm['status']}] — {mm['evidence']}")
+    if not mitre:
+        say("    aucune technique soutenable par preuve — rien n'est mappé")
+
+    # ---- 13) CE QUE JE NE PEUX PAS CONCLURE (§42) ----
+    say("")
+    say(f"  13) LIMITES / DONNÉES MANQUANTES — {len(prj.missing)} limite(s), "
+        f"{len(prj.errors)} erreur(s) tolérée(s)")
+    for mm in prj.missing:
+        say(f"    - {mm['what']} : {mm['why']}"
+            + (f"  (besoin : {mm['needed']})" if mm.get("needed") else "")
+            + (f"  [{mm['capture']}]" if mm.get("capture") else ""))
+    for _e in prj.errors:
+        say(f"    erreur [{_e.get('where')}] {_e.get('capture') or '-'} : "
+            f"{_e.get('error')}")
+    if prj.missing or prj.errors:
+        say(f"    (tout est listé ci-dessus, rien n'est masqué ; détail : "
+            f"{OUT_DATA_JSON})")
+
+    # ---- 14) ROUNDS ----
+    say("")
+    if prj.rounds:
+        r = prj.rounds[-1]
+        say(f"  14) ROUNDS — {len(prj.rounds)} cycle(s), dernier : "
+            f"{r.get('new_knowledge', 0)} nouvelle(s) connaissance(s), "
+            f"{r.get('post_crack_new', 0)} post-crack, "
+            f"{'ÉTAT STABLE' if r.get('stable') else 'limite atteinte'}")
+    else:
+        say("  14) ROUNDS — aucun cycle exécuté")
+
+    say("")
+    say("  ══ QUE FAIRE MAINTENANT ══")
+    _nq = [0]
+
+    def _q(x):
+        _nq[0] += 1
+        say(f"    {_nq[0]}. {x}")
+
+    _q(f"{OUT_GUIDE_TXT} → le guide : ce qui a été trouvé, quel fichier ouvrir")
+    _q(f"{OUT_SECRETS_TXT} → tous les secrets trouvés EN CLAIR, réutilisables")
+    say("       tels quels (type:valeur = format --knowledge)")
+    _q(f"{OUT_DECRYPTED_TXT} → tous les textes des trames déchiffrées")
+    if prj.targets:
+        _q(f"{OUT_HASHES_DIR}/ → UN DOSSIER PAR HASH : la ligne hashcat, la")
+        say("       commande, le résultat (mot de passe EN CLAIR) et la fiche")
+        say(f"       d'origine ; liste : {OUT_HASHES_DIR}/{OUT_HASHES_INDEX}")
+    if n_ready:
+        _q(f"{n_ready} hash(es) prêt(s) à casser : commande dans le dossier de")
+        say(f"       chaque hash ({OUT_HASHES_DIR}/m<MODE>-<utilisateur>-<id>/")
+        say("       commande.txt), ou relancez avec --hashcat CHEMIN --hashcat-run")
+    _q(f"{OUT_REPORT_HTML} (double-clic) → ce rapport en interactif")
+    _q("vous connaissez un mot de passe/secret ? ajoutez-le (fichier")
+    say("       type:valeur) et relancez : menu 2 ▸ 1 (poursuivre), ou :")
+    say(f'       solve "{prj.out_dir}" --knowledge mes-savoirs.txt')
+    return L
+
+
+def engine_report_console(prj, opts=None):
+    for ln in engine_report_lines(prj, opts):
+        print(ln)
+    return 0
+
+
+def engine_write_secrets(prj, path):
+    """secrets-confirmes.txt — tous les secrets trouvés, sous une forme
+    DIRECTEMENT RÉUTILISABLE (v1.1, demande utilisateur : « tous les secrets
+    trouvés peuvent être réutilisés et écrits »).
+
+    Lignes « type:valeur » = le format d'import --knowledge : le fichier peut
+    être réinjecté tel quel dans un autre projet (solve --knowledge
+    secrets-confirmes.txt) pour profiter des mots de passe déjà trouvés.
+    Tri : d'abord les secrets VÉRIFIÉS par preuve cryptographique (VALIDATED,
+    §42 — cassage réussi, MIC/ICV/confirm vérifié), puis les mots de passe de
+    cibles hashcat résolues, puis les secrets OBSERVÉS en clair dans le
+    trafic (tokens, clés API, cookies — explicitement étiquetés, jamais
+    présentés comme vérifiés). Provenance en commentaires. Rien de synthétisé
+    (§42)."""
+    ordre = ("password", "credential", "secret", "key", "pmk", "tk", "kek",
+             "gtk", "token", "apikey", "cookie", "hash")
+    _ord = {t: i for i, t in enumerate(ordre)}
+    val = sorted([it for it in prj.kb.all_items()
+                  if it.status == EV_VALIDATED and it.type in _ord],
+                 key=lambda it: (_ord.get(it.type, 99), it.value))
+    obs = sorted([it for it in prj.kb.all_items()
+                  if it.status == EV_OBSERVED
+                  and it.type in ("token", "apikey", "cookie", "secret",
+                                  "password", "hash")],
+                 key=lambda it: (_ord.get(it.type, 99), it.value))
+    _seen = {(it.type, it.value) for it in val}
+    res = [t for t in sorted(prj.targets.values(),
+                             key=lambda x: (x.mode, x.capture or "",
+                                            x.line[:32]))
+           if t.status in ("CRACKED", "RESOLVED") and t.password
+           and ("password", t.password) not in _seen]
+    L = []
+    L.append("# tshark2hashcat v%s — SECRETS (projet : %s)"
+             % (__version__,
+                os.path.basename(prj.root.rstrip("\\/")) or prj.root))
+    L.append("# généré le %s · moteur v%s" % (now_iso(), ENGINE_VERSION))
+    L.append("#")
+    L.append("# VALIDATED = vérifié par preuve cryptographique (cassage réussi,")
+    L.append("#             MIC/ICV/confirm vérifié) — §42, jamais simulé.")
+    L.append("# OBSERVED  = vu en clair dans le trafic, NON vérifié par cassage.")
+    L.append("#")
+    L.append("# RÉUTILISATION : les lignes « type:valeur » sont au format")
+    L.append("# --knowledge. Exemple (réinjecter ces secrets ailleurs) :")
+    L.append('#   solve "%s" --knowledge %s' % (prj.out_dir, OUT_SECRETS_TXT))
+    L.append("")
+    if val:
+        L.append("# — SECRETS VÉRIFIÉS (VALIDATED) — %d —" % len(val))
+        for it in val:
+            L.append("%s:%s" % (it.type, it.value))
+    else:
+        L.append("# — aucun secret vérifié pour l'instant (rien n'est affirmé")
+        L.append("#   sans preuve, §42) —")
+    if res:
+        L.append("")
+        L.append("# — MOTS DE PASSE DE CIBLES HASHCAT RÉSOLUES — %d —" % len(res))
+        for t in res:
+            L.append("password:%s" % t.password)
+    if obs:
+        L.append("")
+        L.append("# — SECRETS OBSERVÉS DANS LE TRAFIC (OBSERVED, non vérifiés)"
+                 " — %d —" % len(obs))
+        for it in obs:
+            L.append("%s:%s" % (it.type, it.value))
+    L.append("")
+    L.append("# — PROVENANCE —")
+    for it in val:
+        L.append("# %s:%s ← %s" % (it.type, it.value,
+                                    it.source or it.capture or "-"))
+    for t in res:
+        L.append("# password:%s ← hash -m %s [%s] : %s"
+                 % (t.password, t.mode, t.status,
+                    t.why or t.capture or "-"))
+    for it in obs:
+        L.append("# %s:%s ← OBSERVÉ : %s" % (it.type, it.value,
+                                              it.source or it.capture or "-"))
+    try:
+        ensure_parent(path)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(L) + "\n")
+        _gf = prj.settings.setdefault("generated_files", [])
+        if path not in _gf:
+            _gf.append(path)
+        return path
+    except OSError as exc:
+        prj.add_error(OUT_SECRETS_TXT, f"écriture impossible : {exc}")
+        return None
+
+
+def engine_write_decrypted(prj, path):
+    """messages-dechiffres.txt — TOUS les messages/textes extraits des trames
+    déchiffrées (v1.1, demande utilisateur : « tous les messages déchiffrés
+    écrits »). Uniquement des déchiffrements adossés à une clé vérifiée
+    (§42). Chaque bloc : capture, méthode, clé, nombre de trames, puis TOUS
+    les textes extraits (chaînes imprimables, telles quelles, repérées par
+    trame). Le RAPPORT.txt les affiche tous aussi (v1.2) ; ce fichier les
+    regroupe par clé, prêt à réutiliser."""
+    L = []
+    L.append("# tshark2hashcat v%s — MESSAGES DÉCHIFFRÉS (projet : %s)"
+             % (__version__,
+                os.path.basename(prj.root.rstrip("\\/")) or prj.root))
+    L.append("# généré le %s · moteur v%s" % (now_iso(), ENGINE_VERSION))
+    L.append("# Chaque bloc = clé VÉRIFIÉE + textes extraits des trames")
+    L.append("# déchiffrées. Textes = chaînes imprimables telles quelles")
+    L.append("# (aucune interprétation) ; du trafic binaire peut ne rien")
+    L.append("# donner de lisible — c'est normal et ce n'est pas une erreur.")
+    n_txt = 0
+    for i, d in enumerate(prj.decryptions, 1):
+        ev = d.get("evidence") or []
+        n_txt += len(ev)
+        L.append("")
+        L.append("=" * 78)
+        L.append("== [%d] %s — %s  [%s]"
+                 % (i, d.get("capture", "?"), d.get("method", "?"),
+                    d.get("validation", "?")))
+        _k = d.get("key_tk") or d.get("key_wep") or ""
+        if _k:
+            L.append("== clé : %s" % _k)
+        L.append("== trames : %s déchiffrée(s), %s vérifiée(s)"
+                 % (d.get("frames_decrypted", 0),
+                    d.get("frames_verified_llc", 0)))
+        if d.get("source"):
+            L.append("== source : %s" % str(d.get("source")))
+        L.append("== textes extraits (%d) :" % len(ev))
+        for e in ev:
+            if isinstance(e, dict):
+                t = str(e.get("text", ""))
+                fr = e.get("frame")
+                L.append(("  [trame %s] %s" % (fr, t)) if fr is not None
+                         else ("  " + t))
+            else:
+                L.append("  " + str(e))
+        if not ev:
+            L.append("  (aucune chaîne imprimable — trafic binaire)")
+    if not prj.decryptions:
+        L.append("")
+        L.append("(aucun déchiffrement — aucune clé vérifiée disponible :")
+        L.append(" rien n'est affirmé sans preuve, §42)")
+    else:
+        L.append("")
+        L.append("# TOTAL : %d déchiffrement(s), %d texte(s) extrait(s)."
+                 % (len(prj.decryptions), n_txt))
+    try:
+        ensure_parent(path)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(L) + "\n")
+        _gf = prj.settings.setdefault("generated_files", [])
+        if path not in _gf:
+            _gf.append(path)
+        return path
+    except OSError as exc:
+        prj.add_error(OUT_DECRYPTED_TXT,
+                      f"écriture impossible : {exc}")
+        return None
+
+
+def engine_write_text_report(prj, path):
+    """RAPPORT.txt — le rapport complet en texte clair, toujours écrit
+    (même en --quiet) : les fichiers de sortie doivent être lisibles."""
+    try:
+        ensure_parent(path)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(engine_report_lines(prj)) + "\n")
+        _gf = prj.settings.setdefault("generated_files", [])
+        if path not in _gf:
+            _gf.append(path)
+        return path
+    except OSError as exc:
+        prj.add_error(OUT_REPORT_TXT, f"écriture impossible : {exc}")
+        return None
+
+
+def engine_write_readme(prj, path):
+    """GUIDE.txt — guide en tête du dossier projet : ce qui a été trouvé
+    (validé uniquement, §42), quel fichier ouvrir pour quoi, comment
+    continuer. Langage simple, sans jargon inutile."""
+    L = []
+
+    def say(x=""):
+        L.append(x)
+
+    nom = os.path.basename(prj.root.rstrip("\\/")) or prj.root
+    say("=" * 78)
+    say("  PROJET MOTEUR tshark2hashcat — %s" % nom)
+    say("  généré le %s · contexte %s · moteur v%s"
+        % (now_iso(), prj.context, ENGINE_VERSION))
+    say("=" * 78)
+    say("")
+    say("-" * 78)
+    say("  CE QUI A ÉTÉ TROUVÉ (VALIDÉ cryptographiquement — jamais sans preuve)")
+    say("-" * 78)
+    n = 0
+    for t in prj.targets.values():
+        if t.status in ("CRACKED", "RESOLVED"):
+            say("  • CIBLE RÉSOLUE  hashcat -m %d  (%s)" % (t.mode, t.capture))
+            if t.password:
+                say("      valeur : %s" % t.password)
+            say("      pourquoi : %s" % t.why)
+            n += 1
+    for it in prj.kb.all_items():
+        if it.status == EV_VALIDATED and it.type in ("password", "secret",
+                                                     "key", "pmk", "tk",
+                                                     "credential"):
+            say("  • %-11s %s" % (it.type.upper() + " :", it.value))
+            say("      preuve : %s" % (it.source or it.capture or "-"))
+            n += 1
+    for d in prj.decryptions:
+        say("  • DÉCHIFFREMENT  %s — %s trame(s) [%s] via %s"
+            % (d.get("capture"), d.get("frames_decrypted", 0),
+               d.get("validation"), d.get("method", "?")))
+        if d.get("evidence"):
+            say("      preuve(s) : %d texte(s) extrait(s) des trames déchiffrées"
+                % len(d["evidence"]))
+        n += 1
+    for c in prj.correlations:
+        say("  • CORRÉLATION  %s ↔ %s [%s]" % (c["capture_a"], c["capture_b"],
+                                                c["confidence"]))
+        say("      raison : %s" % c["reason"])
+        n += 1
+    if not n:
+        say("  Rien de validé pour l'instant — ce n'est pas une erreur.")
+        say(f"  Voir « PROCHAINES ACTIONS » dans {OUT_REPORT_TXT} (section 4) :")
+        say("  ce qui bloque, ce qu'il faudrait, et ce que ça coûterait.")
+    say("")
+    say("-" * 78)
+    say("  QUEL FICHIER OUVRIR ?")
+    say("-" * 78)
+    say(f"  {OUT_GUIDE_TXT}             ← CE GUIDE (quel fichier ouvrir)")
+    say(f"  {OUT_SECRETS_TXT} ← TOUS les secrets trouvés EN CLAIR — réutilisables")
+    say("                           (type:valeur = format --knowledge,")
+    say("                           VALIDATED = vérifiés, OBSERVED = vus en clair)")
+    say(f"  {OUT_DECRYPTED_TXT} ← TOUS les textes des trames déchiffrées")
+    say("                           (clés vérifiées)")
+    say(f"  {OUT_HASHES_DIR}/               ← UN DOSSIER PAR HASH hashcat :")
+    say("                           hash.txt (ligne à donner à hashcat),")
+    say("                           commande.txt (commande exacte),")
+    say("                           resultat.txt (mot de passe EN CLAIR ou état),")
+    say("                           fiche.txt (capture, trame, protocole, mode)")
+    say(f"  {OUT_HASHES_DIR}/{OUT_HASHES_INDEX}      ← la liste de tous les hashes et leur état")
+    say(f"  {OUT_REPORT_TXT}           ← rapport complet (les infos utiles d'abord)")
+    say(f"  {OUT_REPORT_HTML}          ← le plus confortable : DOUBLE-CLIC → navigateur,")
+    say("                           filtre de recherche intégré en haut de page")
+    say(f"  {OUT_REPORT_XLSX}          ← Excel : feuilles synthèse, captures,")
+    say("                           connaissances, hashes, solveurs, chaînes, MITRE,")
+    say("                           actions, journal")
+    say(f"  {OUT_DATA_JSON}           ← données complètes (pour scripts/outils,")
+    say("                           pas pour une lecture humaine)")
+    say(f"  {OUT_GRAPH_DOT}            ← graphe de connaissances (Graphviz :")
+    say(f"                           dot -Tpng {OUT_GRAPH_DOT} -o graphe.png)")
+    say(f"  {OUT_HASHES_DIR}/hashcat-m<MODE>.hash ← tous les hashes d'un mode, prêts")
+    say(f"  {OUT_HASHES_DIR}/commandes.txt ← commandes hashcat à copier-coller")
+    say(f"  {OUT_SOLVE_DIR}/*-solve.txt     ← journaux détaillés des solveurs, par capture")
+    say(f"  {OUT_SOLVE_DIR}/hashcat-m<MODE>.log ← journal complet d'une session hashcat")
+    say(f"  {OUT_CACHE_DIR}/*.json          ← cache d'analyse (relance rapide ; supprimable)")
+    say("")
+    say("  RIEN N'EST MASQUÉ (v1.2) : les données personnelles (e-mails,")
+    say("  téléphones, cartes bancaires, IBAN) sont EN CLAIR partout, et les")
+    say("  mots de passe / hashes / preuves ne sont jamais tronqués.")
+    say("")
+    say("-" * 78)
+    say("  CONTINUER / RELANCER (le projet est itératif)")
+    say("-" * 78)
+    say("  Menu (lancez le programme sans argument) :")
+    say("    2 = MOTEUR : ouvrir un projet existant  → sous-menu ▸ PROJET :")
+    say("        1 = poursuivre (nouveaux rounds + import knowledge)")
+    say("        2 = connaissances   3 = graphe   4 = hashes hashcat")
+    say("        5 = ouvrir le rapport HTML")
+    say("        6 = inventaire réseau (exhaustif, par capture)")
+    say("  Ou en commande :")
+    say('    py tshark2hashcat.py solve "%s"' % prj.out_dir)
+    say("  Ajoutez ce que vous savez (mots de passe, secrets, masks, identités)")
+    say("  dans un fichier texte « type:valeur » (ex. password:monmotdepasse,")
+    say("  mask:<64 hex> pour un mask SAE), puis :")
+    say('    py tshark2hashcat.py solve "%s" --knowledge mes-savoirs.txt'
+        % prj.out_dir)
+    say("")
+    say("  RÈGLE D'HONNÊTETÉ (§42) : VALIDATED = vérifié cryptographiquement ;")
+    say("  OBSERVED = vu dans la capture ; CORRELATED = recoupé entre captures ;")
+    say("  INFERRED = déduit. Rien n'est affirmé sans preuve, et")
+    say("  « je ne peux pas conclure » est une réponse valide du moteur.")
+    try:
+        ensure_parent(path)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(L) + "\n")
+        _gf = prj.settings.setdefault("generated_files", [])
+        if path not in _gf:
+            _gf.append(path)
+        return path
+    except OSError as exc:
+        prj.add_error("GUIDE.txt", f"écriture impossible : {exc}")
+        return None
+
+
+# ----------------------------------------------------------------------------
+# EXCEL (rapport.xlsx) — openpyxl protégé : absent → note, jamais de crash.
+# ----------------------------------------------------------------------------
+def engine_report_excel(prj, path):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+    except ImportError:
+        prj.add_error("excel", "openpyxl absent — rapport.xlsx non généré "
+                      "(donnees.json reste la source de vérité)")
+        return None
+    try:
+        wb = Workbook()
+        bold = Font(bold=True)
+        fill = PatternFill("solid", fgColor="DDEBF7")
+
+        _re_xl = __import__("re").compile(r"[\x00-\x08\x0b-\x1f]")
+
+        def sheet(title, header, rows, first=False):
+            ws = wb.active if first else wb.create_sheet()
+            ws.title = title[:31]
+            ws.append(header)
+            for c in ws[1]:
+                c.font = bold; c.fill = fill
+            for r in rows:
+                # openpyxl refuse les caractères de contrôle (IllegalCharacterError)
+                # → nettoyés ici, jamais de crash Excel (§30)
+                ws.append([_re_xl.sub("", str(x)) if x is not None else ""
+                           for x in r])
+            return ws
+
+        sheet("Synthèse", ["clé", "valeur"], [
+            ("dossier", prj.root), ("contexte", prj.context),
+            ("captures", len(prj.captures)),
+            ("connaissances", len(prj.kb)),
+            ("hashes hashcat", len(prj.targets)),
+            ("hashes cassés (mot de passe trouvé)",
+             sum(1 for t in prj.targets.values()
+                 if t.status in ("CRACKED", "RESOLVED") and t.password)),
+            ("hashes prêts à casser",
+             sum(1 for t in prj.targets.values() if t.status == "READY")),
+            ("dossiers de hash (1 par hash)", len(prj.targets)),
+            ("corrélations", len(prj.correlations)),
+            ("déchiffrements", len(prj.decryptions)),
+            ("rounds", len(prj.rounds)),
+            ("wordlist", f"{prj.wordlist or '-'} ({prj.wordlist_status})"),
+            ("créé", prj.created_at), ("maj", now_iso()),
+        ], first=True)
+        sheet("Captures", ["fichier", "statut", "paquets", "hash(es)",
+                           "identifiants", "fenêtre (s)", "sha256(16)",
+                           "erreur"],
+              [(c.name, c.status, c.packets, c.n_hashes, c.n_creds,
+                (f"{c.t_last - c.t_first:.0f}" if c.t_first and c.t_last
+                 else ""), c.sha16, c.error) for c in prj.captures])
+        # synthèse de l'inventaire réseau par capture
+        sheet("Inventaire réseau", ["capture", "découvertes", "SECRET",
+                                    "DONNÉE PERSONNELLE", "IDENTITÉ",
+                                    "DÉJÀ MASQUÉE", "MÉTADONNÉE",
+                                    "protocoles", "hôtes", "e-mails",
+                                    "connaissances ajoutées", "secondes",
+                                    "partiel"],
+              [(c.name, inv.get("trouvees", 0),
+                (inv.get("par_categorie") or {}).get("SECRET", 0),
+                (inv.get("par_categorie") or {}).get("PII", 0),
+                (inv.get("par_categorie") or {}).get("IDENTITY", 0),
+                (inv.get("par_categorie") or {}).get("MASKED", 0),
+                (inv.get("par_categorie") or {}).get("METADATA", 0),
+                ", ".join("%s(%s)" % (k, v) for k, v in
+                          sorted((inv.get("protocoles") or {}).items(),
+                                 key=lambda kv: -kv[1])),
+                inv.get("hostnames", 0), inv.get("emails", 0),
+                inv.get("kb_injectees", 0), inv.get("secondes", 0),
+                inv.get("partiel", ""))
+               for c in prj.captures
+               for inv in [(c.det or {}).get("inventory")] if inv])
+        sheet("Connaissances", ["type", "valeur", "statut", "confiance",
+                                "capture", "frame", "protocole", "source"],
+              [(it.type, it.value, it.status, it.confidence, it.capture,
+                it.frame, it.protocol, it.source) for it in prj.kb.all_items()])
+        sheet("Hashes", ["mode", "type", "statut", "validation",
+                         "mot de passe", "utilisateur", "domaine", "capture",
+                         "trame", "protocole", "dossier", "hash",
+                         "pourquoi"],
+              [(t.mode, (mode_info(int(t.mode)) or {}).get("name", ""),
+                t.status, t.validation, t.password or "(non trouvé)",
+                t.user, t.domain, t.capture, t.frame, t.protocol,
+                hash_dir(prj, t.mode, t.line, user=t.user, capture=t.capture),
+                t.line, t.why)
+               for t in sorted(prj.targets.values(),
+                               key=lambda x: (int(x.mode), x.line))])
+        sheet("Solveurs", ["run", "capture", "solveur", "décision", "statut",
+                           "secondes", "raison", "détail"],
+              [(s.run or "-", s.capture, s.solver, s.decision, s.status,
+                f"{s.seconds:.1f}", s.reason, s.detail)
+               for s in prj.solver_runs])
+        sheet("Chaînes", ["chaîne", "issue", "étape", "statut", "détail",
+                          "source"],
+              [(ch.name, ch.outcome, st.action, st.status, st.detail,
+                st.source) for ch in prj.chains for st in ch.steps])
+        sheet("MITRE", ["id", "technique", "statut", "preuve", "confiance"],
+              [(m["id"], m["name"], m["status"], m["evidence"],
+                m.get("confidence", ""))
+               for m in prj.settings.get("mitre", [])])
+        sheet("Actions", ["#", "action", "pourquoi", "confiance", "données",
+                          "coût", "preuve", "commande"],
+              [(i, a["action"], a["why"], a.get("confidence", ""),
+                a.get("data", ""), a.get("cost", ""), a.get("evidence", ""),
+                a.get("command", ""))
+               for i, a in enumerate(prj.settings.get("next_actions", []), 1)])
+        sheet("Journal", ["heure", "action", "raison", "preuve", "entrée",
+                          "sortie", "statut"],
+              [(r["at"], r["action"], r["reason"], r["evidence"],
+                r.get("input", ""), r.get("output", ""), r["status"])
+               for r in prj.actions_log])
+        ensure_parent(path)
+        wb.save(path)
+        prj.settings.setdefault("generated_files", []).append(path)
+        return path
+    except Exception as exc:          # openpyxl/OSError : jamais bloquant
+        prj.add_error("excel", f"rapport.xlsx non généré : "
+                               f"{type(exc).__name__}: {exc}")
+        return None
+
+
+# ----------------------------------------------------------------------------
+# HTML (rapport.html) — fichier unique autonome (CSS/JS inline, aucune
+# ressource externe) avec filtre de recherche et ancres de navigation.
+# ----------------------------------------------------------------------------
+def _hx(v):
+    return _htmlmod.escape(str(v if v is not None else ""), quote=True)
+
+
+def engine_report_html(prj, path):
+    rows_cap = "".join(
+        f"<tr><td>{_hx(c.name)}</td><td>{_hx(c.status)}</td>"
+        f"<td>{c.packets}</td><td>{c.n_hashes}</td><td>{c.n_creds}</td>"
+        f"<td>{(f'{c.t_last - c.t_first:.0f}' if c.t_first and c.t_last else '-')}"
+        f"</td><td>{_hx(c.error)}</td></tr>" for c in prj.captures)
+    rows_kb = "".join(
+        f"<tr><td>{_hx(it.type)}</td><td class=v>{_hx(it.value)}</td>"
+        f"<td>{_hx(it.status)}</td><td>{it.confidence}</td>"
+        f"<td>{_hx(it.capture)}</td><td>{_hx(it.frame)}</td>"
+        f"<td>{_hx(it.source)}</td></tr>" for it in prj.kb.all_items())
+    rows_tg = "".join(
+        f"<tr><td>{t.mode}</td><td>{_hx((mode_info(int(t.mode)) or {}).get('name', ''))}</td>"
+        f"<td>{_hx(t.status)}</td>"
+        f"<td class=v>{_hx(t.password or '(non trouvé)')}</td>"
+        f"<td>{_hx(t.user)}</td><td>{_hx(t.capture)}</td>"
+        f"<td class=v>{_hx(hash_dir(prj, t.mode, t.line, user=t.user, capture=t.capture))}</td>"
+        f"<td class=v>{_hx(t.line)}</td></tr>"
+        for t in sorted(prj.targets.values(), key=lambda x: (int(x.mode), x.line)))
+    runs_now = engine_latest_runs(prj)
+    n_sv_arch = len(prj.solver_runs) - len(runs_now)
+    sv_note = (f"<p><em>+ {n_sv_arch} décision(s) des runs précédents : "
+               f"archivées dans {OUT_DATA_JSON}</em></p>") if n_sv_arch > 0 else ""
+    rows_sv = "".join(
+        f"<tr><td>{_hx(s.capture)}</td><td>{_hx(s.solver)}</td>"
+        f"<td>{_hx(s.decision)}</td><td>{_hx(s.status)}</td>"
+        f"<td>{s.seconds:.1f}</td><td>{_hx(s.reason)}</td>"
+        f"<td>{_hx(s.detail)}</td></tr>" for s in runs_now)
+    rows_cor = "".join(
+        f"<tr><td>{_hx(c['capture_a'])}</td><td>{_hx(c['capture_b'])}</td>"
+        f"<td>{_hx(c['confidence'])}</td><td>{_hx(c['reason'])}</td></tr>"
+        for c in prj.correlations) or \
+        "<tr><td colspan=4>aucune corrélation — pas d'identité partagée (§5)</td></tr>"
+    rows_dec = "".join(
+        f"<tr><td>{_hx(d.get('capture'))}</td><td>{_hx(d.get('method'))}</td>"
+        f"<td>{d.get('frames_decrypted', 0)}</td>"
+        f"<td>{d.get('frames_verified_llc', 0)}</td>"
+        f"<td>{_hx(d.get('validation'))}</td>"
+        f"<td>{len(d.get('evidence') or [])}</td></tr>"
+        for d in prj.decryptions) or \
+        "<tr><td colspan=6>aucun déchiffrement — aucune clé validée disponible</td></tr>"
+    chains_html = ""
+    for ch in prj.chains:
+        steps = "".join(f"<li><b>{_hx(st.status)}</b> — {_hx(st.action)}"
+                        + (f" <i>({_hx(st.detail)})</i>" if st.detail
+                           else "") + "</li>" for st in ch.steps)
+        chains_html += (f"<div class=chain><h4>[{_hx(ch.outcome)}] "
+                        f"{_hx(ch.name)}</h4><ol>{steps}</ol></div>")
+    rows_mit = "".join(
+        f"<tr><td>{_hx(m['id'])}</td><td>{_hx(m['name'])}</td>"
+        f"<td>{_hx(m['status'])}</td><td>{_hx(m['evidence'])}</td></tr>"
+        for m in prj.settings.get("mitre", [])) or \
+        "<tr><td colspan=4>aucune technique soutenable par preuve (§26)</td></tr>"
+    rows_act = "".join(
+        f"<tr><td>{i}</td><td>{_hx(a['action'])}</td><td>{_hx(a['why'])}</td>"
+        f"<td>{_hx(a.get('confidence'))}</td><td>{_hx(a.get('cost'))}</td>"
+        f"<td class=v>{_hx(a.get('command', ''))}</td></tr>"
+        for i, a in enumerate(prj.settings.get("next_actions", []), 1)) or \
+        "<tr><td colspan=6>état stable — aucune action supplémentaire</td></tr>"
+    rows_mis = "".join(
+        f"<tr><td>{_hx(m['what'])}</td><td>{_hx(m['why'])}</td>"
+        f"<td>{_hx(m.get('needed', ''))}</td><td>{_hx(m.get('capture', ''))}"
+        f"</td></tr>" for m in prj.missing) or \
+        "<tr><td colspan=4>aucune donnée manquante signalée</td></tr>"
+    lim = "".join(f"<li>{_hx(x)}</li>"
+                  for x in prj.settings.get("limitations", []))
+    # inventaire réseau : synthèse par capture
+    inv_items = [(c.name, (c.det or {}).get("inventory"))
+                 for c in prj.captures if (c.det or {}).get("inventory")]
+    rows_inv = "".join(
+        f"<tr><td>{_hx(nm)}</td><td>{inv.get('trouvees', 0)}</td>"
+        f"<td>{_hx(', '.join(f'{k}={v}' for k, v in (inv.get('par_categorie') or {}).items() if v)) or '-'}</td>"
+        f"<td>{_hx(', '.join(f'{k}({v})' for k, v in sorted((inv.get('protocoles') or {}).items(), key=lambda kv: -kv[1]))) or '-'}</td>"
+        f"<td>{inv.get('hostnames', 0)}</td><td>{inv.get('emails', 0)}</td>"
+        f"<td>{inv.get('kb_injectees', 0)}</td><td>{inv.get('secondes', 0)}</td>"
+        f"<td>{_hx(str(inv.get('partiel', '')))}</td></tr>"
+        for nm, inv in inv_items) or \
+        "<tr><td colspan=9>aucun inventaire réseau — relancer l'analyse</td></tr>"
+    # v1.1 — sections ajoutées : SECRETS CONFIRMÉS (1) + FICHIERS (5)
+    _sec_types = ("password", "credential", "secret", "key", "pmk", "tk",
+                  "kek", "gtk", "token", "apikey", "cookie")
+    _ord = {t: i for i, t in enumerate(_sec_types)}
+    _secs = sorted([it for it in prj.kb.all_items()
+                    if it.status == EV_VALIDATED and it.type in _ord],
+                   key=lambda it: (_ord.get(it.type, 99), it.value))
+    _n_res = sum(1 for t in prj.targets.values()
+                 if t.status in ("CRACKED", "RESOLVED"))
+    _sec_rows = [f"<tr><td>{_hx(it.type.upper())}</td>"
+                 f"<td class=v>{_hx(it.value)}</td>"
+                 f"<td>{_hx(it.source or it.capture or '-')}</td>"
+                 f"<td>VALIDATED</td></tr>" for it in _secs]
+    for t in sorted(prj.targets.values(),
+                    key=lambda x: (x.mode, x.capture or "", x.line[:32])):
+        if t.status in ("CRACKED", "RESOLVED"):
+            _sec_rows.append(
+                f"<tr><td>CIBLE -m {_hx(str(t.mode))}</td>"
+                f"<td class=v>{_hx(t.password or '(clé interne)')}</td>"
+                f"<td>{_hx(t.capture or '-')}</td>"
+                f"<td>{_hx(t.status)}</td></tr>")
+    rows_sec = "".join(_sec_rows) or \
+        "<tr><td colspan=4>aucun secret vérifié — rien n'est affirmé sans " \
+        "preuve (§42)</td></tr>"
+    _gfl = prj.settings.get("generated_files") or []
+    rows_files = "".join(
+        f"<tr><td class=v>{_hx(g)}</td>"
+        f"<td>{_hx(engine_file_guide(g))}</td></tr>" for g in sorted(_gfl)) \
+        or "<tr><td colspan=2>aucun fichier généré</td></tr>"
+    guide_html = "".join(
+        f"<li><code>{_hx(n)}</code> — {_hx(engine_file_guide(n))}</li>"
+        for n in (OUT_GUIDE_TXT, OUT_SECRETS_TXT, OUT_DECRYPTED_TXT,
+                  OUT_HASHES_INDEX, OUT_REPORT_TXT, OUT_REPORT_HTML,
+                  OUT_REPORT_XLSX, OUT_DATA_JSON)
+        if engine_file_guide(n))
+    _hcp = prj.settings.get("hashcat_path")
+    hc_note = (f"<p><small>hashcat configuré : <code>{_hx(str(_hcp))}</code> "
+               f"({_hx(str(prj.settings.get('hashcat_version') or '?'))}) — "
+               "lancement : question du menu ou <code>--hashcat-run</code> ; "
+               f"manuel : <code>{OUT_HASHES_DIR}/commandes.txt</code>.</small></p>") \
+        if _hcp else ""
+    cores_note = (f" · cœurs : {prj.settings['cores']}"
+                  if prj.settings.get("cores") else "")
+    hc_head = (f" · hashcat : {prj.settings['hashcat_path']}"
+               if _hcp else "")
+    # v1.1 — navigation dans le NOUVEL ordre (infos utiles d'abord)
+    nav = ("secrets déchiffrements hashes actions fichiers captures "
+           "corrélations connaissances chaînes inventaire solveurs mitre "
+           "limites").split()
+    nav_html = " · ".join(f"<a href='#{n}'>{n}</a>" for n in nav)
+    doc = f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rapport moteur — {_hx(os.path.basename(prj.root.rstrip(chr(92) + '/')) or prj.root)}</title>
+<style>
+body{{font-family:Consolas,Menlo,monospace;margin:18px;background:#fafafa;color:#222}}
+h1{{font-size:20px}} h2{{font-size:16px;border-bottom:2px solid #4a90d9;
+padding-bottom:3px;margin-top:26px}} h4{{margin:6px 0}}
+table{{border-collapse:collapse;width:100%;background:#fff;font-size:12px}}
+th,td{{border:1px solid #ccc;padding:3px 6px;text-align:left;vertical-align:top}}
+th{{background:#ddebf7}} td.v{{word-break:break-all;max-width:480px}}
+.badge{{background:#4a90d9;color:#fff;padding:2px 8px;border-radius:8px}}
+input#q{{padding:6px;width:320px;font-family:inherit}}
+.chain{{background:#fff;border:1px solid #ccc;padding:6px 12px;margin:8px 0}}
+ol{{margin:4px 0 8px 18px;padding:0}} li{{margin:2px 0}}
+small{{color:#666}}
+</style></head><body>
+<h1>Rapport moteur — projet <span class=badge>{_hx(prj.context)}</span></h1>
+<p><small>dossier : {_hx(prj.root)} · sorties : {_hx(prj.out_dir)} ·
+généré le {_hx(now_iso())} · moteur v{_hx(ENGINE_VERSION)} ·
+wordlist : {_hx(prj.wordlist or '-')} [{_hx(prj.wordlist_status)}]{_hx(cores_note)}{_hx(hc_head)}</small></p>
+<p><input id="q" placeholder="filtrer toutes les lignes…" onkeyup="f()">
+&nbsp; {nav_html}</p>
+<h2 id="secrets">1 · Secrets confirmés ({len(_secs)} vérifié(s), {_n_res} hash(es) cassé(s))</h2>
+<table><thead><tr><th>type</th><th>valeur</th><th>preuve</th><th>statut</th>
+</tr></thead><tbody>{rows_sec}</tbody></table>
+<p><small>fichier réutilisable : <code>{OUT_SECRETS_TXT}</code>
+(type:valeur = format --knowledge). Toutes les valeurs sont EN CLAIR :
+aucun masquage, aucune troncature.</small></p>
+<h2 id="déchiffrements">2 · Messages déchiffrés ({len(prj.decryptions)})</h2>
+<table><thead><tr><th>capture</th><th>méthode</th><th>trames</th>
+<th>vérifiées</th><th>validation</th><th>preuves</th></tr></thead>
+<tbody>{rows_dec}</tbody></table>
+<p><small>tous les textes extraits : <code>{OUT_DECRYPTED_TXT}</code>.</small></p>
+<h2 id="hashes">3 · Hashes hashcat ({len(prj.targets)}) — un dossier par hash</h2>
+<p><small>dossier de chaque hash : <code>{OUT_HASHES_DIR}/m&lt;MODE&gt;-&lt;utilisateur&gt;-&lt;id&gt;/</code>
+contenant <code>hash.txt</code> (ligne hashcat), <code>commande.txt</code> (commande exacte),
+<code>resultat.txt</code> (mot de passe EN CLAIR ou état honnête) et <code>fiche.txt</code>
+(capture, trame, protocole, mode, tentatives). Liste complète :
+<code>{OUT_HASHES_DIR}/{OUT_HASHES_INDEX}</code>.</small></p>
+<table><thead><tr><th>mode</th><th>type</th><th>statut</th><th>mot de passe</th>
+<th>utilisateur</th><th>capture</th><th>dossier</th><th>hash</th></tr></thead>
+<tbody>{rows_tg}</tbody></table>{hc_note}
+<h2 id="actions">4 · Prochaines actions</h2>
+<table><thead><tr><th>#</th><th>action</th><th>pourquoi</th><th>confiance</th>
+<th>coût</th><th>commande</th></tr></thead><tbody>{rows_act}</tbody></table>
+<h2 id="fichiers">5 · Fichiers générés ({len(_gfl)})</h2>
+<table><thead><tr><th>fichier</th><th>ce qu'il contient</th></tr></thead>
+<tbody>{rows_files}</tbody></table>
+<p><small>quel fichier ouvrir : <ul>{guide_html}</ul></small></p>
+<h2 id="captures">6 · Captures ({len(prj.captures)})</h2>
+<table><thead><tr><th>fichier</th><th>statut</th><th>paquets</th>
+<th>hash(es)</th><th>identifiants</th><th>fenêtre (s)</th><th>erreur</th>
+</tr></thead><tbody>{rows_cap}</tbody></table>
+<h2 id="corrélations">7 · Corrélations ({len(prj.correlations)})</h2>
+<table><thead><tr><th>capture A</th><th>capture B</th><th>confiance</th>
+<th>raison (preuves)</th></tr></thead><tbody>{rows_cor}</tbody></table>
+<h2 id="connaissances">8 · Connaissances ({len(prj.kb)})</h2>
+<table><thead><tr><th>type</th><th>valeur</th><th>statut</th><th>confiance</th>
+<th>capture</th><th>frame</th><th>source</th></tr></thead>
+<tbody>{rows_kb}</tbody></table>
+<h2 id="chaînes">9 · Chaînes de résolution ({len(prj.chains)})</h2>
+{chains_html or '<p>aucune chaîne</p>'}
+<h2 id="inventaire">10 · Inventaire réseau ({len(inv_items)})</h2>
+<table><thead><tr><th>capture</th><th>découvertes</th><th>catégories</th>
+<th>protocoles</th><th>hôtes</th><th>e-mails</th><th>KB</th><th>s</th>
+<th>partiel</th></tr></thead><tbody>{rows_inv}</tbody></table>
+<p><small>Données personnelles (e-mails, téléphones, cartes, IBAN) affichées
+EN CLAIR : aucun masquage. Détail exhaustif : <code>inventory &lt;capture&gt;</code>.</small></p>
+<h2 id="solveurs">11 · Solveurs — dernier run ({len(runs_now)})</h2>
+<table><thead><tr><th>capture</th><th>solveur</th><th>décision</th>
+<th>statut</th><th>s</th><th>raison</th><th>détail</th></tr></thead>
+<tbody>{rows_sv}</tbody></table>{sv_note}
+<h2 id="mitre">12 · MITRE ATT&amp;CK — evidence-based</h2>
+<table><thead><tr><th>id</th><th>technique</th><th>statut</th><th>preuve</th>
+</tr></thead><tbody>{rows_mit}</tbody></table>
+<h2 id="limites">13 · Limites &amp; données manquantes ({len(prj.missing)})</h2>
+<ul>{lim}</ul>
+<table><thead><tr><th>quoi</th><th>pourquoi</th><th>besoin</th><th>capture</th>
+</tr></thead><tbody>{rows_mis}</tbody></table>
+<p><small><code>{OUT_DATA_JSON}</code> = données complètes. Statut VALIDATED
+uniquement après vérification cryptographique : rien n'est affirmé sans preuve.</small></p>
+<script>
+function f(){{var v=document.getElementById('q').value.toLowerCase();
+document.querySelectorAll('tbody tr').forEach(function(r){{
+r.style.display=r.textContent.toLowerCase().indexOf(v)>-1?'':'none';}});}}
+</script></body></html>
+"""
+    try:
+        ensure_parent(path)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(doc)
+        prj.settings.setdefault("generated_files", []).append(path)
+        return path
+    except OSError as exc:
+        prj.add_error("html", f"rapport.html non écrit : {exc}")
+        return None
+
+
+def engine_write_graph(prj, path):
+    try:
+        ensure_parent(path)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(engine_graph_dot(prj))
+        prj.settings.setdefault("generated_files", []).append(path)
+        return path
+    except OSError as exc:
+        prj.add_error("graph", f"{OUT_GRAPH_DOT} non écrit : {exc}")
+        return None
+
+
+# ----------------------------------------------------------------------------
+# PIPELINE MAÎTRE (§33) — séquence complète du moteur sur un dossier.
+# ----------------------------------------------------------------------------
+def engine_run_project(prj, opts):
+    """§33 : inventaire → analyse par capture → normalisation → preuves →
+    entités → corrélation → graphe → cibles → connaissances → candidats →
+    rounds (solveurs → validation → propagation → post-crack → nouveaux
+    candidats) → état stable → rapports. Aucune étape ne plante le projet
+    (§30) ; chaque action importante est journalisée [AUTO] (§34)."""
+    opts = dict(opts or {})
+    quiet = bool(opts.get("quiet"))
+    echo = not quiet
+    interactive = opts.get("ask")
+    if interactive is None:
+        interactive = sys.stdin.isatty()
+    tshark = opts.get("tshark") or find_tshark()
+    prj.log_action("Ouverture du projet", "analyse du dossier demandée",
+                   evidence=prj.root,
+                   inputs=f"contexte={prj.context}, tshark="
+                          f"{tshark or 'absent'}, deep={bool(opts.get('deep'))}, "
+                          f"budget={opts.get('budget') or 'défaut'}",
+                   echo=False)
+    if echo:
+        section_title("MOTEUR D'ANALYSE — PROJET (contexte %s)" % prj.context)
+        info(f"dossier analysé  : {prj.root}")
+        info(f"FICHIERS DE SORTIE → {prj.out_dir}")
+        info(f"    {OUT_GUIDE_TXT} + {OUT_REPORT_TXT} (texte clair), "
+             f"{OUT_REPORT_HTML} (double-clic), {OUT_REPORT_XLSX} (Excel)")
+        info(f"    {OUT_HASHES_DIR}/ (UN DOSSIER PAR HASH hashcat), "
+             f"{OUT_SOLVE_DIR}/ (journaux des solveurs)")
+        info("tshark : " + (str(tshark) if tshark else
+             "ABSENT — analyse pure Python (solveurs WEP/RADIUS/SAE/WPA3 "
+             "disponibles, détecteurs auth indisponibles sur pcap brut)"))
+        if prj.scope:
+            info(f"périmètre : {', '.join(prj.scope)}"
+                 + (f" (exclus : {', '.join(prj.excluded)})"
+                    if prj.excluded else ""))
+
+    # 1-2) INVENTAIRE -------------------------------------------------------
+    files = engine_inventory(prj.root, recursive=not opts.get("no_recursive"))
+    # .json objets (rapports, données de test…) : ignorés proprement, listés
+    # une fois — pas 30 erreurs « export JSON inattendu » (§30, lisibilité)
+    _kept, _ignored = [], []
+    for _f in files:
+        if (str(_f).lower().endswith(".json")
+                and not engine_json_is_capture(_f)):
+            _ignored.append({
+                "path": str(_f),
+                "reason": "fichier JSON objet (rapport/test/données) — "
+                          "pas un export de capture (liste de paquets)",
+            })
+        else:
+            _kept.append(_f)
+    if _ignored:
+        files = _kept
+        prj.settings["ignored_files"] = _ignored
+        if echo:
+            info(f"{len(_ignored)} fichier(s) .json IGNORÉ(S) — pas des "
+                 "exports de capture (JSON objet) :")
+            for _ig in _ignored:
+                info(f"    - {os.path.relpath(_ig['path'], prj.root)}")
+            info(f"    (détail : {OUT_DATA_JSON} → settings.ignored_files)")
+    # poursuite itérative (§28) : retirer l'état périmé des captures qui vont
+    # être ré-analysées — la KB, les cibles et l'historique sont conservés
+    _paths = {str(f) for f in files}
+    prj.captures = [c for c in prj.captures if c.path not in _paths]
+    if not files:
+        warn(f"aucune capture ({'/'.join(ENGINE_CAP_EXTS)}) dans {prj.root} — "
+             "rien à analyser, je ne peux pas conclure (§42)")
+        prj.settings["mitre"] = engine_mitre(prj)
+        prj.settings["limitations"] = engine_limitations(prj)
+        prj.settings["next_actions"] = engine_next_actions(prj)
+        pj = prj.save()
+        prj.settings.setdefault("generated_files", []).append(pj)
+        prj.save()
+        return 0
+    if echo:
+        tot = sum(os.path.getsize(str(f)) for f in files)
+        print(f"  [inventaire] {len(files)} capture(s), {tot / 1e6:.1f} Mo :")
+        for f in files:
+            print(f"    - {os.path.relpath(str(f), prj.root)} "
+                  f"({os.path.getsize(str(f)) / 1e6:.2f} Mo)")
+
+    # 3-6) ANALYSE PAR CAPTURE ---------------------------------------------
+    for f in files:
+        engine_analyze_capture(prj, f, tshark_path=tshark,
+                               use_cache=not opts.get("no_cache"), echo=echo)
+
+    # 6b) DOUBLONS PROBABLES : même nom de base + même nombre de paquets
+    #     (ex. ch10.cap + ch10.json) — simple note honnête, jamais de
+    #     suppression/skip automatique (§42 : l'utilisateur décide)
+    _dupes = []
+    for _i in range(len(prj.captures)):
+        for _j in range(_i + 1, len(prj.captures)):
+            _a, _b = prj.captures[_i], prj.captures[_j]
+            _ba = os.path.splitext(_a.name)[0].lower()
+            _bb = os.path.splitext(_b.name)[0].lower()
+            if _ba == _bb and _a.packets > 0 and _a.packets == _b.packets:
+                _dupes.append({"a": _a.name, "b": _b.name,
+                               "packets": _a.packets})
+    if _dupes:
+        prj.settings["probable_duplicates"] = _dupes
+        if echo:
+            info(f"{len(_dupes)} DOUBLON(S) PROBABLE(S) — même capture en 2 "
+                 "formats (même nb de paquets) :")
+            for _dp in _dupes:
+                info(f"    {_dp['a']} ↔ {_dp['b']} ({_dp['packets']} paquets)"
+                     " — retirer l'un des deux du dossier économise du temps")
+
+    # 7) CORRÉLATION + GRAPHE + SCOPE ---------------------------------------
+    engine_correlate(prj, echo=echo)
+    n_nodes, n_edges = engine_graph_stats(prj)
+    if echo:
+        print(f"  [graphe] {n_nodes} nœuds, {n_edges} relations "
+              f"({OUT_GRAPH_DOT} écrit en fin d'analyse)")
+    engine_apply_scope(prj, echo=echo)
+
+    # 8) CONNAISSANCES EXTERNES (§7, chargées par la CLI) + CANDIDATS (§12)
+    n_cand = engine_generate_candidates(prj)
+    if echo and n_cand:
+        print(f"  [candidats] {n_cand} mot(s) de passe candidat(s) généré(s) "
+              "depuis les connaissances (§12 — INFERRED, jamais VALIDATED "
+              "sans vérification)")
+
+    # 9) WORDLIST (§13) — question à la fin de l'analyse initiale
+    engine_wordlist_setup(prj, opts.get("wordlist") or "",
+                          interactive=interactive, echo=echo)
+
+    # 10) QUESTIONS CIBLÉES PROJET (mask auth / candidats RADIUS / WEP deep /
+    #     hash rendu + mask SAE) — TTY uniquement
+    engine_ask_project(prj, opts, interactive, echo=echo)
+
+    # 11-18) ROUNDS : solveurs → validation → propagation → post-crack -----
+    engine_rounds(prj, opts, echo=echo)
+
+    # 19-22) CHAÎNES · ACTIONS · MITRE · LIMITES -----------------------------
+    engine_build_chains(prj)
+    prj.settings["next_actions"] = engine_next_actions(prj)
+    prj.settings["mitre"] = engine_mitre(prj)
+    prj.settings["limitations"] = engine_limitations(prj)
+
+    # 23) FICHIERS ------------------------------------------------------------
+    engine_write_targets(prj, echo=echo)
+    # v1.1 — hashcat (GPU) sur les cibles READY : chemin validé/mémorisé,
+    # lancement sur confirmation (interactif) ou --hashcat-run ; les mots de
+    # passe cassés → KB VALIDATED + cibles CRACKED AVANT les rapports.
+    _n_hc = engine_hashcat_launch(prj, opts, interactive=interactive,
+                                  echo=echo)
+    if _n_hc:
+        engine_build_chains(prj)
+        prj.settings["next_actions"] = engine_next_actions(prj)
+        prj.settings["mitre"] = engine_mitre(prj)
+        prj.settings["limitations"] = engine_limitations(prj)
+    engine_write_graph(prj, out_path(prj, OUT_GRAPH_DOT))
+    pj = prj.save()
+    prj.settings.setdefault("generated_files", []).append(pj)
+    # RAPPORT.txt + GUIDE.txt + secrets-confirmes.txt +
+    # messages-dechiffres.txt : TOUJOURS écrits (même --quiet) — les fichiers
+    # de sortie doivent être lisibles sans écran. PRÉ-ENREGISTRÉS avant
+    # excel/html pour que TOUTES les listes de fichiers (RAPPORT §5, HTML
+    # section 5) soient complètes et identiques.
+    _rap = out_path(prj, OUT_REPORT_TXT)
+    _lir = out_path(prj, OUT_GUIDE_TXT)
+    _sec = out_path(prj, OUT_SECRETS_TXT)
+    _msg = out_path(prj, OUT_DECRYPTED_TXT)
+    _gf = prj.settings.setdefault("generated_files", [])
+    for _x in (_rap, _lir, _sec, _msg):
+        if _x not in _gf:
+            _gf.append(_x)
+    if not opts.get("no_excel"):
+        engine_report_excel(prj, out_path(prj, OUT_REPORT_XLSX))
+    if not opts.get("no_html"):
+        engine_report_html(prj, out_path(prj, OUT_REPORT_HTML))
+    engine_write_text_report(prj, _rap)
+    engine_write_readme(prj, _lir)
+    engine_write_secrets(prj, _sec)
+    engine_write_decrypted(prj, _msg)
+
+    # 24) RAPPORT CONSOLE + SAUVEGARDE FINALE ---------------------------------
+    if echo:
+        engine_report_console(prj, opts)
+        print()
+        print("═" * 100)
+        ok(f"TOUT EST DANS : {prj.out_dir}")
+        print(f"    1. {OUT_GUIDE_TXT}             → le guide : ce qui a été trouvé, quel fichier ouvrir")
+        print(f"    2. {OUT_SECRETS_TXT} → TOUS les secrets trouvés EN CLAIR (réutilisables)")
+        print(f"    3. {OUT_DECRYPTED_TXT} → TOUS les textes des trames déchiffrées")
+        print(f"    4. {OUT_HASHES_DIR}/               → UN DOSSIER PAR HASH : commande, résultat, fiche")
+        print(f"    5. {OUT_REPORT_TXT}           → ce même rapport, en texte clair")
+        print(f"    6. {OUT_REPORT_HTML}          → DOUBLE-CLIC : rapport interactif dans le navigateur")
+        print("═" * 100)
+    else:
+        print(f"projet écrit dans {prj.out_dir} — ouvrez {OUT_GUIDE_TXT} "
+              f"ou {OUT_REPORT_TXT}")
+    prj.save()
+    return 0
+
+
+# ============================================================================
+#  MOTEUR — COMMANDES CLI (§32) : project · knowledge · graph · targets · solve
+# ----------------------------------------------------------------------------
+#  Noms choisis SANS collision avec les 28 sous-commandes existantes ;
+#  `report` existant inchangé — la régénération des rapports moteur passe par
+#  `project` (poursuite) ou `solve`. extract/auto/folder/analyze/stats/…
+#  conservent exactement leur comportement (§39 anti-régression).
+#  Flags globaux hérités : --tshark, --quiet, --verbose, --lang, …
+# ============================================================================
+
+
+def _engine_default_out(path):
+    p = Path(path).expanduser()
+    stem = p.name if p.is_dir() else p.stem
+    return str(p.parent / (stem + "-projet"))
+
+
+def _engine_load_project(project_dir):
+    prj = Project.load(project_dir)
+    if prj is None:
+        err(f"aucun {OUT_DATA_JSON} dans {project_dir} — créez d'abord le "
+            f"projet : `project {project_dir}`")
+    return prj
+
+
+def _engine_opts_from_args(args):
+    return {
+        "deep": bool(getattr(args, "deep", False)),
+        "budget": int(getattr(args, "budget", 0) or 0),
+        "rounds": int(getattr(args, "rounds", 4) or 4),
+        "wordlist": getattr(args, "wordlist", "") or "",
+        "sae_mask": getattr(args, "sae_mask", None),
+        "auth_mask": getattr(args, "auth_mask", None),
+        "ask": getattr(args, "ask", None),
+        "quiet": bool(getattr(args, "quiet", False)),
+        "verbose": bool(getattr(args, "verbose", False)),
+        "tshark": getattr(args, "tshark", None),
+        "no_cache": bool(getattr(args, "no_cache", False)),
+        "no_recursive": bool(getattr(args, "no_recursive", False)),
+        "no_excel": bool(getattr(args, "no_excel", False)),
+        "no_html": bool(getattr(args, "no_html", False)),
+        # v1.1 — puissance CPU choisie + hashcat externe (GPU)
+        "cores": (int(getattr(args, "cores", 0) or 0) or None),
+        "hashcat": (getattr(args, "hashcat", "") or "").strip() or None,
+        "hashcat_run": bool(getattr(args, "hashcat_run", False)),
+    }
+
+
+def cmd_project(args):
+    """Moteur complet (§33) : DOSSIER → inventaire → analyse → corrélations
+    → knowledge base → cibles → solveurs → rounds → post-crack → rapports.
+    Itératif : relancer sur le même --out poursuit le projet (§28)."""
+    path = args.path
+    if not os.path.exists(path):
+        err(f"chemin introuvable : {path}")
+        return 2
+    out = args.out or _engine_default_out(path)
+    if not args.out and sys.stdin.isatty():
+        # question claire sur l'emplacement des sorties (défaut affiché ;
+        # EOF sûr ; non-TTY → défaut silencieux, scripts/batterie inchangés)
+        try:
+            rep = input(f"  Dossier de sortie (rapports, hashes, journaux)\n"
+                        f"    Entrée = défaut : {out}\n"
+                        f"    autre dossier   : tapez son chemin\n"
+                        f"  → ").strip().strip('"').strip("'")
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            rep = ""
+        if rep:
+            out = rep
+        info(f"fichiers de sortie → {out}")
+    prj = None
+    if not getattr(args, "fresh", False):
+        prj = Project.load(out)
+        if prj is not None:
+            info(f"projet existant chargé depuis {out} — poursuite itérative "
+                 "(§28) ; --fresh pour repartir à zéro")
+            prj.root = str(path)
+            prj.out_dir = str(out)
+    if prj is None:
+        prj = Project(
+            path, out, context=getattr(args, "context", "CTF") or "CTF",
+            scope=[s.strip() for s in (getattr(args, "scope", "") or "").split(",")
+                   if s.strip()],
+            excluded=[s.strip() for s in (getattr(args, "exclude", "") or "").split(",")
+                      if s.strip()])
+    kn = getattr(args, "knowledge", "") or ""
+    if kn:
+        n = engine_load_knowledge_file(prj, kn)
+        info(f"{n} connaissance(s) importée(s) depuis {kn} (§7 — affichées "
+             "comme USER_SUPPLIED)")
+    return engine_run_project(prj, _engine_opts_from_args(args))
+
+
+def cmd_knowledge(args):
+    """Knowledge base d'un projet (§6/§7) : affichage filtrable + import."""
+    prj = _engine_load_project(args.project_dir)
+    if prj is None:
+        return 2
+    kn = getattr(args, "knowledge", "") or ""
+    if kn:
+        n = engine_load_knowledge_file(prj, kn)
+        info(f"{n} connaissance(s) importée(s) depuis {kn}")
+        prj.save()
+    items = prj.kb.all_items()
+    ty = (getattr(args, "type", "") or "").strip().lower()
+    stt = (getattr(args, "status", "") or "").strip().upper()
+    if ty:
+        items = [it for it in items if it.type == ty]
+    if stt:
+        items = [it for it in items if it.status == stt]
+    counts = {}
+    for it in prj.kb.all_items():
+        k = (it.type, it.status)
+        counts[k] = counts.get(k, 0) + 1
+    section_title(f"KNOWLEDGE BASE — {len(prj.kb)} entrée(s) "
+                  f"({len(items)} affichée(s))")
+    for (kty, kst), n in sorted(counts.items()):
+        print(f"  {kty:<20} {kst:<16} {n:>5}")
+    for it in items:                      # v1.2 : TOUT, EN CLAIR, jamais tronqué
+        print(f"  [{it.status:<13}] {it.type:<12} {it.value}")
+        print(f"                  preuve : {it.source or it.capture or '-'}")
+    jo = getattr(args, "json_out", "") or ""
+    if jo:
+        try:
+            ensure_parent(jo)
+            with open(jo, "w", encoding="utf-8") as f:
+                json.dump([it.to_dict() for it in items], f, indent=1,
+                          ensure_ascii=False)
+            ok(f"knowledge exportée : {jo} ({len(items)} entrée(s))")
+        except OSError as exc:
+            err(f"export impossible : {exc}")
+            return 2
+    return 0
+
+
+def cmd_graph(args):
+    """Graphe de connaissances (§9) : graphe.dot + statistiques + timeline."""
+    prj = _engine_load_project(args.project_dir)
+    if prj is None:
+        return 2
+    n_nodes, n_edges = engine_graph_stats(prj)
+    out = args.out or out_path(prj, OUT_GRAPH_DOT)
+    p = engine_write_graph(prj, out)
+    section_title(f"GRAPHE — {n_nodes} nœuds, {n_edges} relations")
+    if p:
+        ok(f"écrit : {p}")
+        info(f"rendu image (Graphviz, optionnel) : dot -Tpng {OUT_GRAPH_DOT} "
+             "-o graph.png")
+    tl = engine_timeline(prj)
+    if tl["windows"]:
+        print("  Fenêtres temporelles (§27) :")
+        for w in tl["windows"]:
+            print(f"    - {w['capture']} : {_fmt_ts(w['t_first'])} → "
+                  f"{_fmt_ts(w['t_last'])}")
+        print(f"    fusion globale possible : {'OUI' if tl['mergeable'] else 'NON'}"
+              f" — {len(tl['events'])} événement(s) horodaté(s), "
+              f"{len(tl['by_capture'])} événement(s) par frame")
+    prj.save()
+    return 0
+
+
+def cmd_targets(args):
+    """Hashes hashcat (§11) : revalidation des formats, UN DOSSIER PAR HASH
+    (hash.txt / commande.txt / resultat.txt / fiche.txt) + fichiers par mode +
+    INDEX.txt. Tout est affiché EN CLAIR, rien n'est tronqué (v1.2)."""
+    prj = _engine_load_project(args.project_dir)
+    if prj is None:
+        return 2
+    wl = getattr(args, "wordlist", "") or ""
+    if wl:
+        engine_wordlist_setup(prj, wl, interactive=False)
+    n_invalid = 0
+    for t in prj.targets.values():
+        okf, why = engine_validate_hash_line(t.mode, t.line)
+        if not okf and t.status not in ("CRACKED", "RESOLVED"):
+            t.status = "INVALID"; t.validation = VAL_FAILED
+            t.why = (t.why or "") + " — format invalide à la revalidation : " + why
+            n_invalid += 1
+    n_cracked = sum(1 for t in prj.targets.values()
+                    if t.status in ("CRACKED", "RESOLVED") and t.password)
+    section_title(f"HASHES HASHCAT — {len(prj.targets)} "
+                  f"({n_cracked} cassé(s), {n_invalid} invalide(s) après revalidation)")
+    by_mode = {}
+    for t in prj.targets.values():
+        by_mode.setdefault(t.mode, []).append(t)
+    for mode, ts in sorted(by_mode.items()):
+        _mi = mode_info(mode) or {}
+        print(f"  -m {mode} — {_mi.get('name', '?')} — {len(ts)} hash(es)")
+        for t in sorted(ts, key=lambda x: x.line):
+            print(f"    [{t.status:<8}] {t.line}")
+            print(f"               mot de passe : {t.password or '(non trouvé)'}")
+            print(f"               origine      : {t.capture or '-'}"
+                  + (f" (trame {t.frame})" if t.frame is not None else "")
+                  + (f" — {t.protocol}" if t.protocol else "")
+                  + (f" — {t.user}" if t.user else ""))
+            print(f"               dossier      : "
+                  f"{hash_dir(prj, t.mode, t.line, user=t.user, capture=t.capture)}")
+            if t.status == "INVALID":
+                print(f"               problème     : {t.why or '-'}")
+    engine_write_targets(prj, echo=True)
+    prj.save()
+    return 0
+
+
+def cmd_solve(args):
+    """Poursuite itérative d'un projet (§18) : nouveaux rounds (solveurs
+    décidés → validation → propagation → post-crack → candidats) puis
+    rapports régénérés. À utiliser après un import de connaissances, une
+    wordlist trouvée, un mask fourni…"""
+    prj = _engine_load_project(args.project_dir)
+    if prj is None:
+        return 2
+    kn = getattr(args, "knowledge", "") or ""
+    if kn:
+        n = engine_load_knowledge_file(prj, kn)
+        info(f"{n} connaissance(s) importée(s) depuis {kn}")
+    opts = _engine_opts_from_args(args)
+    interactive = opts.get("ask")
+    if interactive is None:
+        interactive = sys.stdin.isatty()
+    wl = opts.get("wordlist") or ""
+    if wl or not prj.wordlist:
+        engine_wordlist_setup(prj, wl or prj.wordlist or "",
+                              interactive=interactive)
+    engine_ask_project(prj, opts, interactive)
+    engine_generate_candidates(prj)
+    stable = engine_rounds(prj, opts)
+    engine_build_chains(prj)
+    prj.settings["next_actions"] = engine_next_actions(prj)
+    prj.settings["mitre"] = engine_mitre(prj)
+    prj.settings["limitations"] = engine_limitations(prj)
+    engine_write_targets(prj, echo=not opts["quiet"])
+    # v1.1 — hashcat (GPU) sur les cibles READY : validation du chemin,
+    # confirmation/lancement, mots de passe cassés → KB VALIDATED + CRACKED.
+    _n_hc = engine_hashcat_launch(prj, opts, interactive=interactive,
+                                  echo=not opts["quiet"])
+    if _n_hc:
+        engine_build_chains(prj)
+        prj.settings["next_actions"] = engine_next_actions(prj)
+        prj.settings["mitre"] = engine_mitre(prj)
+        prj.settings["limitations"] = engine_limitations(prj)
+    engine_write_graph(prj, out_path(prj, OUT_GRAPH_DOT))
+    # v1.1 — pré-enregistrement des fichiers texte AVANT excel/html : leurs
+    # listes de fichiers générés (RAPPORT §5, HTML section 5) sont complètes.
+    _rap = out_path(prj, OUT_REPORT_TXT)
+    _lir = out_path(prj, OUT_GUIDE_TXT)
+    _sec = out_path(prj, OUT_SECRETS_TXT)
+    _msg = out_path(prj, OUT_DECRYPTED_TXT)
+    _gf = prj.settings.setdefault("generated_files", [])
+    for _x in (_rap, _lir, _sec, _msg):
+        if _x not in _gf:
+            _gf.append(_x)
+    if not opts["no_excel"]:
+        engine_report_excel(prj, out_path(prj, OUT_REPORT_XLSX))
+    if not opts["no_html"]:
+        engine_report_html(prj, out_path(prj, OUT_REPORT_HTML))
+    # Bug du run réel (v4.5) : solve/« poursuivre » (menu 2 → 1) régénérait
+    # xlsx/html/console/json mais PAS RAPPORT.txt ni GUIDE.txt — le guide
+    # restait à l'ancien horodatage même après un build corrigé, et l'on
+    # croyait les correctifs sans effet. Aligné sur le run complet : les deux
+    # fichiers texte sont TOUJOURS écrits (même --quiet), pré-enregistrés
+    # avant excel/html (v1.1).
+    engine_write_text_report(prj, _rap)
+    engine_write_readme(prj, _lir)
+    engine_write_secrets(prj, _sec)
+    engine_write_decrypted(prj, _msg)
+    if not opts["quiet"]:
+        engine_report_console(prj, opts)
+    prj.save()
+    if stable:
+        info("état stable atteint (§18) — aucune nouvelle information à "
+             "produire sans données supplémentaires")
+    return 0
+
+
+# ==============================================================================================
+#  INVENTAIRE RÉSEAU — extraction exhaustive multi-protocoles, utilisable séparément (sous-commande `inventory`)
+# ==============================================================================================
+# ============================================================================
+#  INVENTAIRE RÉSEAU v1.2 — extraction exhaustive, tous protocoles, tous champs
+# ----------------------------------------------------------------------------
+#  Demande utilisateur (inventaire réseau) : « transforme ce code en vrai outil… tout
+#  ce que tu trouves tu le mets, pas juste CTF… les masques/les données qu'on
+#  ne devrait pas voir… mode pro avec debug… parties utilisables séparément…
+#  exhaustif, doit marcher sur n'importe quel pcap, optimisé au maximum ».
+#
+#  Principes :
+#   - AUTONOME : pur Python, AUCUN tshark requis (pcap, pcapng, gzip,
+#     linktypes Ethernet/NULL/RAW/SLL/SLL2/radiotap). Tronqué/corrompu →
+#     jamais de crash : chaque paquet ET chaque parseur sont isolés, les
+#     anomalies sont comptées et rapportées honnêtement (§42).
+#   - EXHAUSTIF : chaque champ identifiable est inventorié — identités,
+#     secrets en clair (ce qu'on ne devrait JAMAIS voir sur le réseau),
+#     PII (EN CLAIR), données déjà masquées dans les flux
+#     (****, [redacted]…), jetons, clés API, certificats, métadonnées.
+#   - OPTIMISÉ : UN seul passage fichier, lecture streaming par blocs,
+#     regex précompilées au niveau module, dispatch des parseurs par
+#     port + reniflage structurel (jamais « tous les parseurs sur tout »),
+#     réassemblage TCP borné (TLS), mémoires bornées (plafonds + compteurs
+#     de troncature), débit mesuré (paquets/s, Mo/s) affiché.
+#   - SÉPARABLE : `inventory` en CLI autonome, run_inventory() importable,
+#     chaque px_* réutilisable seul, et le moteur l'appelle automatiquement
+#     par capture (KB/entités/corrélations enrichies).
+#
+#  Affichage : TOUT est EN CLAIR partout (console, TXT, JSON, CSV, base de
+#  connaissances) — v1.2 : aucun masquage, aucune troncature, aucun « *** »
+#  ni « • ». La PII (e-mail, téléphone, carte bancaire, IBAN) est affichée
+#  telle quelle : c'est la demande explicite de l'utilisateur et l'analyse
+#  reste strictement locale (audit passif §36 — rien n'est transmis,
+#  tout reste dans les fichiers de sortie). --no-redact est toujours accepté
+#  par la CLI mais n'a plus aucun effet.
+# ============================================================================
+import gzip
+import socket
+import struct
+from collections import OrderedDict, Counter
+
+PRO_INVENTORY_VERSION = "1.0"
+
+# -- Catégories de découvertes ----------------------------------------------
+K_SECRET = "SECRET"        # exposé en clair : ne devrait JAMAIS être visible
+K_PII = "PII"              # donnée personnelle — masquée par défaut
+K_IDENTITY = "IDENTITY"    # utilisateur, hôte, domaine, realm, service…
+K_METADATA = "METADATA"    # versions, compteurs, horodatages, configuration
+K_MASKED = "MASKED"        # donnée DÉJÀ masquée dans le flux (****, [redacted])
+
+KINDS_ORDER = (K_SECRET, K_MASKED, K_IDENTITY, K_PII, K_METADATA)
+
+# Plafonds (mémoire bornée — tout dépassement est COMPTÉ et signalé)
+PRO_MAX_FINDINGS = 50000
+PRO_MAX_STREAMS = 1024
+PRO_STREAM_BYTES = 96 * 1024
+PRO_MINE_BYTES = 16 * 1024          # portion minée par payload
+PRO_MAX_PER_FIELD = 2000            # valeurs distinctes par (proto, champ)
+
+
+def pro_redact(v, kind=""):
+    """Valeur telle quelle : AUCUN MASQUAGE (v1.2).
+
+    L'analyse est locale et l'utilisateur est le propriétaire des données :
+    masquer par des « • » rendait le rapport illisible et empêchait la
+    corrélation. La fonction est conservée (signature et appelants inchangés,
+    drapeau --no-redact toujours accepté) mais elle renvoie systématiquement
+    la valeur complète, sans troncature ni caractère de remplacement.
+    """
+    return str(v)
+
+
+def _pro_redact_legacy(v, kind=""):
+    """Ancien masquage — NON utilisé depuis la v1.2, conservé pour référence."""
+    s = str(v)
+    if kind == "email" and "@" in s:
+        loc, dom = s.split("@", 1)
+        return (loc[0] if loc else "*") + "***@" + dom
+    if kind == "card" and len(s) >= 10:
+        return s[:6] + "•" * (len(s) - 10) + s[-4:]
+    if kind == "phone":
+        digits = [c for c in s if c.isdigit()]
+        keep_h = "".join(s[:3])
+        return keep_h + "•" * max(2, min(8, len(digits) - 5)) + \
+            ("".join(digits[-2:]) if len(digits) > 5 else "")
+    if kind == "iban" and len(s) >= 8:
+        return s[:4] + "•" * (len(s) - 8) + s[-4:]
+    if len(s) <= 4:
+        return "•" * len(s)
+    return s[:2] + "•" * min(12, len(s) - 4) + ("…" if len(s) > 16 else "") + s[-2:]
+
+
+# -- Regex universelles (précompilées UNE fois à l'import : performance) ----
+import re as _re_pro
+
+_HEXDIG = b"0123456789abcdefABCDEF"
+RE_PRO_URL = _re_pro.compile(rb"https?://[^\s\"'<>\\\)\]\},;]{5,255}")
+RE_PRO_EMAIL = _re_pro.compile(
+    rb"[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9.\-]{1,255}\.[A-Za-z]{2,24}")
+RE_PRO_PHONE = _re_pro.compile(rb"(?:\+|00)[0-9][0-9 .\-]{6,17}[0-9]")
+RE_PRO_USERPASS = _re_pro.compile(
+    rb"(?:https?://|ftp://|mysql://|postgres://|mongodb://|redis://|amqp://)"
+    rb"([A-Za-z0-9._%\-]{1,64}):([^\s/@:]{1,128})@")
+RE_PRO_JWT = _re_pro.compile(
+    rb"eyJ[A-Za-z0-9_\-]{4,400}\.[A-Za-z0-9_\-]{4,2000}\.[A-Za-z0-9_\-]{4,600}")
+RE_PRO_HEXHASH = _re_pro.compile(rb"\b[0-9a-fA-F]{32}\b|\b[0-9a-fA-F]{40}\b|"
+                                 rb"\b[0-9a-fA-F]{56}\b|\b[0-9a-fA-F]{64}\b|"
+                                 rb"\b[0-9a-fA-F]{96}\b|\b[0-9a-fA-F]{128}\b")
+RE_PRO_B64 = _re_pro.compile(rb"\b[A-Za-z0-9+/]{24,4096}={0,2}\b")
+RE_PRO_PEM = _re_pro.compile(
+    rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?"
+    rb"(?:PRIVATE KEY|PUBLIC KEY|CERTIFICATE|OPENSSH PRIVATE KEY)-----")
+RE_PRO_PWFIELD = _re_pro.compile(
+    rb"(?:user_?password|password|passwd|pwd|pass|secret|token|api[_\-]?key|"
+    rb"apikey|access[_\-]?key|private[_\-]?key|credential|auth|otp)"
+    rb"[\"']?\s*[:=]\s*[\"']?([^\s\"'&,;}{\)\<\>]{3,128})", _re_pro.I)
+RE_PRO_MASKED = _re_pro.compile(
+    rb"\*{3,}|[xX]{4,}\b|\[redacted\]|\[REDACTED\]|\[masqu|\bmasked\b|"
+    rb"<masked>|\bhidden\b|\bREMOVED\b|\xc2\xa2{3,}|\xe2\x80\xa2{3,}")
+RE_PRO_BEARER = _re_pro.compile(rb"[Bb]earer\s+[A-Za-z0-9._\-/=+]{16,2048}")
+RE_PRO_BASIC = _re_pro.compile(rb"[Bb]asic\s+([A-Za-z0-9+/=]{8,512})")
+RE_PRO_NTLM_B64 = _re_pro.compile(rb"TlRMTVNTUA[A-Za-z0-9+/=]{8,2048}")
+RE_PRO_UA = _re_pro.compile(rb"(?:Mozilla|curl|Wget|python-requests|Go-http-client|"
+                            rb"Java|okhttp|PostmanRuntime|Nmap|masscan|ZmEu)/[^\r\n\x00]{2,180}")
+RE_PRO_DOMAIN = _re_pro.compile(
+    rb"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+"
+    rb"(?:com|net|org|edu|gov|mil|int|io|co|dev|local|lan|internal|cloud|ai|me|"
+    rb"info|biz|eu|fr|de|es|it|uk|us|ca|ch|be|nl|se|no|fi|dk|pl|cz|at|pt|ru|cn|"
+    rb"jp|br|in|au|za|mx|ar|tv|xyz|app|sh|gg|ly|to|onion)\b", _re_pro.I)
+
+# Clés API / jetons connus (motifs vérifiés, jamais inventés : chaque motif
+# correspond au format PUBLIC documenté du fournisseur ; statut = OBSERVED,
+# l'outil ne prétend pas qu'ils sont valides, seulement qu'ils sont exposés)
+RE_PRO_APIKEYS = [
+    ("aws_access_key_id", _re_pro.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("github_token", _re_pro.compile(
+        rb"\b(?:ghp_[A-Za-z0-9]{36}|gh[ousr]_[A-Za-z0-9]{36,}|"
+        rb"github_pat_[A-Za-z0-9_]{22,})\b")),
+    ("slack_token", _re_pro.compile(rb"\bxox[baprs]-[A-Za-z0-9\-]{10,72}\b")),
+    ("stripe_key", _re_pro.compile(rb"\b[rs]k_live_[A-Za-z0-9]{16,99}\b")),
+    ("openai_style_key", _re_pro.compile(rb"\bsk-[A-Za-z0-9_\-]{20,255}\b")),
+    ("google_api_key", _re_pro.compile(rb"\bAIza[0-9A-Za-z_\-]{35}\b")),
+    ("sendgrid_key", _re_pro.compile(rb"\bSG\.[A-Za-z0-9_\-]{16,64}\.[A-Za-z0-9_\-]{16,64}\b")),
+    ("twilio_key", _re_pro.compile(rb"\bSK[0-9a-fA-F]{32}\b")),
+    ("gitlab_token", _re_pro.compile(rb"\bglpat-[A-Za-z0-9_\-]{20,26}\b")),
+    ("huggingface_token", _re_pro.compile(rb"\bhf_[A-Za-z0-9]{30,40}\b")),
+    ("npm_token", _re_pro.compile(rb"\bnpm_[A-Za-z0-9]{36}\b")),
+    ("discord_token", _re_pro.compile(
+        rb"\b[A-Za-z0-9_\-]{24,26}\.[A-Za-z0-9_\-]{6,8}\.[A-Za-z0-9_\-]{25,38}\b")),
+    ("jwt_token", RE_PRO_JWT),
+]
+
+# Motifs de hash textuels (formats PUBLICS — signalés, jamais « cassés » ici)
+RE_PRO_TEXTHASHES = [
+    ("bcrypt", _re_pro.compile(rb"\$2[aby]?\$\d{2}\$[./A-Za-z0-9]{53}")),
+    ("argon2", _re_pro.compile(rb"\$argon2(?:i|d|id)?\$v=\d+\$[^\s\"']{10,512}")),
+    ("phpass", _re_pro.compile(rb"\$P\$[./A-Za-z0-9]{31}|\$H\$[./A-Za-z0-9]{31}")),
+    ("sha512crypt", _re_pro.compile(rb"\$6\$[./A-Za-z0-9]{0,16}\$[./A-Za-z0-9]{86}")),
+    ("md5crypt", _re_pro.compile(rb"\$1\$[./A-Za-z0-9]{0,8}\$[./A-Za-z0-9]{22}")),
+    ("scram_sha1", _re_pro.compile(rb"v=[A-Za-z0-9+/=]{28},p=[A-Za-z0-9+/=]{28}")),
+    ("netntlm_style", _re_pro.compile(
+        rb"[A-Za-z0-9._\-]{1,32}::[A-Za-z0-9._\-]{1,32}:[0-9a-fA-F]{16,32}:"
+        rb"[0-9a-fA-F]{32,64}:[0-9a-fA-F]{32,}")),
+]
+
+_LUHN_DIGITS = tuple(range(10))
+
+
+def _pro_luhn(num):
+    """Contrôle de Luhn (cartes bancaires) — évite les faux positifs PII."""
+    s = 0
+    alt = False
+    for ch in reversed(num):
+        d = ch - 48
+        if alt:
+            d *= 2
+            if d > 9:
+                d -= 9
+        s += d
+        alt = not alt
+    return s % 10 == 0
+
+
+def _pro_iban_ok(iban):
+    """Contrôle modulo 97 (ISO 13616) — IBAN valides seulement."""
+    s = iban.upper().replace(b" ", b"")
+    if len(s) < 8 or not s[:2].isalpha():
+        return False
+    rearr = s[4:] + s[:4]
+    n = 0
+    for c in rearr:
+        if 48 <= c <= 57:
+            n = n * 10 + (c - 48)
+        elif 65 <= c <= 90:
+            n = n * 100 + (c - 55)
+        else:
+            return False
+        n %= 97
+    return n == 1
+
+
+# ----------------------------------------------------------------------------
+#  Stockage borné des découvertes (mémoire maîtrisée, troncature signalée)
+# ----------------------------------------------------------------------------
+class ProFinding(object):
+    """Une découverte élémentaire — volontairement UN objet léger (pas de
+    dataclass : 50 000+ instances possibles, __slots__ économise ~40 %)."""
+    __slots__ = ("proto", "field", "value", "kind", "frame", "src", "dst",
+                 "count", "note", "subkind")
+
+    def __init__(self, proto, field, value, kind, frame=0, src="", dst="",
+                 note="", subkind=""):
+        self.proto = proto
+        self.field = field
+        self.value = value
+        self.kind = kind
+        self.frame = frame
+        self.src = src
+        self.dst = dst
+        self.count = 1
+        self.note = note
+        self.subkind = subkind       # email/card/phone/iban → masque adapté
+
+    def display_value(self, redact=False):
+        """Valeur EN CLAIR, toujours (v1.2 : aucun masquage de PII)."""
+        return self.value
+
+    def to_dict(self, redact=False):
+        return {"proto": self.proto, "field": self.field,
+                "value": self.display_value(redact),
+                "value_redacted": False,
+                "kind": self.kind, "frame": self.frame, "src": self.src,
+                "dst": self.dst, "count": self.count, "note": self.note}
+
+
+class ProStore(object):
+    """Réserve de découvertes : déduplication par (proto, champ, valeur),
+    plafonds par champ et global — tout dépassement est COMPTE (honnête)."""
+
+    def __init__(self, max_findings=PRO_MAX_FINDINGS, max_per_field=PRO_MAX_PER_FIELD):
+        self.findings = []
+        self._index = {}
+        self._per_field = Counter()
+        self.max_findings = max_findings
+        self.max_per_field = max_per_field
+        self.dropped_duplicates = 0
+        self.dropped_overflow = 0
+        self.protos = Counter()
+        self.kinds = Counter()
+
+    def add(self, proto, field, value, kind, frame=0, src="", dst="",
+            note="", subkind=""):
+        if value is None:
+            return None
+        val = value if isinstance(value, str) else \
+            value.decode("utf-8", "replace") if isinstance(value, (bytes, bytearray)) else str(value)
+        val = val.strip()
+        if not val or len(val) > 4096:
+            return None
+        key = (proto, field, val)
+        ex = self._index.get(key)
+        if ex is not None:
+            ex.count += 1
+            self.dropped_duplicates += 1
+            return ex
+        if self.max_findings and len(self.findings) >= self.max_findings:
+            self.dropped_overflow += 1
+            return None
+        if self._per_field[key[:2]] >= self.max_per_field:
+            self.dropped_overflow += 1
+            return None
+        self._per_field[key[:2]] += 1
+        f = ProFinding(proto, field, val, kind, frame, src, dst, note, subkind)
+        self.findings.append(f)
+        self._index[key] = f
+        self.protos[proto] += 1
+        self.kinds[kind] += 1
+        return f
+
+
+# ----------------------------------------------------------------------------
+#  Lecteur pcap / pcapng / gzip — streaming, tolérant, UN seul passage
+# ----------------------------------------------------------------------------
+_PCAP_MAGICS = {
+    b"\xd4\xc3\xb2\xa1": ("<", 1000000.0),     # pcap µs, écrit en LE
+    b"\xa1\xb2\xc3\xd4": (">", 1000000.0),     # pcap µs, écrit en BE
+    b"\x4d\x3c\xb2\xa1": ("<", 1000000000.0),  # pcap ns, LE
+    b"\xa1\xb2\x3c\x4d": (">", 1000000000.0),  # pcap ns, BE
+}
+_PCAPNG_SHB = 0x0A0D0D0A
+_PCAPNG_BOM = 0x1A2B3C4D
+
+
+def pro_read_packets(path, dbg=None, stats=None):
+    """Générateur (n°trame, ts_epoch, linktype, octets_bruts).
+
+    pcap classique (µs/ns, BE/LE), pcapng (SHB/IDB/EPB/SPB), gzip
+    transparent. Troncature/corruption : arrêt PROPRE, compté dans stats —
+    les paquets déjà lus sont bien produits (« n'importe quel pcap »).
+    stats est rempli sur place : {"packets","bytes","format","truncated",
+    "read_errors","linktypes"}.
+    """
+    if stats is None:
+        stats = {"packets": 0, "bytes": 0, "format": "?", "truncated": False,
+                 "read_errors": 0, "linktypes": set()}
+    fh = None
+    gz = False
+    try:
+        fh = open(path, "rb")
+        head = fh.read(4)
+        if head[:2] == b"\x1f\x8b":
+            fh.close()
+            fh = gzip.open(path, "rb")
+            gz = True
+            head = fh.read(4)
+        if len(head) < 4:
+            stats["format"] = "vide/trop court"
+            return
+        if head in _PCAP_MAGICS:
+            stats["format"] = "pcap" + (" (gzip)" if gz else "")
+            yield from _pro_read_pcap(fh, head, stats, dbg)
+        else:
+            fh.seek(0)
+            stats["format"] = "pcapng" + (" (gzip)" if gz else "")
+            yield from _pro_read_pcapng(fh, stats, dbg)
+    except OSError as exc:
+        stats["read_errors"] += 1
+        if dbg:
+            dbg(f"lecteur : erreur E/S — {exc}")
+    except EOFError:
+        stats["truncated"] = True
+        if dbg:
+            dbg("lecteur : fin de fichier prématurée (gzip tronqué ?)")
+    except Exception as exc:                      # jamais de crash (§30)
+        stats["read_errors"] += 1
+        if dbg:
+            dbg(f"lecteur : anomalie tolérée — {type(exc).__name__}: {exc}")
+    finally:
+        try:
+            if fh is not None:
+                fh.close()
+        except Exception:
+            pass
+
+
+def _pro_read_pcap(fh, magic, stats, dbg):
+    fmt, tsdiv = _PCAP_MAGICS[magic]
+    ghdr = fh.read(20)
+    if len(ghdr) < 20:
+        stats["truncated"] = True
+        return
+    linktype = struct.unpack(fmt + "I", ghdr[16:20])[0]
+    stats["linktypes"].add(linktype)
+    n = 0
+    while True:
+        rh = fh.read(16)
+        if not rh:
+            break
+        if len(rh) < 16:
+            stats["truncated"] = True
+            break
+        ts_sec, ts_frac, incl, orig = struct.unpack(fmt + "IIII", rh)
+        if incl > 268435456:                       # > 256 Mo : en-tête corrompu
+            stats["read_errors"] += 1
+            if dbg:
+                dbg(f"paquet {n + 1} : longueur invraisemblable ({incl}) — arrêt propre")
+            break
+        data = fh.read(incl)
+        if len(data) < incl:
+            stats["truncated"] = True
+        n += 1
+        stats["packets"] = n
+        stats["bytes"] += len(data)
+        yield n, ts_sec + ts_frac / tsdiv, linktype, data
+        if stats["truncated"]:
+            break
+
+
+def _pro_read_pcapng(fh, stats, dbg):
+    endian = "<"
+    linktypes = {0: 1}                             # interface_id → linktype
+    n = 0
+    while True:
+        bh = fh.read(8)
+        if not bh:
+            break
+        if len(bh) < 8:
+            stats["truncated"] = True
+            break
+        if bh[:4] == struct.pack("<I", _PCAPNG_SHB) or \
+                bh[:4] == struct.pack(">I", _PCAPNG_SHB):
+            total = struct.unpack("<I", bh[4:8])[0]
+            body = fh.read(max(0, total - 12)) if total >= 12 else b""
+            if len(body) + 12 < total:
+                stats["truncated"] = True
+                break
+            if len(body) >= 4:
+                bom = struct.unpack("<I", body[:4])[0]
+                endian = "<" if bom == _PCAPNG_BOM else ">"
+            # options restantes ignorées (déterministe : on ne fait que lire)
+            fh.read(4)                             # total_len de fin
+            continue
+        btype, total = struct.unpack(endian + "II", bh)
+        if total < 12 or total > 268435456:
+            stats["read_errors"] += 1
+            if dbg:
+                dbg(f"bloc pcapng : longueur invalide ({total}) — arrêt propre")
+            break
+        body = fh.read(total - 12)
+        tail = fh.read(4)
+        if len(body) + 12 < total or len(tail) < 4:
+            stats["truncated"] = True
+            break
+        if btype == 0x00000001 and len(body) >= 8:          # IDB
+            iface = len(linktypes) - 1
+            lt = struct.unpack(endian + "H", body[:2])[0]
+            linktypes[max(0, iface)] = lt
+            stats["linktypes"].add(lt)
+        elif btype == 0x00000006 and len(body) >= 20:       # EPB
+            iface, ts_h, ts_l, caplen, _orig = struct.unpack(endian + "IIIII", body[:20])
+            data = body[20:20 + caplen]
+            lt = linktypes.get(iface, 1)
+            n += 1
+            stats["packets"] = n
+            stats["bytes"] += len(data)
+            yield n, (ts_h << 32 | ts_l) / 1000000.0, lt, data
+        elif btype == 0x00000003:                           # SPB (simple)
+            blen = struct.unpack(endian + "I", body[:4])[0] if len(body) >= 4 else 0
+            data = body[4:4 + blen]
+            lt = linktypes.get(0, 1)
+            n += 1
+            stats["packets"] = n
+            stats["bytes"] += len(data)
+            yield n, 0.0, lt, data
+
+
+# ----------------------------------------------------------------------------
+#  Décodage couches 2/3/4 — rapide, défensif, sans allocation inutile
+# ----------------------------------------------------------------------------
+def _pro_ntop4(b):
+    return "%d.%d.%d.%d" % (b[0], b[1], b[2], b[3])
+
+
+def _pro_ntop6(b):
+    try:
+        return socket.inet_ntop(socket.AF_INET6, bytes(b))
+    except Exception:
+        return ":".join("%02x%02x" % (b[i], b[i + 1]) for i in range(0, 16, 2))
+
+
+def pro_link_to_ip(linktype, data):
+    """linktype + trame → (ethertype_ou_None, offset_L3). Radiotap/prism/
+    802.11 : None (les solveurs Wi-Fi dedicated couvrent WEP/SAE/EAPOL ;
+    l'inventaire les COMPTE honnêtement sans prétendre les décoder)."""
+    n = len(data)
+    if linktype == 1:                              # Ethernet
+        if n < 14:
+            return None, 0
+        et = (data[12] << 8) | data[13]
+        off = 14
+        while et in (0x8100, 0x88A8) and n >= off + 4:   # VLAN/QinQ
+            et = (data[off] << 8) | data[off + 1]
+            off += 4
+        return et, off
+    if linktype == 0:                              # NULL/BSD loopback
+        if n < 5:
+            return None, 0
+        af = struct.unpack("=I", data[:4])[0]
+        return {2: 0x0800, 24: 0x86DD, 28: 0x86DD, 30: 0x86DD}.get(af), 4
+    if linktype == 101:                            # RAW IP
+        if n < 1:
+            return None, 0
+        v = data[0] >> 4
+        return 0x0800 if v == 4 else (0x86DD if v == 6 else None), 0
+    if linktype == 113:                            # Linux SLL
+        if n < 16:
+            return None, 0
+        return (data[14] << 8) | data[15], 16
+    if linktype == 276:                            # SLL2
+        if n < 20:
+            return None, 0
+        return (data[0] << 8) | data[1], 20
+    if linktype in (105, 119, 127, 163):                 # radiotap/prism/802.11
+        return "WIFI", 0
+    return None, 0
+
+
+def pro_ip4(data, off):
+    """IPv4 → dict ou None. Fragments non-premiers : payload vide (honnête)."""
+    n = len(data)
+    if off + 20 > n:
+        return None
+    vhl = data[off]
+    if vhl >> 4 != 4:
+        return None
+    ihl = (vhl & 0x0F) * 4
+    if ihl < 20 or off + ihl > n:
+        return None
+    total_len = struct.unpack("!H", data[off + 2:off + 4])[0]
+    flags_frag = struct.unpack("!H", data[off + 6:off + 8])[0]
+    proto = data[off + 9]
+    src = _pro_ntop4(data[off + 12:off + 16])
+    dst = _pro_ntop4(data[off + 16:off + 20])
+    end = min(n, off + total_len) if 20 <= total_len <= n - off else n
+    mf = bool(flags_frag & 0x2000)
+    foff = (flags_frag & 0x1FFF) * 8
+    payload = b"" if (foff or mf) else data[off + ihl:end]
+    return {"v": 4, "proto": proto, "src": src, "dst": dst,
+            "payload": payload, "frag": bool(foff or mf), "ttl": data[off + 8]}
+
+
+def pro_ip6(data, off):
+    """IPv6 → dict ou None (en-têtes d'extension parcourus, fragments gérés)."""
+    n = len(data)
+    if off + 40 > n or data[off] >> 4 != 6:
+        return None
+    plen = struct.unpack("!H", data[off + 4:off + 6])[0]
+    nh = data[off + 6]
+    src = _pro_ntop6(data[off + 8:off + 24])
+    dst = _pro_ntop6(data[off + 24:off + 40])
+    cur = off + 40
+    end = min(n, off + 40 + plen) if 0 <= plen <= n - off - 40 else n
+    hops = 0
+    frag_nonfirst = False
+    while nh in (0, 43, 44, 50, 51, 60, 135, 139, 140, 141) and hops < 8:
+        if nh == 44:                               # Fragment
+            if cur + 8 > end:
+                return None
+            nh = data[cur]
+            fo = struct.unpack("!H", data[cur + 2:cur + 4])[0]
+            frag_nonfirst = (fo >> 3) != 0
+            cur += 8
+        else:
+            if cur + 2 > end:
+                return None
+            nxt = data[cur]
+            ext_len = (data[cur + 1] + 1) * 8
+            nh = nxt
+            cur += ext_len
+        hops += 1
+    payload = b"" if frag_nonfirst else data[cur:end]
+    return {"v": 6, "proto": nh, "src": src, "dst": dst,
+            "payload": payload, "frag": frag_nonfirst, "ttl": None}
+
+
+def pro_tcp(ip):
+    pl = ip["payload"]
+    if len(pl) < 20:
+        return None
+    sport, dport = struct.unpack("!HH", pl[:4])
+    doff = (pl[12] >> 4) * 4
+    if doff < 20 or len(pl) < doff:
+        return None
+    return {"sport": sport, "dport": dport, "flags": pl[13],
+            "payload": pl[doff:],
+            "seq": struct.unpack("!I", pl[4:8])[0]}
+
+
+def pro_udp(ip):
+    pl = ip["payload"]
+    if len(pl) < 8:
+        return None
+    sport, dport, ulen = struct.unpack("!HHH", pl[:6])
+    end = min(len(pl), 8 + max(0, ulen - 8)) if 8 <= ulen <= len(pl) else len(pl)
+    return {"sport": sport, "dport": dport, "flags": 0, "payload": pl[8:end]}
+
+
+def pro_arp(ip_layer_raw):
+    """ARP → (sha, spa, tha, tpa) ou None — identités IP↔MAC."""
+    d = ip_layer_raw
+    if len(d) < 28:
+        return None
+    op = struct.unpack("!H", d[6:8])[0]
+    sha = ":".join("%02x" % b for b in d[8:14])
+    spa = _pro_ntop4(d[14:18])
+    tha = ":".join("%02x" % b for b in d[18:24])
+    tpa = _pro_ntop4(d[24:28])
+    return op, sha, spa, tha, tpa
+
+
+# ----------------------------------------------------------------------------
+#  Parseurs protocolaires — chacun ISOLÉ (une anomalie ne touche que lui),
+#  déclenchés par port OU reniflage structurel (jamais tous sur tout).
+#  Chaque parseur reçoit : payload (bytes), contexte (frame/src/dst/ports),
+#  et le magasin `st` (ProStore) ; il retourne le nombre d'ajouts.
+# ----------------------------------------------------------------------------
+def _pro_text(pl, limit=8192):
+    """Payload → texte latin-1 borné (fidèle aux octets, zéro exception)."""
+    return bytes(pl[:limit]).decode("latin-1")
+
+
+def _pro_lines(pl, limit=8192):
+    return _pro_text(pl, limit).replace("\r", "").split("\n")
+
+
+def px_dns(pl, ctx, st, only=None):
+    """DNS (53/5353/5354) : questions, réponses A/AAAA/CNAME/PTR/MX/TXT/SRV."""
+    n = len(pl)
+    if n < 12:
+        return 0
+    added = 0
+    qd = struct.unpack("!H", pl[4:6])[0]
+    an = struct.unpack("!H", pl[6:8])[0]
+    if qd > 64 or an > 512:
+        return 0
+
+    def name_at(off, depth=0):
+        # nom DNS avec compression (pointeurs 0xC0) — borné en profondeur
+        labels = []
+        seen_ptrs = 0
+        cur = off
+        jumped = False
+        ret = off
+        while cur < n and len(labels) < 64:
+            ln = pl[cur]
+            if ln == 0:
+                if not jumped:
+                    ret = cur + 1
+                break
+            if ln & 0xC0 == 0xC0:
+                if cur + 2 > n or seen_ptrs > 16:
+                    break
+                ptr = ((ln & 0x3F) << 8) | pl[cur + 1]
+                if not jumped:
+                    ret = cur + 2
+                jumped = True
+                seen_ptrs += 1
+                cur = ptr
+                continue
+            if ln & 0xC0 or cur + 1 + ln > n:
+                break
+            labels.append(pl[cur + 1:cur + 1 + ln].decode("ascii", "replace"))
+            cur += 1 + ln
+        return ".".join(labels), ret
+
+    off = 12
+    proto = ctx.get("proto_name", "dns")
+    for _ in range(min(qd, 16)):
+        qn, off = name_at(off)
+        if off + 4 > n:
+            break
+        qt = struct.unpack("!H", pl[off:off + 2])[0]
+        off += 4
+        if qn:
+            st.add(proto, "question", qn, K_IDENTITY, **ctx["fk"])
+            added += 1
+            if qt:
+                st.add(proto, "qtype", {1: "A", 2: "NS", 5: "CNAME", 6: "SOA",
+                                        12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA",
+                                        33: "SRV", 35: "NAPTR", 43: "DS",
+                                        46: "RRSIG", 48: "DNSKEY", 257: "CAA"
+                                        }.get(qt, str(qt)), K_METADATA, **ctx["fk"])
+    rtypes = {1: ("A", K_IDENTITY), 2: ("NS", K_IDENTITY), 5: ("CNAME", K_IDENTITY),
+              12: ("PTR", K_IDENTITY), 15: ("MX", K_IDENTITY), 16: ("TXT", K_METADATA),
+              28: ("AAAA", K_IDENTITY), 33: ("SRV", K_IDENTITY)}
+    for _ in range(min(an, 64)):
+        _rn, off = name_at(off)
+        if off + 10 > n:
+            break
+        rtype = struct.unpack("!H", pl[off:off + 2])[0]
+        rdlen = struct.unpack("!H", pl[off + 8:off + 10])[0]
+        off += 10
+        if off + rdlen > n or rdlen > 4096:
+            break
+        rd = pl[off:off + rdlen]
+        off += rdlen
+        lbl, kind = rtypes.get(rtype, (None, None))
+        if lbl == "A" and rdlen == 4:
+            st.add(proto, "answer_A", _pro_ntop4(rd), K_IDENTITY, **ctx["fk"])
+            added += 1
+        elif lbl == "AAAA" and rdlen == 16:
+            st.add(proto, "answer_AAAA", _pro_ntop6(rd), K_IDENTITY, **ctx["fk"])
+            added += 1
+        elif lbl in ("CNAME", "NS", "PTR", "MX", "SRV"):
+            base = 2 if lbl in ("MX", "SRV") else 0
+            nm, _ = name_at(off - rdlen + base)
+            if nm:
+                st.add(proto, "answer_" + lbl, nm, K_IDENTITY, **ctx["fk"])
+                added += 1
+        elif lbl == "TXT":
+            i = 0
+            txt = []
+            while i < rdlen:
+                tl = rd[i]
+                if i + 1 + tl > rdlen or tl == 0:
+                    break
+                txt.append(rd[i + 1:i + 1 + tl].decode("utf-8", "replace"))
+                i += 1 + tl
+            val = "".join(txt)
+            if val:
+                st.add(proto, "answer_TXT", val[:512], K_METADATA, **ctx["fk"])
+                added += 1
+    return added
+
+
+def px_http(pl, ctx, st, only=None):
+    """HTTP : requêtes/réponses, en-têtes sensibles (Authorization/Cookie/
+    Set-Cookie/X-Api-Key…), Basic décodé, formulaires, User-Agent, HSTS…"""
+    txt = _pro_text(pl, 32768)
+    if not txt:
+        return 0
+    added = 0
+    fk = ctx["fk"]
+    head, _, body = txt.partition("\n\n") if "\n\n" in txt else \
+        (txt.partition("\r\n\r\n")[0], None, txt.partition("\r\n\r\n")[2])
+    lines = head.replace("\r", "").split("\n")
+    verbs = ("GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH",
+             "TRACE", "CONNECT")
+    first = lines[0] if lines else ""
+    is_req = first.split(" ", 1)[0] in verbs if first else False
+    if is_req:
+        parts = first.split(" ")
+        if len(parts) >= 2:
+            st.add("http", "method", parts[0], K_METADATA, **fk)
+            url = parts[1]
+            st.add("http", "url", url[:512], K_IDENTITY, **fk)
+            added += 1
+            if "?" in url:
+                qs = url.split("?", 1)[1]
+                for kv in qs.split("&"):
+                    k, _, v = kv.partition("=")
+                    if k.lower() in ("password", "passwd", "pwd", "pass",
+                                     "secret", "token", "api_key", "apikey",
+                                     "key", "auth", "code", "otp") and v:
+                        st.add("http", "querystring_secret",
+                               f"{k}={v[:128]}", K_SECRET,
+                               note="secret dans l'URL (visible par tous les intermédiaires)", **fk)
+                        added += 1
+    elif first.startswith("HTTP/"):
+        st.add("http", "status", first[:32], K_METADATA, **fk)
+    host = ""
+    for ln in lines[1:]:
+        if ":" not in ln:
+            continue
+        k, _, v = ln.partition(":")
+        k = k.strip().lower()
+        v = v.strip()
+        if not v:
+            continue
+        if k == "host":
+            host = v[:255]
+            st.add("http", "host", host, K_IDENTITY, **fk)
+            added += 1
+        elif k == "authorization":
+            added += 1
+            if v.lower().startswith("basic "):
+                st.add("http", "authorization", v[:128], K_SECRET, **fk)
+                try:
+                    dec = base64.b64decode(v[6:].strip() + "===")
+                    s = dec.decode("utf-8", "replace")
+                    if ":" in s:
+                        u, _, p = s.partition(":")
+                        st.add("http", "basic_user", u[:128], K_IDENTITY, **fk)
+                        st.add("http", "basic_password", p[:256], K_SECRET,
+                               note="HTTP Basic = base64, AUCUN chiffrement", **fk)
+                except Exception:
+                    pass
+            elif v.lower().startswith("digest "):
+                st.add("http", "authorization", v[:256], K_SECRET,
+                       note="digest HTTP : pas de mode hashcat natif (cf. rapport)", **fk)
+                for fld in ("username", "realm", "nonce", "uri", "response"):
+                    m = _re_pro.search(('%s="([^"]{1,256})"' % fld).encode(),
+                                       v.encode("latin-1", "replace"))
+                    if m:
+                        kk = K_IDENTITY if fld in ("username", "realm", "uri") else K_SECRET
+                        st.add("http", "digest_" + fld,
+                               m.group(1).decode("latin-1"), kk, **fk)
+            else:
+                st.add("http", "authorization", v[:256], K_SECRET, **fk)
+        elif k == "proxy-authorization":
+            st.add("http", "proxy-authorization", v[:256], K_SECRET, **fk)
+            added += 1
+        elif k in ("cookie", "set-cookie"):
+            st.add("http", k, v[:512], K_SECRET,
+                   note="session/jeton transmis — sensible" if k == "cookie"
+                   else "serveur pose un jeton", **fk)
+            added += 1
+            m = _re_pro.search(rb"[Ss]ession[^=]{0,8}=([^\s;]{6,128})",
+                               v.encode("latin-1", "replace"))
+            if m:
+                st.add("http", "session_id", m.group(1).decode("latin-1")[:128],
+                       K_SECRET, **fk)
+        elif k in ("x-api-key", "x-auth-token", "x-csrf-token", "x-xsrf-token",
+                   "x-forwarded-for", "x-real-ip", "x-amz-security-token",
+                   "x-functions-key", "ocp-apim-subscription-key"):
+            kk = K_SECRET if "token" in k or "key" in k else K_IDENTITY
+            st.add("http", k, v[:512], kk, **fk)
+            added += 1
+        elif k == "user-agent":
+            st.add("http", "user-agent", v[:255], K_METADATA, **fk)
+            added += 1
+        elif k == "www-authenticate":
+            st.add("http", "www-authenticate", v[:255], K_METADATA, **fk)
+            added += 1
+        elif k == "location":
+            st.add("http", "location", v[:512], K_METADATA, **fk)
+        elif k == "server":
+            st.add("http", "server", v[:255], K_METADATA, **fk)
+        elif k == "referer" and ("password" in v.lower() or "token" in v.lower()):
+            st.add("http", "referer", v[:512], K_SECRET,
+                   note="URL sensible dans Referer", **fk)
+    if body:
+        bl = body[:PRO_MINE_BYTES]
+        ctype_form = any(l.lower().startswith("content-type:") and
+                         "x-www-form-urlencoded" in l.lower() for l in lines[1:])
+        if ctype_form or "=" in bl[:2048]:
+            for kv in bl.split("&"):
+                k, _, v = kv.partition("=")
+                k = k.strip().lower()[:64]
+                if not v or not k:
+                    continue
+                if any(t in k for t in ("pass", "pwd", "secret", "token",
+                                        "key", "auth", "otp", "cvv", "pin")):
+                    st.add("http", "form_secret", f"{k}={v.strip()[:128]}",
+                           K_SECRET, note="champ de formulaire sensible", **fk)
+                    added += 1
+                elif k in ("user", "username", "login", "email", "mail",
+                           "user_id", "userid", "account", "j_username"):
+                    st.add("http", "form_user", v.strip()[:128], K_IDENTITY, **fk)
+                    added += 1
+    return added
+
+
+def _pro_der_tlv(buf, off):
+    """TLV BER/DER minimal → (tag, valeur_bytes, prochain_offset) ou None."""
+    n = len(buf)
+    if off >= n:
+        return None
+    tag = buf[off]
+    off += 1
+    if off >= n:
+        return None
+    ln = buf[off]
+    off += 1
+    if ln & 0x80:
+        nb = ln & 0x7F
+        if nb == 0 or nb > 4 or off + nb > n:
+            return None
+        ln = int.from_bytes(buf[off:off + nb], "big")
+        off += nb
+    if ln > n - off or ln > 4 * 1024 * 1024:
+        return None
+    return tag, buf[off:off + ln], off + ln
+
+
+def _pro_x509_summary(der):
+    """Certificat X.509 DER → dictionnaire best-effort (CN/émetteur/série/
+    validité/SAN DNS). Parseur ciblé borné — jamais d'exception vers le haut."""
+    out = {}
+    try:
+        t = _pro_der_tlv(der, 0)                     # Certificate SEQUENCE
+        if not t or t[0] != 0x30:
+            return out
+        tbs = _pro_der_tlv(t[1], 0)                  # TBSCertificate
+        if not tbs or tbs[0] != 0x30:
+            return out
+        body = tbs[1]
+        off = 0
+        first = _pro_der_tlv(body, off)
+        if first and first[0] == 0xA0:               # version explicite
+            off = first[2]
+        ser = _pro_der_tlv(body, off)                # serialNumber INTEGER
+        if ser and ser[0] == 0x02:
+            out["serial"] = ser[1].hex()[:64]
+            off = ser[2]
+        sig = _pro_der_tlv(body, off)                # signature AlgorithmId
+        if sig:
+            off = sig[2]
+        iss = _pro_der_tlv(body, off)                # issuer Name
+        if iss:
+            out["issuer"] = _pro_der_cn(iss[1])
+            off = iss[2]
+        val = _pro_der_tlv(body, off)                # validity
+        if val:
+            times = []
+            o2 = 0
+            for _ in range(2):
+                tt = _pro_der_tlv(val[1], o2)
+                if not tt:
+                    break
+                times.append(tt[1].decode("ascii", "replace"))
+                o2 = tt[2]
+            if len(times) == 2:
+                out["not_before"], out["not_after"] = times
+            off = val[2]
+        sub = _pro_der_tlv(body, off)                # subject Name
+        if sub:
+            out["subject"] = _pro_der_cn(sub[1])
+            off = sub[2]
+        # SAN : recherche ciblée des dNSName [context 2] dans les extensions
+        ext_root = None
+        while off < len(body):
+            t2 = _pro_der_tlv(body, off)
+            if not t2:
+                break
+            if t2[0] == 0xA3:
+                ext_root = t2[1]
+                break
+            off = t2[2]
+        if ext_root:
+            seq = _pro_der_tlv(ext_root, 0)
+            if seq and seq[0] == 0x30:
+                exts = _pro_der_tlv(seq[1], 0)
+                if exts and exts[0] == 0x30:
+                    eoff = 0
+                    cnt = 0
+                    while eoff < len(exts[1]) and cnt < 64:
+                        e = _pro_der_tlv(exts[1], eoff)
+                        if not e or e[0] != 0x30:
+                            break
+                        eoff = e[2]
+                        cnt += 1
+                        oid = _pro_der_tlv(e[1], 0)
+                        if not oid or oid[0] != 0x06:
+                            continue
+                        if oid[1] == bytes.fromhex("551d11"):      # SAN
+                            ov = _pro_der_tlv(e[1], oid[2])
+                            if ov and ov[0] == 0x04:
+                                san_seq = _pro_der_tlv(ov[1], 0)
+                                if san_seq and san_seq[0] == 0x30:
+                                    soff, names = 0, []
+                                    while soff < len(san_seq[1]) and len(names) < 32:
+                                        g = _pro_der_tlv(san_seq[1], soff)
+                                        if not g:
+                                            break
+                                        soff = g[2]
+                                        if g[0] == 0x82:           # dNSName
+                                            names.append(
+                                                g[1].decode("ascii", "replace"))
+                                    if names:
+                                        out["san_dns"] = names
+    except Exception:
+        pass
+    return out
+
+
+def _pro_der_cn(name_body):
+    """Extrait le(s) CN d'un Name DER (OID 2.5.4.3 = 55 04 03)."""
+    try:
+        idx = name_body.find(b"\x55\x04\x03")
+        if idx < 0:
+            return ""
+        t = _pro_der_tlv(name_body[idx:], 3)
+        if not t:
+            # le TLV commence au type après l'OID (0x0C/0x13/0x16)
+            for start in (3, 4):
+                if idx + start < len(name_body):
+                    t = _pro_der_tlv(name_body, idx + start)
+                    if t and t[0] in (0x0C, 0x13, 0x16, 0x1E):
+                        break
+                    t = None
+        if t and t[0] in (0x0C, 0x13, 0x16, 0x1E):
+            return t[1].decode("utf-8", "replace")[:128]
+    except Exception:
+        pass
+    return ""
+
+
+class ProStreams(object):
+    """Réassemblage TCP BORNÉ pour les protocoles à enregistrements multiples
+    (TLS : certificats répartis sur plusieurs segments). Plafond par flux,
+    plafond de flux, éviction FIFO — mémoire strictement maîtrisée."""
+
+    def __init__(self, max_streams=PRO_MAX_STREAMS, max_bytes=PRO_STREAM_BYTES):
+        self.bufs = OrderedDict()
+        self.max_streams = max_streams
+        self.max_bytes = max_bytes
+
+    def feed(self, key, chunk):
+        buf = self.bufs.get(key)
+        if buf is None:
+            if len(self.bufs) >= self.max_streams:
+                self.bufs.popitem(last=False)
+            buf = bytearray()
+            self.bufs[key] = buf
+        room = self.max_bytes - len(buf)
+        if room > 0:
+            buf.extend(chunk[:room])
+        return buf
+
+    def consume(self, key, n):
+        buf = self.bufs.get(key)
+        if buf is not None:
+            del buf[:n]
+
+    def drop(self, key):
+        self.bufs.pop(key, None)
+
+
+def px_tls(pl, ctx, st, streams=None, key=None, only=None):
+    """TLS : ClientHello (SNI, ALPN, version), ServerHello, certificats
+    X.509 (sujet/émetteur/série/validité/SAN). Réassemblage borné via
+    ProStreams quand les enregistrements débordent un segment."""
+    buf = pl
+    if streams is not None and key is not None:
+        buf = streams.feed(key, pl)
+    consumed = 0
+    added = 0
+    fk = ctx["fk"]
+    n = len(buf)
+    while consumed + 5 <= n:
+        ctype = buf[consumed]
+        if ctype not in (20, 21, 22, 23, 24):
+            break
+        ver = struct.unpack("!H", buf[consumed + 1:consumed + 3])[0]
+        rlen = struct.unpack("!H", buf[consumed + 3:consumed + 5])[0]
+        if ver not in (0x0300, 0x0301, 0x0302, 0x0303, 0x0304) or rlen > 20480:
+            break
+        if consumed + 5 + rlen > n:
+            break                                   # enregistrement incomplet
+        rec = bytes(buf[consumed + 5:consumed + 5 + rlen])
+        consumed += 5 + rlen
+        if ctype == 22:
+            added += _pro_tls_handshake(rec, ctx, st)
+        elif ctype == 21 and rlen >= 2:
+            st.add("tls", "alert", f"{rec[0]}/{rec[1]}", K_METADATA, **fk)
+    if streams is not None and key is not None and consumed:
+        streams.consume(key, consumed)
+        if not streams.bufs.get(key):
+            streams.drop(key)
+    return added
+
+
+def _pro_tls_handshake(rec, ctx, st):
+    added = 0
+    fk = ctx["fk"]
+    off = 0
+    while off + 4 <= len(rec):
+        ht = rec[off]
+        hlen = int.from_bytes(rec[off + 1:off + 4], "big")
+        body = rec[off + 4:off + 4 + hlen]
+        off += 4 + hlen
+        if hlen > 65536:
+            break
+        if ht == 1 and len(body) >= 38:              # ClientHello
+            st.add("tls", "handshake", "ClientHello", K_METADATA, **fk)
+            ver = struct.unpack("!H", body[:2])[0]
+            st.add("tls", "version_offerte",
+                   {0x0301: "TLS1.0", 0x0302: "TLS1.1", 0x0303: "TLS1.2",
+                    0x0304: "TLS1.3"}.get(ver, hex(ver)), K_METADATA, **fk)
+            p = 34
+            try:
+                sidlen = body[p]
+                p += 1 + sidlen
+                cslen = struct.unpack("!H", body[p:p + 2])[0]
+                p += 2 + cslen
+                cmlen = body[p]
+                p += 1 + cmlen
+                ext_total = struct.unpack("!H", body[p:p + 2])[0]
+                p += 2
+                end = p + ext_total
+                while p + 4 <= min(end, len(body)):
+                    et = struct.unpack("!H", body[p:p + 2])[0]
+                    el = struct.unpack("!H", body[p + 2:p + 4])[0]
+                    ev = body[p + 4:p + 4 + el]
+                    p += 4 + el
+                    if et == 0x0000 and len(ev) > 5:      # SNI
+                        nl = struct.unpack("!H", ev[3:5])[0]
+                        sni = ev[5:5 + nl].decode("ascii", "replace")
+                        if sni:
+                            st.add("tls", "sni", sni, K_IDENTITY, **fk)
+                            added += 1
+                    elif et == 0x0010 and len(ev) > 2:    # ALPN
+                        q = 2
+                        protos = []
+                        while q < len(ev) and len(protos) < 8:
+                            ln = ev[q]
+                            if q + 1 + ln > len(ev) or ln == 0:
+                                break
+                            protos.append(ev[q + 1:q + 1 + ln].decode("ascii", "replace"))
+                            q += 1 + ln
+                        if protos:
+                            st.add("tls", "alpn", ",".join(protos), K_METADATA, **fk)
+                            added += 1
+                    elif et == 0x0029 and ev:             # pre_shared_key
+                        st.add("tls", "extension_psk", "présente",
+                               K_METADATA, note="TLS1.3 PSK — réutilisation de session", **fk)
+            except (IndexError, struct.error):
+                st.add("tls", "clienthello", "parse partiel (structure inhabituelle)",
+                       K_METADATA, **fk)
+        elif ht == 2 and len(body) >= 2:             # ServerHello
+            ver = struct.unpack("!H", body[:2])[0]
+            st.add("tls", "version_négociée",
+                   {0x0301: "TLS1.0", 0x0302: "TLS1.1", 0x0303: "TLS1.2",
+                    0x0304: "TLS1.3"}.get(ver, hex(ver)), K_METADATA, **fk)
+        elif ht == 11 and len(body) >= 3:            # Certificate
+            total = int.from_bytes(body[:3], "big")
+            q = 3
+            ncert = 0
+            while q + 3 <= len(body) and q - 3 < total and ncert < 8:
+                clen = int.from_bytes(body[q:q + 3], "big")
+                q += 3
+                if clen <= 0 or q + clen > len(body):
+                    break
+                info = _pro_x509_summary(body[q:q + clen])
+                q += clen
+                ncert += 1
+                role = "leaf" if ncert == 1 else f"ca{ncert - 1}"
+                if info.get("subject"):
+                    st.add("tls", f"cert_{role}_subject", info["subject"], K_IDENTITY, **fk)
+                    added += 1
+                if info.get("issuer"):
+                    st.add("tls", f"cert_{role}_issuer", info["issuer"], K_IDENTITY, **fk)
+                if info.get("serial"):
+                    st.add("tls", f"cert_{role}_serial", info["serial"], K_METADATA, **fk)
+                if info.get("not_before"):
+                    st.add("tls", f"cert_{role}_validité",
+                           f"{info['not_before']} → {info.get('not_after', '?')}",
+                           K_METADATA, **fk)
+                for d in (info.get("san_dns") or [])[:8]:
+                    st.add("tls", "cert_san_dns", d, K_IDENTITY, **fk)
+                    added += 1
+    return added
+
+
+def _pro_text_auth(proto, pl, ctx, st, cmds, only=None):
+    """Motif commun FTP/POP3/IMAP/SMTP/IRC/Redis : commandes en clair."""
+    added = 0
+    fk = ctx["fk"]
+    for raw in _pro_lines(pl, 8192):
+        ln = raw.strip()
+        if not ln or len(ln) > 2048:
+            continue
+        up = ln.upper()
+        for prefix, field, kind, note in cmds:
+            if up.startswith(prefix):
+                val = ln[len(prefix):].strip()
+                if not val:
+                    continue
+                if kind == "B64PAIR":
+                    try:
+                        dec = base64.b64decode(val + "===").decode("utf-8", "replace")
+                        if ":" in dec:
+                            u, _, p = dec.partition(":")
+                            st.add(proto, field + "_user", u[:128], K_IDENTITY, **fk)
+                            st.add(proto, field + "_password", p[:256], K_SECRET,
+                                   note=note, **fk)
+                            added += 2
+                        elif dec:
+                            st.add(proto, field, dec[:256], K_SECRET, note=note, **fk)
+                            added += 1
+                    except Exception:
+                        st.add(proto, field, val[:256], K_METADATA,
+                               note="base64 non décodable", **fk)
+                else:
+                    st.add(proto, field, val[:256], kind, note=note, **fk)
+                    added += 1
+                break
+    return added
+
+
+def px_ftp(pl, ctx, st, only=None):
+    return _pro_text_auth("ftp", pl, ctx, st, [
+        ("USER ", "user", K_IDENTITY, ""),
+        ("PASS ", "password", K_SECRET, "mot de passe FTP EN CLAIR sur le réseau"),
+        ("ACCT ", "account", K_IDENTITY, ""),
+        ("AUTH ", "auth_mech", K_METADATA, ""),
+    ])
+
+
+def px_pop3(pl, ctx, st, only=None):
+    return _pro_text_auth("pop3", pl, ctx, st, [
+        ("USER ", "user", K_IDENTITY, ""),
+        ("PASS ", "password", K_SECRET, "mot de passe POP3 EN CLAIR"),
+        ("AUTH PLAIN ", "auth_plain", "B64PAIR", "POP3 AUTH PLAIN = base64(user\\0pass)"),
+        ("APOP ", "apop_challenge_response", K_SECRET,
+         "APOP : challenge+digest MD5 (mode hashcat 20 via le pipeline)"),
+    ])
+
+
+def px_imap(pl, ctx, st, only=None):
+    added = 0
+    fk = ctx["fk"]
+    for raw in _pro_lines(pl, 8192):
+        ln = raw.strip()
+        if not ln:
+            continue
+        low = ln.lower()
+        if " login " in low:
+            parts = ln.split(None, 3)
+            if len(parts) >= 4:
+                u = parts[2].strip('"')
+                p = parts[3].strip('"')
+                st.add("imap", "user", u[:128], K_IDENTITY, **fk)
+                st.add("imap", "password", p[:256], K_SECRET,
+                       note="IMAP LOGIN EN CLAIR", **fk)
+                added += 2
+        elif "authenticate plain" in low:
+            tok = ln.split()
+            if tok:
+                b64 = tok[-1]
+                try:
+                    dec = base64.b64decode(b64 + "===").decode("utf-8", "replace")
+                    segs = dec.split("\x00")
+                    if len(segs) >= 3:
+                        st.add("imap", "user", segs[1][:128], K_IDENTITY, **fk)
+                        st.add("imap", "password", segs[2][:256], K_SECRET,
+                               note="IMAP AUTHENTICATE PLAIN = base64", **fk)
+                        added += 2
+                except Exception:
+                    pass
+    return added
+
+
+def px_smtp(pl, ctx, st, only=None):
+    added = _pro_text_auth("smtp", pl, ctx, st, [
+        ("EHLO ", "ehlo_domain", K_IDENTITY, ""),
+        ("HELO ", "helo_domain", K_IDENTITY, ""),
+        ("MAIL FROM:", "mail_from", K_IDENTITY, ""),
+        ("RCPT TO:", "rcpt_to", K_IDENTITY, ""),
+        ("AUTH PLAIN ", "auth_plain", "B64PAIR", "SMTP AUTH PLAIN = base64 — EN CLAIR"),
+    ])
+    fk = ctx["fk"]
+    for raw in _pro_lines(pl, 16384):
+        ln = raw.strip()
+        if not ln:
+            continue
+        if ln.upper().startswith("AUTH LOGIN"):
+            st.add("smtp", "auth_login", "session AUTH LOGIN détectée",
+                   K_SECRET, note="les lignes base64 suivantes = user puis mot de passe", **fk)
+            added += 1
+        for hdr in ("From:", "To:", "Subject:", "Reply-To:", "Cc:", "Bcc:"):
+            if ln.startswith(hdr) and len(ln) > len(hdr) + 1:
+                v = ln[len(hdr):].strip()
+                kind = K_METADATA if hdr == "Subject:" else K_IDENTITY
+                st.add("smtp", "header_" + hdr.rstrip(":").lower(), v[:256], kind, **fk)
+                added += 1
+                break
+        # ligne base64 isolée juste après AUTH LOGIN : user/pass en base64
+        if 4 <= len(ln) <= 256 and _re_pro.fullmatch(r"[A-Za-z0-9+/=]+", ln):
+            try:
+                dec = base64.b64decode(ln + "===").decode("utf-8", "strict")
+                if dec and all(32 <= ord(c) < 127 for c in dec):
+                    st.add("smtp", "auth_login_b64", dec[:256], K_SECRET,
+                           note="ligne base64 AUTH LOGIN décodée (user OU mot de passe)", **fk)
+                    added += 1
+            except Exception:
+                pass
+    return added
+
+
+def px_telnet(pl, ctx, st, only=None):
+    """Telnet : bannières + négociation. Les mots de passe telnet sont tapés
+    CARACTÈRE PAR CARACTÈRE (écho) — extraction non fiable ; la session est
+    signalée honnêtement (§42), le minage générique couvre les échos de ligne."""
+    added = 0
+    fk = ctx["fk"]
+    clean = bytearray()
+    i = 0
+    n = len(pl)
+    while i < n:
+        if pl[i] == 0xFF and i + 1 < n:
+            cmd = pl[i + 1]
+            if cmd in (0xFB, 0xFC, 0xFD, 0xFE):
+                i += 3
+                continue
+            if cmd == 0xFA:
+                j = pl.find(b"\xff\xf0", i)
+                i = (j + 2) if j >= 0 else n
+                continue
+            i += 2
+            continue
+        clean.append(pl[i])
+        i += 1
+    txt = bytes(clean).decode("latin-1")
+    for ln in txt.replace("\r", "").split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        low = ln.lower()
+        if any(t in low for t in ("login:", "username:", "password:",
+                                  "user:", "welcome", "banner")):
+            st.add("telnet", "prompt", ln[:200], K_METADATA,
+                   note="session telnet EN CLAIR (aucun chiffrement)", **fk)
+            added += 1
+            if "password" in low or "login" in low or "user" in low:
+                st.add("telnet", "exposition", "session d'authentification en clair",
+                       K_SECRET, note="telnet transmet TOUT en clair", **fk)
+    return added
+
+
+def px_ssh(pl, ctx, st, only=None):
+    fk = ctx["fk"]
+    txt = _pro_text(pl, 512)
+    if txt.startswith("SSH-"):
+        banner = txt.split("\n", 1)[0].split("\r", 1)[0][:255]
+        st.add("ssh", "banner", banner, K_METADATA,
+               note="échange de versions SSH (le reste est chiffré)", **fk)
+        return 1
+    return 0
+
+
+def px_irc(pl, ctx, st, only=None):
+    return _pro_text_auth("irc", pl, ctx, st, [
+        ("NICK ", "nick", K_IDENTITY, ""),
+        ("USER ", "user_line", K_IDENTITY, ""),
+        ("PASS ", "password", K_SECRET, "mot de passe IRC EN CLAIR"),
+        ("JOIN ", "channel", K_IDENTITY, ""),
+    ])
+
+
+def px_xmpp(pl, ctx, st, only=None):
+    added = 0
+    fk = ctx["fk"]
+    txt = _pro_text(pl, 32768)
+    m = _re_pro.search(r"<stream:stream[^>]*to=['\"]([^'\"]{1,255})['\"]", txt)
+    if m:
+        st.add("xmpp", "stream_to", m.group(1), K_IDENTITY, **fk)
+        added += 1
+    for mech in _re_pro.finditer(r"<auth[^>]*mechanism=['\"]([^'\"]{1,64})['\"][^>]*>([^<]{0,4096})", txt):
+        name, payload = mech.group(1), mech.group(2).strip()
+        st.add("xmpp", "auth_mechanism", name, K_METADATA, **fk)
+        added += 1
+        if payload:
+            try:
+                dec = base64.b64decode(payload + "===").decode("utf-8", "replace")
+                if name.upper().startswith("PLAIN") and dec.count("\x00") >= 2:
+                    segs = dec.split("\x00")
+                    st.add("xmpp", "auth_user", segs[1][:128], K_IDENTITY, **fk)
+                    st.add("xmpp", "auth_password", segs[2][:256], K_SECRET,
+                           note="XMPP PLAIN = EN CLAIR (base64)", **fk)
+                    added += 2
+                elif "SCRAM" in name.upper() and dec.startswith("n,,"):
+                    for kv in dec[3:].split(","):
+                        if kv.startswith("n="):
+                            st.add("xmpp", "scram_username", kv[2:130], K_IDENTITY, **fk)
+                            added += 1
+                        elif kv.startswith("r="):
+                            st.add("xmpp", "scram_nonce", kv[2:130], K_METADATA, **fk)
+                elif dec:
+                    st.add("xmpp", "auth_payload", dec[:256], K_SECRET, **fk)
+                    added += 1
+            except Exception:
+                pass
+    m = _re_pro.search(r"<iq[^>]*type=['\"]set['\"][^>]*>.*?<username>([^<]{1,128})</username>"
+                       r".*?<password>([^<]{1,256})</password>", txt, _re_pro.S)
+    if m:
+        st.add("xmpp", "iq_username", m.group(1), K_IDENTITY, **fk)
+        st.add("xmpp", "iq_password", m.group(2), K_SECRET,
+               note="jabber:iq:auth EN CLAIR", **fk)
+        added += 2
+    return added
+
+
+def px_ldap(pl, ctx, st, only=None):
+    """LDAP : BindRequest (DN + mot de passe simple en clair). BER minimal."""
+    added = 0
+    fk = ctx["fk"]
+    off = 0
+    for _ in range(8):                               # quelques messages max/paquet
+        t = _pro_der_tlv(pl, off)
+        if not t or t[0] != 0x30:
+            break
+        off = t[2]
+        msg = t[1]
+        mid = _pro_der_tlv(msg, 0)                   # messageID INTEGER
+        if not mid or mid[0] != 0x02:
+            continue
+        op = _pro_der_tlv(msg, mid[2])               # opération applicative
+        if not op:
+            continue
+        if op[0] == 0x60:                            # BindRequest
+            body = op[1]
+            ver = _pro_der_tlv(body, 0)
+            if not ver:
+                continue
+            dn = _pro_der_tlv(body, ver[2])
+            if not dn or dn[0] != 0x04:
+                continue
+            dn_s = dn[1].decode("utf-8", "replace")[:255]
+            st.add("ldap", "bind_dn", dn_s or "(anonyme)", K_IDENTITY, **fk)
+            added += 1
+            auth = _pro_der_tlv(body, dn[2])
+            if auth and auth[0] == 0x80:             # simple = mot de passe CLAIR
+                pw = auth[1].decode("utf-8", "replace")
+                st.add("ldap", "bind_password_simple", pw[:256], K_SECRET,
+                       note="bind LDAP simple = mot de passe EN CLAIR", **fk)
+                added += 1
+    return added
+
+
+def px_snmp(pl, ctx, st, only=None):
+    """SNMP v1/v2c : community EN CLAIR. v3 : engineID/userName best-effort."""
+    added = 0
+    fk = ctx["fk"]
+    t = _pro_der_tlv(pl, 0)
+    if not t or t[0] != 0x30:
+        return 0
+    ver = _pro_der_tlv(t[1], 0)
+    if not ver or ver[0] != 0x02 or not ver[1]:
+        return 0
+    version = ver[1][0]
+    st.add("snmp", "version", {0: "v1", 1: "v2c", 3: "v3"}.get(version, str(version)),
+           K_METADATA, **fk)
+    comm = _pro_der_tlv(t[1], ver[2])
+    if not comm:
+        return added
+    if comm[0] == 0x04 and version in (0, 1):
+        c = comm[1].decode("ascii", "replace")
+        st.add("snmp", "community", c[:128], K_SECRET,
+               note="community SNMP v1/v2c EN CLAIR (souvent 'public'/'private')", **fk)
+        added += 1
+        pdu = _pro_der_tlv(t[1], comm[2])
+        if pdu and pdu[0] in (0xA0, 0xA1, 0xA2, 0xA3, 0xA5):
+            st.add("snmp", "pdu", {0xA0: "GetRequest", 0xA1: "GetNextRequest",
+                                   0xA2: "GetResponse", 0xA3: "SetRequest",
+                                   0xA5: "GetBulk"}.get(pdu[0], hex(pdu[0])),
+                   K_METADATA, **fk)
+    elif version == 3:
+        # msgGlobalData puis msgSecurityParameters (OCTET STRING imbriquée)
+        glob = comm
+        sec = _pro_der_tlv(t[1], glob[2]) if glob else None
+        if sec and sec[0] == 0x04:
+            inner = _pro_der_tlv(sec[1], 0)
+            if inner and inner[0] == 0x30:
+                eid = _pro_der_tlv(inner[1], 0)
+                if eid and eid[0] == 0x04:
+                    st.add("snmp", "v3_engine_id", eid[1].hex()[:64], K_METADATA, **fk)
+                    added += 1
+                boot = _pro_der_tlv(inner[1], eid[2]) if eid else None
+                tm = _pro_der_tlv(inner[1], boot[2]) if boot else None
+                user = _pro_der_tlv(inner[1], tm[2]) if tm else None
+                if user and user[0] == 0x04 and user[1]:
+                    st.add("snmp", "v3_user", user[1].decode("utf-8", "replace")[:128],
+                           K_IDENTITY, **fk)
+                    added += 1
+    return added
+
+
+def px_sip(pl, ctx, st, only=None):
+    added = 0
+    fk = ctx["fk"]
+    txt = _pro_text(pl, 16384)
+    if not txt:
+        return 0
+    lines = txt.replace("\r", "").split("\n")
+    first = lines[0] if lines else ""
+    if first.startswith("SIP/2.0") or first.split(" ", 1)[0] in (
+            "INVITE", "REGISTER", "BYE", "CANCEL", "ACK", "OPTIONS", "SUBSCRIBE"):
+        st.add("sip", "message", first[:160], K_METADATA, **fk)
+    for ln in lines[1:]:
+        if ":" not in ln:
+            continue
+        k, _, v = ln.partition(":")
+        k = k.strip().lower()
+        v = v.strip()
+        if k in ("from", "to", "contact") and v:
+            st.add("sip", k, v[:255], K_IDENTITY, **fk)
+            added += 1
+            m = _re_pro.search(r"sips?:([^@;>\s]{1,128})@([^;>\s]{1,255})", v)
+            if m:
+                st.add("sip", k + "_user", m.group(1), K_IDENTITY, **fk)
+                st.add("sip", k + "_domain", m.group(2), K_IDENTITY, **fk)
+        elif k == "authorization" or k == "proxy-authenticate" or k == "www-authenticate":
+            st.add("sip", k, v[:512], K_SECRET,
+                   note="digest SIP : pas de mode hashcat natif — candidat 11400 si uri/realm conformes", **fk)
+            added += 1
+            for fld in ("username", "realm", "nonce", "uri", "response"):
+                m = _re_pro.search(('%s="([^"]{1,256})"' % fld).encode(),
+                                   v.encode("latin-1", "replace"))
+                if m:
+                    kk = K_IDENTITY if fld in ("username", "realm", "uri") else K_SECRET
+                    st.add("sip", "digest_" + fld, m.group(1).decode("latin-1"), kk, **fk)
+    return added
+
+
+def px_dhcp(pl, ctx, st, only=None):
+    n = len(pl)
+    if n < 240:
+        return 0
+    added = 0
+    fk = ctx["fk"]
+    op = pl[0]
+    st.add("dhcp", "op", {1: "discover/request (client)", 2: "offer/ack (serveur)"}.get(op, str(op)),
+           K_METADATA, **fk)
+    xid = struct.unpack("!I", pl[4:8])[0]
+    chaddr = ":".join("%02x" % b for b in pl[28:34])
+    yiaddr = _pro_ntop4(pl[16:20])
+    siaddr = _pro_ntop4(pl[20:24])
+    if yiaddr != "0.0.0.0":
+        st.add("dhcp", "yiaddr", yiaddr, K_IDENTITY, **fk)
+        added += 1
+    if siaddr != "0.0.0.0":
+        st.add("dhcp", "siaddr", siaddr, K_IDENTITY, **fk)
+    st.add("dhcp", "chaddr", chaddr, K_IDENTITY, **fk)
+    sname = pl[44:108].split(b"\x00", 1)[0].decode("ascii", "replace")
+    fname = pl[108:236].split(b"\x00", 1)[0].decode("ascii", "replace")
+    if sname:
+        st.add("dhcp", "server_name", sname[:64], K_IDENTITY, **fk)
+        added += 1
+    if fname:
+        st.add("dhcp", "boot_file", fname[:128], K_METADATA, **fk)
+    if pl[236:240] != b"\x63\x82\x53\x63":          # magic cookie
+        return added
+    i = 240
+    optnames = {12: ("hostname", K_IDENTITY), 50: ("requested_ip", K_IDENTITY),
+                53: ("message_type", K_METADATA), 54: ("server_id", K_IDENTITY),
+                55: ("param_request_list", K_METADATA), 60: ("vendor_class_id", K_METADATA),
+                61: ("client_id", K_IDENTITY), 66: ("tftp_server", K_IDENTITY),
+                67: ("bootfile_name", K_METADATA), 81: ("client_fqdn", K_IDENTITY)}
+    while i + 2 <= n:
+        code = pl[i]
+        ln = pl[i + 1]
+        if code == 255:
+            break
+        if code == 0:
+            i += 1
+            continue
+        if i + 2 + ln > n:
+            break
+        val = pl[i + 2:i + 2 + ln]
+        i += 2 + ln
+        if code == 53 and ln == 1:
+            names = {1: "DISCOVER", 2: "OFFER", 3: "REQUEST", 4: "DECLINE",
+                     5: "ACK", 6: "NAK", 7: "RELEASE", 8: "INFORM"}
+            st.add("dhcp", "message_type", names.get(val[0], str(val[0])), K_METADATA, **fk)
+            added += 1
+        elif code in optnames:
+            nm, kind = optnames[code]
+            if code == 54 and ln == 4:
+                v = _pro_ntop4(val)
+            elif code in (12, 60, 66, 67, 81):
+                v = val.decode("utf-8", "replace")[:128]
+            elif code == 61 and ln >= 2:
+                v = ("01:" + ":".join("%02x" % b for b in val[1:])) if val[0] == 1 \
+                    else val.hex()
+            else:
+                v = val.hex()[:128]
+            st.add("dhcp", nm, v, kind, **fk)
+            added += 1
+    return added
+
+
+def px_ntp(pl, ctx, st, only=None):
+    if len(pl) < 4:
+        return 0
+    li_vn_mode = pl[0]
+    mode = li_vn_mode & 0x07
+    ver = (li_vn_mode >> 3) & 0x07
+    names = {1: "sym_active", 2: "sym_passive", 3: "client", 4: "server",
+             5: "broadcast", 6: "control", 7: "private"}
+    st.add("ntp", "mode", f"{names.get(mode, mode)} (v{ver})", K_METADATA, **ctx["fk"])
+    if mode == 7 and len(pl) >= 8:                   # mode privé = monlist (amplification)
+        st.add("ntp", "mode_privé", "présent — vecteur d'amplification (monlist)",
+               K_METADATA, note="RFC 5683 — à filtrer côté réseau", **ctx["fk"])
+    return 1
+
+
+def px_modbus(pl, ctx, st, only=None):
+    if len(pl) < 8:
+        return 0
+    tid, pid, ln, unit = struct.unpack("!HHHB", pl[:7])
+    func = pl[7]
+    if pid != 0:
+        return 0
+    fcn = {1: "ReadCoils", 2: "ReadDiscreteInputs", 3: "ReadHoldingRegisters",
+           4: "ReadInputRegisters", 5: "WriteSingleCoil", 6: "WriteSingleRegister",
+           15: "WriteMultipleCoils", 16: "WriteMultipleRegisters",
+           43: "ReadDeviceIdentification"}.get(func, f"func{func}")
+    st.add("modbus", "function", fcn, K_METADATA,
+           note="OT/SCADA — aucune authentification dans Modbus/TCP", **ctx["fk"])
+    st.add("modbus", "unit_id", str(unit), K_METADATA, **ctx["fk"])
+    return 1
+
+
+def px_s7(pl, ctx, st, only=None):
+    # TPKT(4) + COTP + S7comm 0x32
+    idx = pl.find(b"\x32")
+    if idx < 0 or idx > 40 or len(pl) < idx + 10:
+        return 0
+    rosctr = pl[idx + 1]
+    func = pl[idx + 7] if len(pl) > idx + 7 else 0
+    roles = {1: "Job", 2: "Ack", 3: "Ack_Data", 7: "UserData"}
+    st.add("s7", "rosctr", roles.get(rosctr, str(rosctr)), K_METADATA,
+           note="Siemens S7 (OT) — protocole sans authentification", **ctx["fk"])
+    if func:
+        st.add("s7", "function", str(func), K_METADATA, **ctx["fk"])
+    return 1
+
+
+def px_bacnet(pl, ctx, st, only=None):
+    if len(pl) < 4 or pl[0] != 0x81:
+        return 0
+    bfunc = pl[1]
+    names = {0x0A: "Unicast", 0x04: "ReadProperty", 0x05: "ReadProperty-Ack",
+             0x0B: "Broadcast", 0x0C: "WriteProperty"}
+    st.add("bacnet", "fonction", names.get(bfunc, hex(bfunc)), K_METADATA,
+           note="BACnet/IP (GTB) — sans authentification par défaut", **ctx["fk"])
+    return 1
+
+
+def px_mysql(pl, ctx, st, only=None):
+    added = 0
+    fk = ctx["fk"]
+    if len(pl) > 5 and pl[4] == 0x0A:                # handshake v10 serveur
+        try:
+            ver = pl[5:].split(b"\x00", 1)[0].decode("ascii", "replace")
+            if ver and len(ver) < 64:
+                st.add("mysql", "server_version", ver, K_METADATA, **fk)
+                added += 1
+            rest = pl[5:].split(b"\x00", 1)
+            if len(rest) > 1 and len(rest[1]) > 36:
+                tail = rest[1][32:]
+                plugin = tail.split(b"\x00")[-2].decode("ascii", "replace") if b"\x00" in tail else ""
+                if plugin and len(plugin) < 40:
+                    st.add("mysql", "auth_plugin", plugin, K_METADATA, **fk)
+        except Exception:
+            pass
+    elif len(pl) > 36:                               # réponse de login client
+        try:
+            body = pl[4:]
+            if len(body) > 32:
+                user = body[32:].split(b"\x00", 1)[0].decode("utf-8", "replace")
+                if user and len(user) < 64 and user.isprintable():
+                    st.add("mysql", "username", user, K_IDENTITY,
+                           note="login MySQL en clair (hors TLS)", **fk)
+                    added += 1
+        except Exception:
+            pass
+    return added
+
+
+def px_postgres(pl, ctx, st, only=None):
+    if len(pl) < 8:
+        return 0
+    ln = struct.unpack("!I", pl[:4])[0]
+    code = struct.unpack("!I", pl[4:8])[0]
+    fk = ctx["fk"]
+    if code == 196608:                               # StartupMessage 3.0
+        added = 0
+        parts = pl[8:min(len(pl), 4 + ln)].split(b"\x00")
+        i = 0
+        while i + 1 < len(parts):
+            k = parts[i].decode("utf-8", "replace")
+            v = parts[i + 1].decode("utf-8", "replace")
+            i += 2
+            if k in ("user", "database", "application_name", "client_encoding"):
+                kind = K_IDENTITY if k in ("user", "database") else K_METADATA
+                st.add("postgres", k, v[:128], kind, **fk)
+                added += 1
+        return added
+    if code == 1347703880:                           # SSLRequest
+        st.add("postgres", "ssl_request", "présente", K_METADATA, **fk)
+    return 0
+
+
+def px_redis(pl, ctx, st, only=None):
+    added = 0
+    fk = ctx["fk"]
+    txt = _pro_text(pl, 4096)
+    if txt.upper().startswith("AUTH "):
+        st.add("redis", "auth_password", txt[5:].strip()[:256], K_SECRET,
+               note="AUTH Redis EN CLAIR", **fk)
+        added += 1
+    elif txt.startswith("*") and "$4" in txt and "AUTH" in txt.upper():
+        parts = [p for p in txt.split("\r\n") if p and not p.startswith(("*", "$"))]
+        if len(parts) >= 2 and parts[0].upper() == "AUTH":
+            st.add("redis", "auth_password", parts[-1][:256], K_SECRET,
+                   note="AUTH Redis (RESP) EN CLAIR", **fk)
+            added += 1
+    return added
+
+
+def px_vnc(pl, ctx, st, only=None):
+    txt = _pro_text(pl, 64)
+    if txt.startswith("RFB "):
+        st.add("vnc", "version", txt.split("\n", 1)[0].strip()[:32], K_METADATA,
+               note="RFB/VNC : authentification souvent faible (challenge 8 octets DES)", **ctx["fk"])
+        return 1
+    return 0
+
+
+def px_rdp(pl, ctx, st, only=None):
+    added = 0
+    fk = ctx["fk"]
+    txt = _pro_text(pl, 4096)
+    m = _re_pro.search(r"[Cc]ookie: mstshash=([A-Za-z0-9._\-]{1,128})", txt)
+    if m:
+        st.add("rdp", "mstshash_user", m.group(1), K_IDENTITY,
+               note="cookie de routage RDP = nom d'utilisateur", **fk)
+        added += 1
+    if b"\x03\x00\x00" in pl[:4] or txt.startswith("\x03\x00"):
+        st.add("rdp", "x224", "connexion X.224 détectée", K_METADATA, **fk)
+    return added
+
+
+def px_kerberos(pl, ctx, st, only=None):
+    """Kerberos (88/464) : realm/principaux best-effort via les chaînes
+    GeneralString du DER (honnête : marqué best-effort, pas d'invention)."""
+    added = 0
+    fk = ctx["fk"]
+    if b"\x1b" not in pl[:4096]:
+        return 0
+    i = 0
+    strings = []
+    n = min(len(pl), 8192)
+    while i < n - 2 and len(strings) < 12:
+        if pl[i] == 0x1B:                              # GeneralString
+            ln = pl[i + 1]
+            if 2 <= ln <= 128 and i + 2 + ln <= n:
+                s = pl[i + 2:i + 2 + ln]
+                if all(32 <= c < 127 for c in s):
+                    strings.append(s.decode("ascii"))
+                    i += 2 + ln
+                    continue
+        i += 1
+    for s in strings[:6]:
+        if "." in s or s.isupper():
+            st.add("kerberos", "realm_candidat", s, K_IDENTITY,
+                   note="extraction best-effort (chaînes GeneralString du DER)", **fk)
+            added += 1
+        else:
+            st.add("kerberos", "principal_candidat", s, K_IDENTITY,
+                   note="extraction best-effort", **fk)
+            added += 1
+    if b"krbtgt" in pl[:4096]:
+        st.add("kerberos", "service", "krbtgt (TGS) détecté", K_METADATA, **fk)
+    return added
+
+
+def _pro_txt_ok(val):
+    """bytes → True si texte affichable (ASCII/UTF-8 plausible, sans octet de
+    contrôle) : les attributs RADIUS binaires ne polluent pas les rapports."""
+    return bool(val) and all(c >= 32 and c != 127 for c in val)
+
+
+def px_radius(pl, ctx, st, only=None):
+    """RADIUS (1812/1813/1645/1646) : User-Name EN CLAIR, présence
+    User-Password (obfusqué RFC 2865 §5.2 avec le secret partagé — signalé,
+    JAMAIS prétendu déchiffré §42 ; le pipeline `resolve` le traite),
+    Message-Authenticator, EAP reconstitué (type + Identity), NAS/Station IDs."""
+    n = len(pl)
+    if n < 20:
+        return 0
+    code = pl[0]
+    rlen = struct.unpack("!H", pl[2:4])[0]
+    if code not in (1, 2, 3, 4, 5, 11, 12, 13) or rlen != n:
+        return 0
+    added = 0
+    fk = ctx["fk"]
+    names = {1: "Access-Request", 2: "Access-Accept", 3: "Access-Reject",
+             4: "Accounting-Request", 5: "Accounting-Response",
+             11: "Access-Challenge", 12: "Status-Server", 13: "Status-Client"}
+    st.add("radius", "code", names.get(code, str(code)), K_METADATA, **fk)
+    st.add("radius", "identifier", str(pl[1]), K_METADATA, **fk)
+    added += 1
+    i = 20
+    eap_frags = []
+    attrs = 0
+    while i + 2 <= n and attrs < 64:
+        at = pl[i]
+        al = pl[i + 1]
+        if al < 2 or i + al > n:
+            break
+        val = pl[i + 2:i + al]
+        i += al
+        attrs += 1
+        if at == 1 and _pro_txt_ok(val):              # User-Name (clair)
+            st.add("radius", "user_name", val.decode("utf-8", "replace")[:128],
+                   K_IDENTITY, **fk)
+            added += 1
+        elif at == 2:                                 # User-Password obfusqué
+            st.add("radius", "user_password_present",
+                   f"{len(val)} octets — obfusqué MD5(secret+authenticator)",
+                   K_SECRET, note="déchiffrement possible UNIQUEMENT avec le "
+                                  "secret partagé → pipeline 'resolve' ; rien "
+                                  "n'est déchiffré ici (§42)", **fk)
+            added += 1
+        elif at == 80:                                # Message-Authenticator
+            st.add("radius", "message_authenticator",
+                   "présent (HMAC-MD5, 16 octets)" if len(val) == 16 else "présent",
+                   K_METADATA, note="typique des trames EAP — le secret partagé "
+                                    "est testable par le solveur dédié (resolve)", **fk)
+            added += 1
+        elif at == 79:                                # EAP-Message (fragment)
+            eap_frags.append(val)
+        elif at == 18 and _pro_txt_ok(val):           # Reply-Message
+            st.add("radius", "reply_message", val.decode("utf-8", "replace")[:256],
+                   K_METADATA, **fk)
+            added += 1
+        elif at == 32 and _pro_txt_ok(val):           # NAS-Identifier
+            st.add("radius", "nas_identifier", val.decode("utf-8", "replace")[:128],
+                   K_IDENTITY, **fk)
+            added += 1
+        elif at == 4 and len(val) == 4:               # NAS-IP-Address
+            st.add("radius", "nas_ip", _pro_ntop4(val), K_IDENTITY, **fk)
+            added += 1
+        elif at == 30 and _pro_txt_ok(val):           # Called-Station-Id
+            st.add("radius", "called_station", val.decode("utf-8", "replace")[:64],
+                   K_IDENTITY, **fk)
+            added += 1
+        elif at == 31 and _pro_txt_ok(val):           # Calling-Station-Id
+            st.add("radius", "calling_station", val.decode("utf-8", "replace")[:64],
+                   K_IDENTITY, **fk)
+            added += 1
+    if eap_frags:
+        eap = b"".join(eap_frags)
+        st.add("radius", "eap_message", f"{len(eap)} octets reconstitués",
+               K_METADATA, **fk)
+        added += 1
+        if len(eap) >= 5 and eap[0] in (1, 2, 3):
+            tn = {1: "Identity", 2: "Notification", 3: "Nak", 13: "EAP-TLS",
+                  17: "LEAP", 21: "EAP-TTLS", 25: "PEAP", 26: "MSCHAPv2",
+                  33: "EAP-FAST", 43: "EAP-AKA", 18: "EAP-SIM"}.get(eap[4])
+            if tn:
+                st.add("radius", "eap_type", tn, K_METADATA, **fk)
+                added += 1
+            if eap[0] in (1, 2) and eap[4] == 1 and len(eap) > 5:
+                st.add("radius", "eap_identity",
+                       eap[5:].decode("utf-8", "replace")[:128], K_IDENTITY, **fk)
+                added += 1
+    return added
+
+
+def px_quic(pl, ctx, st, only=None):
+    if len(pl) < 6:
+        return 0
+    form = pl[0] & 0x80
+    if not form:
+        return 0
+    ver = struct.unpack("!I", pl[1:5])[0]
+    known = {0x00000001: "QUIC v1", 0x6b3343cf: "QUIC v2", 0xff00001d: "draft-29"}
+    st.add("quic", "version", known.get(ver, hex(ver)), K_METADATA,
+           note="QUIC initial : SNI chiffré (protection d'en-tête) — non extractible sans clés", **ctx["fk"])
+    return 1
+
+
+def px_ssdp(pl, ctx, st, only=None):
+    return _pro_text_auth("ssdp", pl, ctx, st, [
+        ("LOCATION:", "location", K_IDENTITY, ""),
+        ("SERVER:", "server", K_METADATA, ""),
+        ("USN:", "usn", K_IDENTITY, ""),
+        ("NT:", "notification_type", K_METADATA, ""),
+    ])
+
+
+# ----------------------------------------------------------------------------
+#  Mineur universel — appliqué à TOUT payload texte, quel que soit le port :
+#  c'est lui qui rend l'outil « exhaustif » sur n'importe quelle capture
+#  (protocoles inconnus, ports non standard, tunnels texte…). Chaque motif
+#  est borné (plafond par payload) → coût maîtrisé sur les gros fichiers.
+# ----------------------------------------------------------------------------
+import base64
+import hashlib
+import json
+import os
+import time
+
+RE_PRO_CARD = _re_pro.compile(
+    rb"\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|"
+    rb"6(?:011|5[0-9]{2})[0-9]{12}|3(?:0[0-5]|[68][0-9])[0-9]{11})\b")
+RE_PRO_IBAN = _re_pro.compile(rb"\b[A-Z]{2}[0-9]{2}[0-9A-Z ]{8,32}[0-9A-Z]\b")
+
+_B64URL_TRANS = bytes.maketrans(b"-_", b"+/")
+
+# Notes hashcat HONNÊTES (§11 : aucun mode inventé — modes publics standard,
+# sinon « pas de mode natif » explicitement)
+_PRO_HASH_NOTES = {
+    "bcrypt": "bcrypt — mode hashcat 3200",
+    "argon2": "argon2 — PAS de mode hashcat natif générique (documenté)",
+    "phpass": "phpass (WordPress/PHP) — mode hashcat 400",
+    "sha512crypt": "sha512-crypt ($6$) — mode hashcat 1800",
+    "md5crypt": "md5-crypt ($1$) — mode hashcat 500",
+    "scram_sha1": "SCRAM-SHA-1 — PAS de mode hashcat natif (chaîne StoredKey)",
+    "netntlm_style": "ligne de style NetNTLMv2 — candidate mode 5600",
+}
+
+
+def _pro_dec(b):
+    """bytes → str : UTF-8 d'abord (texte moderne), latin-1 en repli
+    (fidèle aux octets, jamais d'exception). Évite le mojibake « tronquÃ© »."""
+    try:
+        return bytes(b).decode("utf-8")
+    except UnicodeDecodeError:
+        return bytes(b).decode("latin-1")
+
+
+def _pro_is_text(pl):
+    """Heuristique imprimabilité (échantillon 512 o) — évite de miner des
+    mégaoctets binaires pour rien (optimisation majeure sur gros pcap)."""
+    sample = bytes(pl[:512])
+    if not sample:
+        return False
+    printable = 0
+    for c in sample:
+        if 32 <= c < 127 or c in (9, 10, 13):
+            printable += 1
+    return printable * 10 >= len(sample) * 7
+
+
+def _pro_b64url(tok):
+    return base64.b64decode(bytes(tok).translate(_B64URL_TRANS)
+                            + b"=" * (-len(tok) % 4))
+
+
+def px_mine(pl, ctx, st, depth=0, proto="mine"):
+    """Minage générique : credentials dans URLs, clés API, JWT (décodé),
+    e-mails/téléphones/cartes(Luhn)/IBAN(mod97), PEM, champs password=…,
+    données DÉJÀ masquées, Bearer/Basic/NTLM, User-Agent, domaines, hashes
+    textuels, re-minage base64 (profondeur 1 : SASL PLAIN, secrets encodés)."""
+    if len(pl) < 12:
+        return 0
+    if depth == 0:
+        seen = ctx.get("mine_seen")
+        if seen is not None:
+            h = hashlib.blake2b(bytes(pl[:2048]), digest_size=8).digest()
+            if h in seen:
+                return 0
+            if len(seen) < 65536:
+                seen.add(h)
+        if not _pro_is_text(pl):
+            return 0
+    b = bytes(pl[:PRO_MINE_BYTES])
+    added = 0
+    fk = ctx["fk"]
+    deep = ctx.get("deep", False)
+
+    # 1) credentials embarqués dans une URL (scheme://user:pass@hôte)
+    n = 0
+    for m in RE_PRO_USERPASS.finditer(b):
+        n += 1
+        if n > 6:
+            break
+        st.add(proto, "url_user", m.group(1).decode("latin-1")[:128], K_IDENTITY, **fk)
+        st.add(proto, "url_password", m.group(2).decode("latin-1")[:256], K_SECRET,
+               note="credentials dans l'URL — visibles par tous les intermédiaires", **fk)
+        added += 2
+
+    # 2) clés API / jetons de fournisseurs (formats PUBLICS documentés)
+    for name, rx in RE_PRO_APIKEYS:
+        if name == "jwt_token":
+            continue                                  # traité au point 3
+        n = 0
+        for m in rx.finditer(b):
+            n += 1
+            if n > 6:
+                break
+            st.add(proto, "cle_api[" + name + "]", m.group(0).decode("latin-1")[:300],
+                   K_SECRET, note="clé/jeton exposé EN CLAIR (OBSERVED — "
+                                  "validité non vérifiée, rien n'est transmis)", **fk)
+            added += 1
+
+    # 3) JWT : jeton + en-tête + claims sensibles décodées
+    n = 0
+    for m in RE_PRO_JWT.finditer(b):
+        n += 1
+        if n > 4:
+            break
+        tok = m.group(0)
+        st.add(proto, "jeton_jwt", tok.decode("latin-1")[:512], K_SECRET,
+               note="JWT exposé — payload lisible par tous (base64, pas chiffré)", **fk)
+        added += 1
+        try:
+            parts = tok.split(b".")
+            hdr = json.loads(_pro_b64url(parts[0]))
+            pay = json.loads(_pro_b64url(parts[1]))
+            if isinstance(hdr, dict) and hdr.get("alg") is not None:
+                alg = str(hdr["alg"])
+                st.add(proto, "jwt_alg", alg, K_METADATA, **fk)
+                if alg.lower() == "none":
+                    st.add(proto, "jwt_alg_none", "algorithme 'none' détecté",
+                           K_SECRET, note="JWT non signé — contournement possible "
+                                          "si le serveur l'accepte (à vérifier)", **fk)
+                    added += 1
+            if isinstance(pay, dict):
+                for k in sorted(pay):                 # ordre déterministe (§35)
+                    v = pay[k]
+                    ks = str(k).lower()
+                    if not isinstance(v, (str, int, float)) or v == "":
+                        continue
+                    vs = str(v)[:256]
+                    if ks in ("password", "passwd", "pwd", "secret", "apikey",
+                              "api_key", "token", "private_key", "passkey"):
+                        st.add(proto, "jwt_" + ks, vs, K_SECRET,
+                               note="claim sensible dans le JWT", **fk)
+                        added += 1
+                    elif ks in ("email", "upn", "mail"):
+                        st.add(proto, "jwt_email", vs, K_PII, subkind="email", **fk)
+                        added += 1
+                    elif ks in ("sub", "iss", "aud", "jti", "azp", "name", "user",
+                                "username", "nickname", "preferred_username",
+                                "unique_name", "sid", "tenant", "scope", "scp"):
+                        st.add(proto, "jwt_" + ks, vs, K_IDENTITY, **fk)
+                        added += 1
+                    elif ks in ("exp", "iat", "nbf"):
+                        st.add(proto, "jwt_" + ks, vs, K_METADATA, **fk)
+        except Exception:
+            pass                                      # JWT tronqué : signalé brut
+
+    # 4) PII — e-mails, téléphones, cartes (Luhn), IBAN (mod 97)
+    n = 0
+    for m in RE_PRO_EMAIL.finditer(b):
+        n += 1
+        if n > 10:
+            break
+        st.add(proto, "email", m.group(0).decode("latin-1"), K_PII,
+               subkind="email", **fk)
+        added += 1
+    n = 0
+    for m in RE_PRO_PHONE.finditer(b):
+        n += 1
+        if n > 5:
+            break
+        st.add(proto, "telephone", m.group(0).decode("latin-1"), K_PII,
+               subkind="phone", **fk)
+        added += 1
+    n = 0
+    for m in RE_PRO_CARD.finditer(b):
+        n += 1
+        if n > 5:
+            break
+        if _pro_luhn(m.group(0)):
+            st.add(proto, "carte_bancaire", m.group(0).decode("ascii"), K_PII,
+                   subkind="card", note="PAN validé par Luhn — masqué par défaut", **fk)
+            added += 1
+    n = 0
+    for m in RE_PRO_IBAN.finditer(b):
+        n += 1
+        if n > 5:
+            break
+        if _pro_iban_ok(m.group(0)):
+            st.add(proto, "iban", m.group(0).decode("ascii").replace(" ", "")[:34],
+                   K_PII, subkind="iban",
+                   note="IBAN validé (mod 97) — masqué par défaut", **fk)
+            added += 1
+
+    # 5) blocs PEM (clés privées = critique)
+    n = 0
+    for m in RE_PRO_PEM.finditer(b):
+        n += 1
+        if n > 4:
+            break
+        hdr = m.group(0).decode("latin-1")
+        is_priv = "PRIVATE KEY" in hdr
+        st.add(proto, "bloc_pem", hdr, K_SECRET if is_priv else K_IDENTITY,
+               note="clé PRIVÉE en clair dans le flux — critique" if is_priv
+               else "certificat/clé publique PEM dans le flux", **fk)
+        added += 1
+
+    # 6) champs « password=… / token: … » en clair (mots-clés + valeur)
+    n = 0
+    for m in RE_PRO_PWFIELD.finditer(b):
+        n += 1
+        if n > 10:
+            break
+        st.add(proto, "champ_secret", m.group(0).decode("latin-1")[:160], K_SECRET,
+               note="champ sensible (password/token/key/…) avec valeur en clair", **fk)
+        added += 1
+
+    # 7) données DÉJÀ masquées dans le flux (****, [redacted], XXXX…) :
+    #    l'outil signale leur PRÉSENCE (quelque chose existe et fut masqué)
+    n = 0
+    for m in RE_PRO_MASKED.finditer(b):
+        n += 1
+        if n > 4:
+            break
+        tok = m.group(0).lower()
+        pre = b[max(0, m.start() - 8):m.start()].lower()
+        if tok == b"hidden" and (b"type" in pre or b"type" in b[max(0, m.start() - 16):m.start()].lower()):
+            continue                                  # <input type=hidden> ≠ secret masqué
+        s = max(0, m.start() - 24)
+        e = min(len(b), m.end() + 24)
+        ctxv = _pro_dec(b[s:e]).replace("\r", " ").replace("\n", " ").strip()
+        st.add(proto, "donnee_masquee", ctxv[:96], K_MASKED,
+               note="donnée déjà masquée dans le flux — présence signalée", **fk)
+        added += 1
+
+    # 8) Bearer / Basic / NTLMSSP (base64)
+    n = 0
+    for m in RE_PRO_BEARER.finditer(b):
+        n += 1
+        if n > 3:
+            break
+        st.add(proto, "jeton_bearer", m.group(0).decode("latin-1")[:300], K_SECRET, **fk)
+        added += 1
+    n = 0
+    for m in RE_PRO_BASIC.finditer(b):
+        n += 1
+        if n > 3:
+            break
+        rawb = m.group(1)
+        st.add(proto, "basic_b64", rawb.decode("latin-1")[:300], K_SECRET, **fk)
+        added += 1
+        try:
+            dec = base64.b64decode(rawb + b"===").decode("utf-8", "replace")
+            if ":" in dec:
+                u, _, p = dec.partition(":")
+                st.add(proto, "basic_user", u[:128], K_IDENTITY, **fk)
+                st.add(proto, "basic_password", p[:256], K_SECRET,
+                       note="Basic = base64 : AUCUN chiffrement", **fk)
+                added += 2
+        except Exception:
+            pass
+    n = 0
+    for m in RE_PRO_NTLM_B64.finditer(b):
+        n += 1
+        if n > 3:
+            break
+        st.add(proto, "message_ntlm_b64", m.group(0).decode("latin-1")[:300], K_SECRET,
+               note="message NTLMSSP (base64) — candidat NetNTLMv2 (mode 5600 "
+                    "via le pipeline dédié, structure à valider)", **fk)
+        added += 1
+
+    # 9) User-Agent, domaines, hashes textuels, (hex si --deep)
+    n = 0
+    for m in RE_PRO_UA.finditer(b):
+        n += 1
+        if n > 2:
+            break
+        st.add(proto, "user_agent", m.group(0).decode("latin-1")[:200], K_METADATA, **fk)
+        added += 1
+    if len(b) <= 8192:
+        n = 0
+        for m in RE_PRO_DOMAIN.finditer(b):
+            n += 1
+            if n > 10:
+                break
+            st.add(proto, "domaine", m.group(0).decode("latin-1").lower()[:255],
+                   K_IDENTITY, **fk)
+            added += 1
+    for name, rx in RE_PRO_TEXTHASHES:
+        n = 0
+        for m in rx.finditer(b):
+            n += 1
+            if n > 3:
+                break
+            st.add(proto, "hash[" + name + "]", m.group(0).decode("latin-1")[:512],
+                   K_SECRET, note=_PRO_HASH_NOTES.get(
+                       name, "hash textuel — candidat pour pipeline dédié"), **fk)
+            added += 1
+    if deep:
+        n = 0
+        for m in RE_PRO_HEXHASH.finditer(b):
+            n += 1
+            if n > 10:
+                break
+            st.add(proto, "hex_hash_candidat", m.group(0).decode("ascii"), K_METADATA,
+                   note="longueur seule — ambigu (hash, nonce, identifiant de session)", **fk)
+            added += 1
+
+    # 10) re-minage base64 (profondeur 1) : SASL PLAIN + texte encodé
+    if depth < 1:
+        nb = 0
+        for m in RE_PRO_B64.finditer(b):
+            nb += 1
+            if nb > 24:
+                break
+            tok = m.group(0)
+            if len(tok) < 24 or len(tok) % 4 == 1:
+                continue
+            try:
+                dec = base64.b64decode(tok + b"===")
+            except Exception:
+                continue
+            if len(dec) < 8:
+                continue
+            if dec.count(b"\x00") == 2:               # SASL PLAIN authz\0user\0pass
+                try:
+                    _a, u, p = dec.split(b"\x00")
+                    if u and p and len(p) <= 256:
+                        st.add(proto, "sasl_plain_user", u.decode("utf-8", "replace")[:128],
+                               K_IDENTITY, **fk)
+                        st.add(proto, "sasl_plain_password",
+                               p.decode("utf-8", "replace")[:256], K_SECRET,
+                               note="SASL PLAIN = credentials EN CLAIR (base64)", **fk)
+                        added += 2
+                except Exception:
+                    pass
+                continue
+            if 6 <= len(dec) <= 300 and b":" in dec:
+                # paire user:pass décodée d'un blob base64 (AUTH LOGIN, PLAIN
+                # hors SASL, config encodée…) — règles strictes anti-bruit :
+                # user alphanumérique, pass ≥4 imprimable, pas d'heure/date
+                u, _, pw = dec.partition(b":")
+                us = u.decode("latin-1")
+                ps = pw.decode("latin-1")
+                if _re_pro.fullmatch(r"[A-Za-z0-9._%+\-]{2,64}", us) \
+                        and 4 <= len(ps) <= 128 and " " not in ps \
+                        and all(32 <= c < 127 for c in pw) \
+                        and not _re_pro.fullmatch(r"[0-9:.+\-/ ]+", ps):
+                    st.add(proto, "b64_user", us[:128], K_IDENTITY,
+                           note="paire user:pass décodée d'un blob base64", **fk)
+                    st.add(proto, "b64_password", ps[:256], K_SECRET,
+                           note="paire user:pass décodée d'un blob base64", **fk)
+                    added += 2
+                    continue
+            if _pro_is_text(dec):
+                added += px_mine(dec, ctx, st, depth=depth + 1, proto=proto + "+b64")
+    return added
+
+
+# ----------------------------------------------------------------------------
+#  Table de dispatch — port TCP/UDP + reniflage structurel (jamais tous les
+#  parseurs sur tous les paquets : UN seul passage, coût minimal).
+# ----------------------------------------------------------------------------
+PRO_PARSERS = (
+    # (nom, fonction, ports TCP, ports UDP)
+    ("dns",      px_dns,      (53,),                          (53, 5353, 5354, 5355)),
+    ("tls",      px_tls,      (443, 8443, 993, 995, 465, 853, 636, 5223,
+                               5061, 989, 990, 992, 6697, 3269), ()),
+    ("http",     px_http,     (80, 8080, 8000, 8888, 3128, 5000, 591,
+                               8008, 9000, 8081),            ()),
+    ("smtp",     px_smtp,     (25, 587, 465, 2525),           ()),
+    ("pop3",     px_pop3,     (110, 995),                     ()),
+    ("imap",     px_imap,     (143, 993, 220),                ()),
+    ("ftp",      px_ftp,      (21, 2121, 2100),               ()),
+    ("telnet",   px_telnet,   (23, 2323),                     ()),
+    ("ssh",      px_ssh,      (22, 2222),                     ()),
+    ("ldap",     px_ldap,     (389, 636, 3268, 3269),         ()),
+    ("snmp",     px_snmp,     (161, 162),                     (161, 162)),
+    ("sip",      px_sip,      (5060, 5061),                   (5060, 5061)),
+    ("dhcp",     px_dhcp,     (),                             (67, 68)),
+    ("ntp",      px_ntp,      (),                             (123,)),
+    ("modbus",   px_modbus,   (502,),                         ()),
+    ("s7",       px_s7,       (102,),                         ()),
+    ("bacnet",   px_bacnet,   (),                             (47808,)),
+    ("mysql",    px_mysql,    (3306, 33060),                  ()),
+    ("postgres", px_postgres, (5432,),                        ()),
+    ("redis",    px_redis,    (6379,),                        ()),
+    ("vnc",      px_vnc,      (5900, 5901, 5902, 5903, 5904, 5905), ()),
+    ("rdp",      px_rdp,      (3389,),                        ()),
+    ("kerberos", px_kerberos, (88, 464),                      (88, 464)),
+    ("xmpp",     px_xmpp,     (5222, 5223, 5269),             ()),
+    ("irc",      px_irc,      (6667, 6668, 6669, 194, 6697),  ()),
+    ("radius",   px_radius,   (),                             (1812, 1813, 1645, 1646)),
+    ("quic",     px_quic,     (),                             (443,)),
+    ("ssdp",     px_ssdp,     (),                             (1900,)),
+    ("arp",      None,        (),                             ()),   # géré en amont
+    ("mine",     px_mine,     (),                             ()),   # universel
+)
+
+_PRO_BY_NAME = {nm: fn for nm, fn, _t, _u in PRO_PARSERS}
+_PRO_TCP_BY_PORT = {}
+_PRO_UDP_BY_PORT = {}
+for _nm, _fn, _tp, _up in PRO_PARSERS:
+    for _p in _tp:
+        _PRO_TCP_BY_PORT.setdefault(_p, []).append(_nm)
+    for _p in _up:
+        _PRO_UDP_BY_PORT.setdefault(_p, []).append(_nm)
+PRO_PARSER_NAMES = tuple(sorted(_PRO_BY_NAME))
+
+
+def _pro_sniff_tcp(pl):
+    """Reniflage structurel (payloads hors ports connus) — borné à 16-512 o."""
+    n = len(pl)
+    if n < 5:
+        return []
+    h = pl[:16]
+    if h[0] in (0x14, 0x15, 0x16, 0x17) and h[1] == 0x03:
+        return ["tls"]
+    if h.startswith(b"SSH-"):
+        return ["ssh"]
+    if h.startswith(b"RFB "):
+        return ["vnc"]
+    if h.startswith((b"GET ", b"POST ", b"PUT ", b"HEAD ", b"HTTP/1", b"DELETE ",
+                     b"OPTIONS ", b"PATCH ", b"TRACE ", b"CONNECT ")):
+        return ["http"]
+    if h.startswith((b"+OK", b"-ERR")):
+        return ["pop3"]
+    if h.startswith(b"220 ") or h.startswith(b"250 ") or h.startswith(b"354 "):
+        up = pl[:256].upper()
+        return ["smtp"] if (b"SMTP" in up or b"MAIL" in up or b"ESMTP" in up) else ["ftp"]
+    if n > 8 and pl[3] == 0 and pl[4] == 0x0A:
+        return ["mysql"]                              # handshake MySQL v10
+    if n >= 8:
+        code = struct.unpack("!I", pl[4:8])[0]
+        if code in (196608, 1347703880):
+            return ["postgres"]                       # StartupMessage / SSLRequest
+    if b"<stream:stream" in pl[:64] or b"jabber:" in pl[:512]:
+        return ["xmpp"]
+    if h.startswith(b"SIP/2.0") or b" sip:" in pl[:64]:
+        return ["sip"]
+    if h.startswith(b"*") and b"$" in h and b"\r\n" in h:
+        return ["redis"]
+    if h[:1] == b"\x30":
+        return ["ldap", "snmp", "kerberos"]           # DER ambigu → candidats
+    if b"NICK " in pl[:128] or b"PRIVMSG " in pl[:128]:
+        return ["irc"]
+    if pl[0] == 0x03 and pl[1] == 0x00 and n >= 7:
+        return ["rdp"]                                # X.224 (TPKT)
+    return []
+
+
+def _pro_sniff_udp(pl):
+    n = len(pl)
+    if n < 12:
+        return []
+    if n >= 240 and pl[0] in (1, 2) and pl[236:240] == b"\x63\x82\x53\x63":
+        return ["dhcp"]
+    if n >= 20 and pl[0] in (1, 2, 3, 4, 5, 11, 12, 13) and \
+            struct.unpack("!H", pl[2:4])[0] == n:
+        return ["radius"]
+    if (pl[2] & 0xF8) in (0x00, 0x80) and struct.unpack("!H", pl[4:6])[0] <= 64:
+        return ["dns"]
+    if pl[0] == 0x30 and pl[2] == 0x02:
+        return ["snmp"]
+    return []
+
+
+def _pro_dispatch(st, ctx, sport, dport, pl, is_udp, streams,
+                  anomalies, per_parser, selected):
+    """Choisit ≤3 parseurs (ports puis structure), les exécute ISOLÉMENT,
+    s'arrête au premier productif, puis lance le minage universel."""
+    if not pl or len(pl) < 3:
+        return
+    if is_udp:
+        names = list(_PRO_UDP_BY_PORT.get(dport, ()))
+        if not names:
+            names = list(_PRO_UDP_BY_PORT.get(sport, ()))
+        if not names:
+            names = _pro_sniff_udp(pl)
+    else:
+        names = list(_PRO_TCP_BY_PORT.get(dport, ()))
+        if not names:
+            names = list(_PRO_TCP_BY_PORT.get(sport, ()))
+        if not names:
+            names = _pro_sniff_tcp(pl)
+    for nm in names[:3]:
+        if nm not in _PRO_BY_NAME or _PRO_BY_NAME[nm] is None:
+            continue
+        if selected is not None and nm not in selected:
+            continue
+        fn = _PRO_BY_NAME[nm]
+        per_parser[nm] += 1
+        try:
+            if nm == "tls":
+                added = fn(pl, ctx, st, streams=streams,
+                           key=(ctx["fk"]["src"], sport, ctx["fk"]["dst"], dport))
+            elif nm == "dns" and not is_udp and len(pl) > 14:
+                ln = struct.unpack("!H", pl[:2])[0]   # DNS/TCP : préfixe longueur
+                added = fn(pl[2:] if ln == len(pl) - 2 else pl, ctx, st)
+            else:
+                added = fn(pl, ctx, st)
+            if added:
+                break
+        except Exception as exc:                      # isolation stricte (§30)
+            anomalies["parseur_" + nm] += 1
+            if ctx.get("dbg"):
+                ctx["dbg"](f"trame {ctx['fk']['frame']}: {nm} — "
+                           f"{type(exc).__name__}: {exc}")
+    if selected is None or "mine" in selected:
+        try:
+            px_mine(pl, ctx, st)
+        except Exception as exc:
+            anomalies["mineur"] += 1
+            if ctx.get("dbg"):
+                ctx["dbg"](f"trame {ctx['fk']['frame']}: mineur — "
+                           f"{type(exc).__name__}: {exc}")
+
+
+# ----------------------------------------------------------------------------
+#  Orchestrateur — UN seul passage fichier → découvertes (streaming, mémoire
+#  bornée, budget temps, limite de paquets, anomalies comptées §42).
+# ----------------------------------------------------------------------------
+def run_inventory(path, only=None, redact=False, debug=False, limit=0,
+                  budget=0.0, deep=False):
+    """Analyse exhaustive d'UN fichier pcap/pcapng (même tronqué/corrompu).
+
+    Retourne un dictionnaire de résultat (jamais d'exception vers l'appelant) :
+    ok/error/file/stats/packets_read/anomalies/per_parser/compteurs/store
+    (ProStore)/seconds/throughput_mbps/limit_hit/budget_hit/redact/deep/
+    debug_lines. `only` : liste de noms de parseurs (PRO_PARSER_NAMES).
+    """
+    t0 = time.time()
+    dbg_lines = [] if debug else None
+
+    def _dbg(msg):
+        if dbg_lines is not None and len(dbg_lines) < 2000:
+            dbg_lines.append(str(msg))
+
+    res = {"file": str(path), "ok": False, "error": "",
+           "version": PRO_INVENTORY_VERSION, "redact": bool(redact),
+           "deep": bool(deep), "packets_read": 0, "limit_hit": False,
+           "budget_hit": False, "seconds": 0.0, "throughput_mbps": 0.0,
+           "stats": {}, "anomalies": {}, "per_parser": {}, "compteurs": {},
+           "store": ProStore(), "debug_lines": []}
+    sel = set(x.lower() for x in only) if only else None
+    if sel is not None:
+        bad = sorted(sel - set(PRO_PARSER_NAMES))
+        if bad:
+            res["error"] = ("protocole(s) inconnu(s) pour --only : "
+                            + ", ".join(bad) + "  — disponibles : "
+                            + ", ".join(PRO_PARSER_NAMES))
+            return res
+    if not os.path.isfile(path):
+        res["error"] = f"fichier introuvable : {path}"
+        return res
+    st = res["store"]
+    anomalies = Counter()
+    per_parser = Counter()
+    extra = Counter()
+    stats = {"packets": 0, "bytes": 0, "format": "?", "truncated": False,
+             "read_errors": 0, "linktypes": set()}
+    streams = ProStreams()
+    mine_seen = set()
+    n = 0
+    try:
+        for idx, ts, linktype, raw in pro_read_packets(path, dbg=_dbg, stats=stats):
+            n += 1
+            if limit and n > limit:
+                res["limit_hit"] = True
+                n -= 1
+                break
+            if budget and (time.time() - t0) > budget:
+                res["budget_hit"] = True
+                break
+            ctx = {"fk": {"frame": idx, "src": "", "dst": ""},
+                   "deep": bool(deep), "mine_seen": mine_seen, "ts": ts,
+                   "dbg": _dbg if debug else None}
+            try:
+                et, off = pro_link_to_ip(linktype, raw)
+            except Exception:
+                anomalies["lien"] += 1
+                continue
+            if et == "WIFI":
+                extra["trames_wifi"] += 1
+                continue                              # comptées, non décodées (honnête)
+            if et is None:
+                anomalies["lien_inconnu"] += 1
+                continue
+            if et == 0x0806:                          # ARP (identité IP↔MAC)
+                if sel is not None and "arp" not in sel:
+                    extra["arp"] += 1
+                    continue
+                try:
+                    ar = pro_arp(raw[off:])
+                    if ar:
+                        op, sha, spa, tha, tpa = ar
+                        fk = ctx["fk"]
+                        fk["src"], fk["dst"] = spa, tpa
+                        st.add("arp", "operation",
+                               {1: "who-has (requête)", 2: "réponse"}.get(op, str(op)),
+                               K_METADATA, **fk)
+                        st.add("arp", "ip_emetteur", spa, K_IDENTITY, **fk)
+                        st.add("arp", "ip_cible", tpa, K_IDENTITY, **fk)
+                        if sha:
+                            st.add("arp", "mac_emetteur", sha, K_IDENTITY, **fk)
+                        if tha and tha != "00:00:00:00:00:00":
+                            st.add("arp", "mac_cible", tha, K_IDENTITY, **fk)
+                except Exception:
+                    anomalies["arp"] += 1
+                continue
+            ip = None
+            try:
+                if et == 0x0800:
+                    ip = pro_ip4(raw, off)
+                elif et == 0x86DD:
+                    ip = pro_ip6(raw, off)
+            except Exception:
+                ip = None
+            if ip is None:
+                anomalies["ip_malforme"] += 1
+                continue
+            ctx["fk"]["src"], ctx["fk"]["dst"] = ip["src"], ip["dst"]
+            pn = ip["proto"]
+            if ip.get("frag"):
+                extra["fragments"] += 1
+            try:
+                if pn == 6:
+                    t = pro_tcp(ip)
+                    if t is None:
+                        anomalies["tcp_malforme"] += 1
+                    else:
+                        _pro_dispatch(st, ctx, t["sport"], t["dport"],
+                                      t["payload"], False, streams,
+                                      anomalies, per_parser, sel)
+                elif pn == 17:
+                    u = pro_udp(ip)
+                    if u is None:
+                        anomalies["udp_malforme"] += 1
+                    else:
+                        _pro_dispatch(st, ctx, u["sport"], u["dport"],
+                                      u["payload"], True, None,
+                                      anomalies, per_parser, sel)
+                elif pn in (1, 58):
+                    extra["icmp"] += 1
+                else:
+                    extra["autre_proto_ip_%d" % pn] += 1
+            except Exception as exc:                  # jamais de crash (§30)
+                anomalies["dispatch"] += 1
+                _dbg(f"trame {idx}: anomalie tolérée {type(exc).__name__}: {exc}")
+    except Exception as exc:
+        res["error"] = f"anomalie fatale tolérée : {type(exc).__name__}: {exc}"
+        _dbg(res["error"])
+    stats["linktypes"] = sorted(stats["linktypes"])
+    res["packets_read"] = n
+    res["stats"] = stats
+    res["anomalies"] = dict(anomalies)
+    res["per_parser"] = dict(per_parser)
+    res["compteurs"] = dict(extra)
+    res["seconds"] = round(time.time() - t0, 3)
+    mb = stats.get("bytes", 0) / 1e6
+    res["throughput_mbps"] = round(mb / res["seconds"], 2) if res["seconds"] > 0 \
+        else round(mb * 1000.0, 2)
+    res["debug_lines"] = dbg_lines or []
+    res["ok"] = (res["error"] == "")
+    _dbg(f"fin : {n} paquets, {len(st.findings)} découvertes, "
+         f"{sum(anomalies.values())} anomalies tolérées")
+    return res
+
+
+# ----------------------------------------------------------------------------
+#  Sorties — console, TXT, JSON, CSV (une seule source : mêmes lignes triées,
+#  ordre déterministe §35 ; PII masquée par défaut partout, y compris fichiers)
+# ----------------------------------------------------------------------------
+def _pro_sorted(findings):
+    ko = {k: i for i, k in enumerate(KINDS_ORDER)}
+    return sorted(findings, key=lambda f: (ko.get(f.kind, 9), f.proto, f.field,
+                                           -f.count, f.value))
+
+
+def _pro_report_lines(res, redact=None, top=0):
+    """Rapport texte COMPLET (console ET fichier .txt — strictement identique).
+
+    v1.2 (demande utilisateur : « tout doit être en clair », « pas de PII
+    cachée ou remplacée par des *** », « rapport clair et très simple ») :
+      - toutes les découvertes sont affichées, dans l'ordre des catégories ;
+      - les valeurs sont ENTIÈRES : aucune troncature, aucun caractère de
+        remplacement, aucun masquage (le paramètre `redact` et `top` sont
+        conservés pour compatibilité d'appel mais n'ont plus d'effet) ;
+      - une ligne par découverte, lisible telle quelle ;
+      - les compteurs, protocoles et parseurs sont TOUS listés (plus de
+        « … +N (.json) »).
+    """
+    bar = "─" * 74
+    L = [bar,
+         f"  INVENTAIRE RÉSEAU v{PRO_INVENTORY_VERSION} — {res['file']}", bar]
+    if not res["ok"] and not res["packets_read"]:
+        L.append(f"ERREUR : {res['error']}")
+        return L
+    st = res["store"]
+    stats = res.get("stats") or {}
+    if res.get("error"):
+        L.append(f"⚠ lecture partielle : {res['error']}")
+    trunc = "OUI ⚠ (fichier coupé — paquets lisibles traités)" \
+        if stats.get("truncated") else "non"
+    L.append(f"Format          : {stats.get('format', '?')}   "
+             f"Paquets lus : {res['packets_read']} "
+             f"({stats.get('bytes', 0):,} octets)   tronqué : {trunc}")
+    L.append(f"Durée           : {res['seconds']} s      débit : "
+             f"{res['throughput_mbps']} Mo/s")
+    if res.get("limit_hit"):
+        L.append("⚠ --limit atteint : analyse arrêtée avant la fin du fichier")
+    if res.get("budget_hit"):
+        L.append("⚠ budget temps atteint : analyse arrêtée avant la fin du fichier")
+    if stats.get("read_errors"):
+        L.append(f"Erreurs de lecture tolérées : {stats['read_errors']}")
+    cpt = res.get("compteurs") or {}
+    if cpt:
+        L.append("Compteurs       :")
+        for k, v in sorted(cpt.items(), key=lambda kv: (-kv[1], kv[0])):
+            L.append(f"  {k} = {v}")
+    pp = res.get("per_parser") or {}
+    if pp:
+        L.append("Parseurs lancés :")
+        for k, v in sorted(pp.items(), key=lambda kv: (-kv[1], kv[0])):
+            L.append(f"  {k} = {v}")
+    L.append(f"Découvertes     : {len(st.findings)} uniques   "
+             f"(doublons consolidés : {st.dropped_duplicates}, "
+             f"écartées par plafond : {st.dropped_overflow})")
+    L.append("Par catégorie   : " + "   ".join(
+        f"{k}={st.kinds.get(k, 0)}" for k in KINDS_ORDER))
+    if st.protos:
+        L.append("Par protocole   :")
+        for p, c in st.protos.most_common():
+            L.append(f"  {p} = {c}")
+    L.append("")
+    L.append("LÉGENDE (à quoi sert chaque catégorie)")
+    L.append("  SECRET    mots de passe, clés, tokens exposés en clair → à"
+             " réutiliser tels quels (connexion, hashcat, déchiffrement)")
+    L.append("  MASKED    données déjà masquées dans le flux (****, [redacted])"
+             " → rien à casser ; signale une tentative de dissimulation")
+    L.append("  IDENTITY  comptes, hôtes, domaines, realms → cibles et contexte"
+             " (qui, où)")
+    L.append("  PII       données personnelles (e-mails, téléphones, cartes,"
+             " IBAN) → affichées EN CLAIR (v1.2)")
+    L.append("  METADATA  versions logicielles, horodatages, configuration →"
+             " contexte technique de la capture")
+    fs = _pro_sorted(st.findings)
+    cur = None
+    for f in fs:
+        if f.kind != cur:
+            cur = f.kind
+            L.append("")
+            L.append(f"── {cur} — {st.kinds.get(cur, 0)} découverte(s) "
+                     + "─" * max(0, 48 - len(cur)))
+        occ = f" (×{f.count})" if f.count > 1 else ""
+        note = (" — " + f.note) if f.note else ""
+        L.append(f"  [{f.proto}] {f.field} = {f.value}{occ}  "
+                 f"(trame {f.frame}, {f.src} → {f.dst}){note}")
+    an = res.get("anomalies") or {}
+    if an:
+        L.append("")
+        L.append("── ANOMALIES TOLÉRÉES (comptées, jamais masquées) " + "─" * 24)
+        for k in sorted(an):
+            L.append(f"  {k} = {an[k]}")
+    L.append("")
+    L.append("RIEN N'EST MASQUÉ (v1.2) : toutes les valeurs ci-dessus sont"
+             " complètes, y compris les données personnelles.")
+    L.append("Détail machine (mêmes données, format exploitable) :"
+             " fichiers .json et .csv accompagnants, écrits systématiquement.")
+    if res.get("debug_lines"):
+        L.append("")
+        L.append("── DEBUG " + "─" * 60)
+        L.extend("  " + x for x in res["debug_lines"])
+    return L
+
+
+def pro_console(res, top=0):
+    for ln in _pro_report_lines(res, top=top):
+        print(ln)
+
+
+def pro_write_txt(res, path):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(_pro_report_lines(res)) + "\n")
+
+
+def pro_write_json(res, path):
+    """JSON exhaustif : toutes les découvertes, valeurs EN CLAIR (v1.2)."""
+    st = res["store"]
+    stats = dict(res.get("stats") or {})
+    doc = {
+        "outil": "tshark2hashcat — inventaire réseau",
+        "version_inventaire": PRO_INVENTORY_VERSION,
+        "fichier": res["file"],
+        "ok": bool(res["ok"]),
+        "erreur": res["error"],
+        "genere_le": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "format": stats.get("format"),
+        "paquets_lus": res["packets_read"],
+        "octets": stats.get("bytes", 0),
+        "tronque": bool(stats.get("truncated")),
+        "secondes": res["seconds"],
+        "debit_mos": res["throughput_mbps"],
+        "limite_atteinte": bool(res.get("limit_hit")),
+        "budget_atteint": bool(res.get("budget_hit")),
+        "valeurs_masquees": False,
+        "compteurs": {"doublons_consolides": st.dropped_duplicates,
+                      "ecartees_plafond": st.dropped_overflow,
+                      **(res.get("compteurs") or {})},
+        "par_categorie": {k: st.kinds.get(k, 0) for k in KINDS_ORDER},
+        "par_protocole": dict(st.protos),
+        "parseurs_lances": res.get("per_parser") or {},
+        "anomalies": res.get("anomalies") or {},
+        "decouvertes": [f.to_dict(False) for f in _pro_sorted(st.findings)],
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, ensure_ascii=False, indent=1)
+
+
+def pro_write_csv(res, path):
+    """CSV séparateur « ; » + BOM UTF-8 : lisible directement par Excel FR.
+
+    v1.2 : colonne « masquee » supprimée, valeurs EN CLAIR."""
+    st = res["store"]
+
+    def esc(v):
+        v = str(v)
+        if any(c in v for c in ';"\r\n'):
+            v = '"' + v.replace('"', '""') + '"'
+        return v
+
+    lines = ["categorie;protocole;champ;valeur;occurrences;trame;"
+             "source;destination;note"]
+    for f in _pro_sorted(st.findings):
+        lines.append(";".join(esc(x) for x in (
+            f.kind, f.proto, f.field, f.value,
+            f.count, f.frame, f.src, f.dst, f.note)))
+    with open(path, "w", encoding="utf-8-sig") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+# ----------------------------------------------------------------------------
+#  CLI — sous-commande `inventory` (utilisable INDÉPENDAMMENT du moteur)
+# ----------------------------------------------------------------------------
+def cmd_inventory(args):
+    """Fichier OU dossier → inventaire réseau exhaustif. Sorties :
+    BASE.txt (rapport COMPLET en clair) + BASE.json et BASE.csv (mêmes
+    données, formats machine) — les trois sont écrits systématiquement.
+    Bases par défaut : <capture>.inventaire-reseau.* (un fichier) ou
+    inventaire-reseau.* (dossier). Codes retour : 0 succès, 2 erreur."""
+    path = getattr(args, "path", "") or ""
+    if not path:
+        print("[!] Usage : inventory <fichier-ou-dossier> [--only proto1,proto2] "
+              "[-o BASE] [--json] [--csv] [--deep] [--debug] "
+              "[--limit N] [--budget SECONDES]")
+        print("    Toutes les valeurs sont affichées EN CLAIR (v1.2 : aucun "
+              "masquage, aucune troncature). --no-redact reste accepté sans effet.")
+        return 2
+    only = None
+    raw_only = getattr(args, "only", "") or ""
+    if raw_only:
+        only = [x.strip().lower() for x in raw_only.split(",") if x.strip()]
+        unknown = [x for x in only if x not in PRO_PARSER_NAMES]
+        if unknown:
+            print("[!] Protocole(s) inconnu(s) : " + ", ".join(unknown))
+            print("    Disponibles : " + ", ".join(PRO_PARSER_NAMES))
+            return 2
+    files = []
+    if os.path.isdir(path):
+        exts = (".cap", ".pcap", ".pcapng", ".pcap.gz", ".pcapng.gz", ".cap.gz")
+        for root, _dirs, names in os.walk(path):
+            for nm in names:
+                if nm.lower().endswith(exts):
+                    files.append(os.path.join(root, nm))
+        files.sort()
+    elif os.path.isfile(path):
+        files = [path]
+    else:
+        print(f"[!] Fichier ou dossier introuvable : {path}")
+        return 2
+    if not files:
+        print(f"[!] Aucune capture (.cap/.pcap/.pcapng) trouvée dans : {path}")
+        return 2
+    redact = False              # v1.2 : toujours en clair (--no-redact sans effet)
+    base = getattr(args, "o", "") or ""
+    results = []
+    ok_any = False
+    total = Counter()
+    for f in files:
+        res = run_inventory(f, only=only, redact=redact,
+                            debug=bool(getattr(args, "debug", False)),
+                            limit=int(getattr(args, "limit", 0) or 0),
+                            budget=float(getattr(args, "budget", 0) or 0),
+                            deep=bool(getattr(args, "deep", False)))
+        results.append(res)
+        pro_console(res)
+        if res["ok"] or res["packets_read"]:
+            ok_any = True
+            total.update(res["store"].kinds)
+    if not base:
+        if len(files) == 1:
+            base = files[0] + ".inventaire-reseau"
+        else:
+            base = os.path.join(path if os.path.isdir(path)
+                                else (os.path.dirname(path) or "."),
+                                "inventaire-reseau")
+    written = []
+    dossier = os.path.dirname(os.path.abspath(base))
+    if dossier and not os.path.isdir(dossier):
+        try:
+            os.makedirs(dossier, exist_ok=True)
+        except OSError as exc:
+            print(f"[!] Création du dossier de sortie impossible : {exc}")
+    for i, res in enumerate(results):
+        b = base if len(results) == 1 else f"{base}.{i + 1}"
+        try:
+            # v1.2 : le .txt contient TOUTES les découvertes EN CLAIR ;
+            # .json et .csv sont écrits sans condition (même contenu,
+            # formats machine).
+            ptxt = b + ".txt"
+            pro_write_txt(res, ptxt)
+            written.append(ptxt)
+            pj = b + ".json"
+            pro_write_json(res, pj)
+            written.append(pj)
+            pc = b + ".csv"
+            pro_write_csv(res, pc)
+            written.append(pc)
+        except OSError as exc:
+            print(f"[!] Erreur d'écriture : {exc}")
+    print("─" * 74)
+    if len(results) > 1:
+        print(f"{len(results)} captures analysées — TOTAL : " + "   ".join(
+            f"{k}={total.get(k, 0)}" for k in KINDS_ORDER))
+    print("Fichiers écrits :")
+    for s in written:
+        print("  " + os.path.abspath(s))
+    return 0 if ok_any else 2
+
+
+# ----------------------------------------------------------------------------
+#  Crochet MOTEUR — appelé par engine_analyze_capture sur CHAQUE capture :
+#  résumé dans ci.det["inventory"] (cache), base de connaissances (priorité
+#  aux SECRET/MASKED/IDENTITY), entités/relations Host/User, ci.hostnames et
+#  ci.emails pour la corrélation inter-captures. TOUT en clair dans la KB.
+#  Jamais d'exception vers l'analyse principale (§30) — erreurs comptées (§42).
+# ----------------------------------------------------------------------------
+def _pro_looks_host(v):
+    if not (3 <= len(v) <= 253):
+        return False
+    if not all(c.isalnum() or c in ".-_" for c in v):
+        return False
+    labels = [x for x in v.split(".") if x]
+    if not labels:
+        return False
+    return not all(l.isdigit() for l in labels)       # exclut les IPs brutes
+
+
+def _pro_kb_type(f):
+    """Découverte → type KB (KB_TYPES parts/60 étendu) ou None (= non injecté)."""
+    fld = f.field.lower()
+    if f.kind == K_SECRET:
+        if any(t in fld for t in ("password", "pwd", "pass_", "_pass", "community")) \
+                or fld.endswith("pass"):
+            return "password"
+        if "cle_api" in fld or "api_key" in fld:
+            return "apikey"
+        if "hash" in fld or "ntlm" in fld or "scram" in fld:
+            return "hash"
+        if "pem" in fld and "private" in f.value.lower():
+            return "key"
+        if "cookie" in fld or "session" in fld:
+            return "cookie"
+        if any(t in fld for t in ("token", "jwt", "bearer")):
+            return "token"
+        return "secret"
+    if f.kind == K_MASKED:
+        return "mask"
+    if f.kind == K_IDENTITY:
+        if any(t in fld for t in ("user", "nick", "login", "dn", "account")):
+            return "username"
+        if "realm" in fld:
+            return "realm"
+        if any(t in fld for t in ("email", "mail_from", "rcpt_to", "header_from",
+                                  "header_to", "header_cc")):
+            return "email"
+        return "hostname"
+    if f.kind == K_PII:
+        if f.subkind == "email":
+            return "email"
+        if f.subkind == "phone":
+            return "phone"
+        if f.subkind == "card":
+            return "carte"                 # v1.2 : EN CLAIR comme le reste
+        if f.subkind == "iban":
+            return "iban"                  # v1.2 : EN CLAIR comme le reste
+        return "pii"
+    return "metadata"                                 # v1.2 : rien n'est écarté
+
+
+def engine_inventory_capture(prj, ci, echo=True, budget=15.0):
+    """Inventaire réseau d'UNE capture pour le moteur projet.
+
+    v1.2 : toutes les valeurs (e-mails, téléphones, cartes, IBAN) sont
+    conservées EN CLAIR dans la base de connaissances et dans les entités.
+    """
+    try:
+        res = run_inventory(ci.path, redact=False, budget=budget)
+    except Exception as exc:                          # ne JAMAIS bloquer (§30)
+        prj.add_error("inventaire_reseau", exc, capture=ci.name)
+        return None
+    if res is None or (not res["ok"] and res["packets_read"] == 0):
+        err = (res or {}).get("error", "erreur inconnue")
+        prj.add_error("inventaire_reseau", err, capture=ci.name)
+        return None
+    st = res["store"]
+    cap = ci.name
+    somm = {"version": PRO_INVENTORY_VERSION,
+            "trouvees": len(st.findings),
+            "par_categorie": {k: st.kinds.get(k, 0) for k in KINDS_ORDER},
+            "protocoles": dict(st.protos.most_common()),
+            "secondes": res["seconds"],
+            "paquets": res["packets_read"],
+            "anomalies": sum((res.get("anomalies") or {}).values())}
+    if res.get("error"):
+        somm["partiel"] = res["error"]
+    try:
+        kb_per_type = Counter()
+        kb_total = 0
+        # v1.2 : plafonds très relevés — plus aucune découverte écartée en
+        # pratique (ProStore borne déjà la mémoire : PRO_MAX_FINDINGS).
+        KB_TOTAL_MAX, KB_PER_TYPE_MAX = 100000, 20000
+        hostnames, emails, usernames = [], [], []
+        seen_h, seen_e, seen_u = set(), set(), set()
+        for f in _pro_sorted(st.findings):            # SECRET d'abord (priorité)
+            fld = f.field.lower()
+            # -- identités pour corrélation (hostnames) ------------------
+            if f.kind == K_IDENTITY and any(t in fld for t in (
+                    "host", "sni", "domaine", "domain", "answer_a", "answer_cname",
+                    "answer_ptr", "server_name", "client_fqdn", "hostname",
+                    "ehlo", "helo", "stream_to")):
+                v = f.value.lower().rstrip(".")
+                if v not in seen_h and _pro_looks_host(v) \
+                        and all(ord(ch) >= 32 for ch in v):
+                    seen_h.add(v)
+                    hostnames.append(v)
+            # -- e-mails EN CLAIR (v1.2 : aucun masquage) ----------------
+            if f.subkind == "email" or fld in ("mail_from", "rcpt_to") or \
+                    fld.startswith("header_from") or fld.startswith("header_to"):
+                m = RE_PRO_EMAIL.search(f.value.encode("utf-8", "replace"))
+                if m:
+                    v = m.group(0).decode("utf-8", "replace")
+                elif f.subkind == "email":
+                    v = f.value
+                else:
+                    v = ""
+                if v and v not in seen_e:
+                    seen_e.add(v)
+                    emails.append(v)
+            # -- utilisateurs observés -----------------------------------
+            if f.kind == K_IDENTITY and any(t in fld for t in (
+                    "user", "nick", "login", "dn", "account")) and \
+                    f.value.isprintable() and 1 < len(f.value) <= 64:
+                v = f.value
+                if v not in seen_u:
+                    seen_u.add(v)
+                    usernames.append(v)
+            # -- injection KB (plafonnée) --------------------------------
+            ty = _pro_kb_type(f)
+            if ty is None:
+                continue
+            if kb_per_type[ty] >= KB_PER_TYPE_MAX or kb_total >= KB_TOTAL_MAX:
+                continue
+            val = f.value                             # v1.2 : EN CLAIR, toujours
+            if ty == "email":
+                m = RE_PRO_EMAIL.search(val.encode("utf-8", "replace"))
+                if m:
+                    val = m.group(0).decode("utf-8", "replace")
+                elif f.subkind != "email":
+                    continue
+            if len(val) > 512 or any(ord(ch) < 32 for ch in val):
+                continue                    # binaire/contrôle = jamais en KB
+            prj.kb.add(val, ty, status=EV_OBSERVED, confidence=1.0,
+                       source="inventaire réseau", capture=cap, frame=f.frame,
+                       protocol=f.proto, field_=f.field, note=(f.note or ""))
+            kb_per_type[ty] += 1
+            kb_total += 1
+        # -- champs CaptureInfo (corrélation) + entités/relations --------
+        ci.hostnames = hostnames                      # v1.2 : TOUS, en clair
+        ci.emails = emails                            # v1.2 : TOUS, en clair
+        for u in usernames:
+            if u not in (ci.users or []):
+                ci.users = (ci.users or []) + [u]
+        for h in ci.hostnames:
+            prj.add_entity("Host", h, evidence=f"{cap} (inventaire réseau)")
+            prj.add_relation(f"Capture:{cap}", f"Host:{h}", "contains_host",
+                             capture=cap)
+        for u in usernames:
+            prj.add_entity("User", u, evidence=f"{cap} (inventaire réseau)")
+            prj.add_relation(f"User:{u}", f"Capture:{cap}", "appears_in",
+                             capture=cap)
+        somm.update({"kb_injectees": kb_total, "hostnames": len(ci.hostnames),
+                     "emails": len(ci.emails), "users_ajoutes": len(usernames)})
+        ci.det["inventory"] = somm
+    except Exception as exc:
+        prj.add_error("inventaire_reseau", exc, capture=ci.name)
+        ci.det["inventory"] = somm                    # résumé même si KB a échoué
+    if echo:
+        cats = ", ".join(f"{k}={v}" for k, v in somm["par_categorie"].items() if v)
+        print(f"  [+] inventaire réseau : {somm['trouvees']} découverte(s) "
+              f"({cats}) — KB +{somm.get('kb_injectees', 0)}, "
+              f"{somm.get('hostnames', 0)} hôte(s)  ({somm['secondes']}s)")
+    return somm
+
+
 def _ask(prompt: str, default: str = "") -> str:
     suffix = f"  [{default}]" if default else ""
     try:
@@ -9072,11 +21553,16 @@ def _ask_dir(prompt: str = "Dossier contenant les .pcap / .pcapng / .cap") -> st
         tip("Glissez-déposez le dossier ici, ou collez le chemin complet.")
 
 def _print_menu() -> None:
-    """3 options max : fichier / dossier / quitter."""
+    """Menu principal — 4 choix maximum (demande utilisateur explicite :
+    « enlève les fonctionnalités inutiles du début, pas plus de 4 choix »).
+    Rien n'est perdu : les outils projet (poursuivre, knowledge base, graphe,
+    cibles hashcat, rapport HTML) passent dans le SOUS-MENU de l'option 2 ;
+    fichier/dossier classiques sont fusionnés en option 3 (auto-détecté)."""
     items = [
-        ("1", "Un fichier   →   Excel + txt Hashcat"),
-        ("2", "Un dossier   →   Excel + txt Hashcat (tous les pcap)"),
-        ("0", "Quitter"),
+        ("1", "MOTEUR ▸ projet complet — dossier de captures : analyse, crackage, rapports lisibles", "moteur"),
+        ("2", "MOTEUR ▸ ouvrir un projet — poursuivre, knowledge base, graphe, cibles, rapport HTML", "moteur"),
+        ("3", "classique ▸ fichier OU dossier de captures → Excel + txt Hashcat (auto-détecté)", "classique"),
+        ("0", "Quitter", "quit"),
     ]
     if _have_rich():
         from rich.console import Console
@@ -9084,29 +21570,196 @@ def _print_menu() -> None:
         from rich.table import Table
         from rich import box
 
-        table = Table(box=box.SIMPLE, show_header=False, pad_edge=False, expand=True)
-        table.add_column(justify="right", style=f"bold {COLOR_YELLOW}", width=4)
+        table = Table(box=box.SIMPLE, show_header=False, pad_edge=False,
+                      expand=True)
+        table.add_column(justify="right", style=f"bold {COLOR_YELLOW}", width=3)
         table.add_column(style="white")
-        for num, label in items:
-            table.add_row(num, label)
+        for num, label, kind in items:
+            if kind == "moteur":
+                table.add_row(num, f"[bold {COLOR_CYAN}]{label}[/]")
+            elif kind == "quit":
+                table.add_row(num, f"[dim]{label}[/]")
+            else:
+                table.add_row(num, label)
         Console(highlight=False).print(
             Panel(
                 table,
-                title=f"[bold {COLOR_CYAN}]tshark2hashcat[/]  [dim]— menu[/]",
+                title=(f"[bold {COLOR_CYAN}]◆ tshark2hashcat[/]"
+                       f"  [dim]— menu principal (MOTEUR intégré)[/]"),
+                border_style=COLOR_BLUE,
+                padding=(0, 1),
+            )
+        )
+        Console(highlight=False).print(
+            f"  [dim]tapez un numéro puis Entrée · le dossier de sortie est "
+            f"demandé au lancement · rapports lisibles : GUIDE.txt, "
+            f"RAPPORT.txt, rapport.html — tout EN CLAIR (v1.2)[/]")
+    else:
+        print()
+        print("  ◆ tshark2hashcat  —  menu principal (MOTEUR intégré)")
+        print("  " + "─" * 66)
+        for num, label, _kind in items:
+            print(f"    {num}.  {label}")
+        print("  " + "─" * 66)
+        print("    tapez un numéro puis Entrée · le dossier de sortie est")
+        print("    demandé au lancement · rapports : GUIDE.txt, RAPPORT.txt")
+        print()
+
+
+def _print_projet_menu(projet: str) -> None:
+    """Sous-menu projet (option 2) — les anciens outils 4-8 y vivent tous."""
+    items = [
+        ("1", "poursuivre — nouveaux rounds (solveurs → post-crack → rapports)"),
+        ("2", "knowledge base — afficher / filtrer / importer"),
+        ("3", "graphe de connaissances — graphe.dot + fenêtres temporelles"),
+        ("4", "hashes hashcat — un dossier par hash, commandes prêtes"),
+        ("5", "ouvrir le rapport HTML — navigateur"),
+        ("6", "inventaire réseau — tout extraire d'une capture (secrets, tokens, SNI, e-mails en clair…)"),
+        ("0", "revenir au menu principal"),
+    ]
+    if _have_rich():
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich import box
+
+        table = Table(box=box.SIMPLE, show_header=False, pad_edge=False,
+                      expand=True)
+        table.add_column(justify="right", style=f"bold {COLOR_YELLOW}", width=3)
+        table.add_column(style="white")
+        for num, label in items:
+            style = "dim" if num == "0" else f"bold {COLOR_CYAN}"
+            table.add_row(num, f"[{style}]{label}[/]")
+        Console(highlight=False).print(
+            Panel(
+                table,
+                title=(f"[bold {COLOR_CYAN}]▸ PROJET[/]  [dim]{projet}[/]"),
                 border_style=COLOR_BLUE,
                 padding=(0, 1),
             )
         )
     else:
         print()
-        print("  tshark2hashcat  —  menu")
-        print("  " + "─" * 56)
+        print(f"  ▸ PROJET — {projet}")
+        print("  " + "─" * 66)
         for num, label in items:
             print(f"    {num}.  {label}")
         print()
 
+
+def _ask_path(prompt: str = "Fichier OU dossier de captures "
+                            "(.pcap / .pcapng / .cap / .json)") -> str:
+    """Chemin fichier OU dossier (option 3 : le type est auto-détecté)."""
+    while True:
+        path = _ask(prompt).strip().strip('"').strip("'")
+        if not path:
+            return ""
+        if os.path.isfile(path) or os.path.isdir(path):
+            return path
+        cand = os.path.abspath(path)
+        if os.path.isfile(cand) or os.path.isdir(cand):
+            return cand
+        err(f"Fichier ou dossier introuvable : {path}")
+        tip("Glissez-déposez le chemin ici, ou collez le chemin complet.")
+
+
+def _wizard_projet(projet: str) -> None:
+    """Sous-menu d'un projet existant — mêmes actions que les anciennes
+    options 4-8, aucun comportement changé, seulement regroupées."""
+    while True:
+        print()
+        _print_projet_menu(projet)
+        try:
+            choix = input("  Votre choix : ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if choix in {"0", "q", "quit", "exit"}:
+            return
+        if choix not in {"1", "2", "3", "4", "5", "6"}:
+            warn("Tapez 1 à 6 (outil projet) ou 0 (menu principal).")
+            continue
+        try:
+            if choix == "1":
+                kn = _ask("Fichier de connaissances à importer avant les rounds (Entrée = aucun) : ")
+                argv = ["solve", projet, "--no-banner"]
+                if kn:
+                    argv += ["--knowledge", kn]
+                main(argv)
+            elif choix == "2":
+                st = _ask("Filtrer par statut (VALIDATED / CORRELATED / OBSERVED…, Entrée = tous) : ").upper()
+                ty = _ask("Filtrer par type (password / secret / pmk / hash…, Entrée = tous) : ")
+                kn = _ask("Fichier de connaissances à importer (Entrée = aucun) : ")
+                argv = ["knowledge", projet, "--no-banner"]
+                if st:
+                    argv += ["--status", st]
+                if ty:
+                    argv += ["--type", ty]
+                if kn:
+                    argv += ["--knowledge", kn]
+                main(argv)
+            elif choix == "3":
+                main(["graph", projet, "--no-banner"])
+            elif choix == "4":
+                wl = _ask("Wordlist à associer aux commandes hashcat (Entrée = aucune) : ")
+                argv = ["targets", projet, "--no-banner"]
+                if wl:
+                    argv += ["-w", wl]
+                main(argv)
+            elif choix == "6":
+                racine = ""
+                try:
+                    import json as _json
+                    _pj = os.path.join(projet, OUT_DATA_JSON)
+                    if not os.path.isfile(_pj):
+                        _pj = os.path.join(projet, "project.json")
+                    with open(_pj, encoding="utf-8") as _fh:
+                        racine = _json.load(_fh).get("root", "") or ""
+                except Exception:
+                    racine = ""
+                defaut = (f" (Entrée = dossier analysé : {racine})"
+                          if racine else "")
+                cap = _ask("Fichier ou dossier de captures à inventorier"
+                           + defaut + " : ")
+                cible = cap or racine
+                if not cible:
+                    err("aucune cible — indiquez un fichier ou dossier de captures")
+                    continue
+                js = _ask("Écrire aussi le rapport JSON ? (o/N) : ").strip().lower()
+                argv = ["inventory", cible, "--no-banner"]
+                if js in ("o", "oui", "y", "yes"):
+                    argv += ["--json"]
+                main(argv)
+            elif choix == "5":
+                htmlp = os.path.join(projet, OUT_REPORT_HTML)
+                if not os.path.isfile(htmlp):
+                    err(f"{OUT_REPORT_HTML} introuvable dans {projet} — "
+                        "lancez d'abord un projet complet (option 1)")
+                    continue
+                try:
+                    import webbrowser
+                    ouvert = webbrowser.open("file://" + os.path.abspath(htmlp))
+                    if ouvert:
+                        ok(f"rapport ouvert dans le navigateur : {htmlp}")
+                    else:
+                        warn(f"aucun navigateur trouvé — ouvrez manuellement : {htmlp}")
+                except Exception as exc:  # noqa: BLE001 — jamais bloquant
+                    warn(f"ouverture automatique impossible ({exc}) — "
+                         f"ouvrez manuellement : {htmlp}")
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                warn(f"terminé avec le code {exc.code}")
+        except Exception as exc:  # noqa: BLE001
+            err(str(exc))
+        _pause()
+
+
 def run_wizard(lang: str = "fr") -> int:
-    """Menu interactif : on tape un numéro, pas une commande."""
+    """Menu interactif : on tape un numéro, pas une commande.
+    4 choix maximum (demande utilisateur) : 1 = moteur projet complet,
+    2 = ouvrir un projet (sous-menu : poursuivre / knowledge base / graphe /
+    cibles / rapport HTML), 3 = classique fichier OU dossier (auto-détecté),
+    0 = quitter."""
     set_lang(lang)
     first = True
     while True:
@@ -9125,21 +21778,49 @@ def run_wizard(lang: str = "fr") -> int:
         if choix in {"0", "q", "quit", "exit", "n", "non"}:
             ok("À bientôt.")
             return 0
-        if choix not in {"1", "2"}:
-            warn("Tapez 1 (fichier), 2 (dossier) ou 0 (quitter).")
+        if choix not in {"1", "2", "3"}:
+            warn("Tapez 1 (MOTEUR projet complet), 2 (ouvrir un projet), "
+                 "3 (fichier ou dossier → Excel/hashcat) ou 0 (quitter).")
             continue
 
         try:
             if choix == "1":
-                pcap = _ask_file()
-                if not pcap:
-                    continue
-                main(["auto", pcap, "--no-banner"])
-            elif choix == "2":
-                dossier = _ask_dir()
+                dossier = _ask_dir("Dossier du projet (captures .pcap / .pcapng / .cap / .json)")
                 if not dossier:
                     continue
-                main(["folder", dossier, "--no-banner"])
+                defaut_out = _engine_default_out(dossier)
+                print("  OÙ ÉCRIRE LES FICHIERS DE SORTIE ? (rapports, hashes, journaux)")
+                print(f"    défaut (Entrée) : {defaut_out}")
+                print("    autre dossier   : tapez son chemin complet")
+                sortie = _ask("  Dossier de sortie : ").strip()
+                sortie = sortie or defaut_out
+                kn = _ask("Fichier de connaissances — lignes type:valeur ou JSON (Entrée = aucun) : ")
+                deep = _ask("Mode profond — échelles complètes, sans budget temps ? [o/N] : ").lower()
+                argv = ["project", dossier, "--no-banner", "--out", sortie]
+                if kn:
+                    argv += ["--knowledge", kn]
+                if deep in ("o", "oui", "y", "yes"):
+                    argv.append("--deep")
+                main(argv)
+                print()
+                info(f"TOUT EST DANS : {sortie}")
+                info(f"ouvrez d'abord {OUT_GUIDE_TXT} (le guide), puis "
+                     f"{OUT_REPORT_TXT} (rapport texte) ou {OUT_REPORT_HTML} "
+                     "(double-clic → navigateur) — tout est EN CLAIR")
+            elif choix == "2":
+                projet = _ask_dir(f"Dossier projet (celui qui contient {OUT_DATA_JSON})")
+                if not projet:
+                    continue
+                _wizard_projet(projet)
+                continue        # le sous-menu a déjà fait ses pauses
+            elif choix == "3":
+                chemin = _ask_path()
+                if not chemin:
+                    continue
+                if os.path.isdir(chemin):
+                    main(["folder", chemin, "--no-banner"])
+                else:
+                    main(["auto", chemin, "--no-banner"])
         except SystemExit as exc:
             # les cmd_* font parfois sys.exit — on reste dans le menu
             if exc.code not in (0, None):
@@ -9207,6 +21888,18 @@ def _build_parser() -> argparse.ArgumentParser:
     au.add_argument("--wordlist", default="wordlist.txt")
     au.add_argument("--limit", type=int, default=0)
     au.add_argument("--no-raw", action="store_true")
+    au.add_argument("--no-solve", action="store_true",
+                    help="Désactiver les solveurs intégrés (auth / WPA2-Enterprise / WEP / SAE)")
+    au.add_argument("--deep", action="store_true",
+                    help="Solveurs intégrés : brute force complet, sans budget temps (défaut : mode rapide borné)")
+    au.add_argument("--solve-timeout", type=int, default=0,
+                    help="Budget en secondes par solveur (0 = défaut : 180 s en mode rapide, illimité avec --deep)")
+    au.add_argument("--sae-mask", default=None,
+                    help="Solveur WPA3-SAE : mask hexadécimal (défaut : valeur du script auto-sae d'origine)")
+    au.add_argument("--auth-mask", default=None,
+                    help="Solveur auth : mask de crackage (syntaxe du sous-code 1, ex. 'frag?l?l?l') — sinon proposé en interactif")
+    au.add_argument("--no-ask", action="store_true",
+                    help="Solveurs intégrés : ne poser aucune question interactive (wordlist / masks / candidats RADIUS / WEP profond), même sur terminal")
     au.set_defaults(_fn=cmd_auto)
 
     # folder — un dossier de pcap → un seul Excel
@@ -9409,6 +22102,81 @@ def _build_parser() -> argparse.ArgumentParser:
     ic.add_argument("-o", "--output", default="tshark2hashcat.json")
     ic.set_defaults(_fn=cmd_init_config)
 
+    # ---- MOTEUR (§32) : project · knowledge · graph · targets · solve ----
+    pj = _sub("project", help="Moteur : projet d'analyse complet d'un dossier de captures (inventaire → analyse → corrélations → knowledge base → cibles → solveurs → rounds → rapports)")
+    pj.add_argument("path", help="Dossier (ou fichier .pcap/.pcapng/.cap/.json) à analyser")
+    pj.add_argument("-o", "--out", default=None, help="Dossier de sortie du projet (défaut : <nom>-projet à côté du dossier analysé)")
+    pj.add_argument("--context", default="CTF", choices=("CTF", "PENTEST", "AUDIT", "RESEARCH"), help="Contexte déclaré du projet (défaut : CTF)")
+    pj.add_argument("--scope", default="", help="PENTEST : périmètre autorisé — IP/CIDR séparés par virgules (§8, hors scope jamais testé)")
+    pj.add_argument("--exclude", default="", help="IP/CIDR explicitement exclus du périmètre (virgules)")
+    pj.add_argument("-w", "--wordlist", default="", help="Wordlist pour les cibles hashcat (§13 : absente = NO_WORDLIST, jamais une erreur)")
+    pj.add_argument("--knowledge", default="", help="Fichier de connaissances (§7) : JSON [{type,value,context}] ou lignes type:valeur")
+    pj.add_argument("--deep", action="store_true", help="Mode profond : échelles complètes, budget illimité")
+    pj.add_argument("--budget", type=int, default=0, help="Budget en secondes par solveur (0 = défaut : 180 s, illimité avec --deep)")
+    pj.add_argument("--cores", type=int, default=0, help="Nombre de cœurs CPU pour le cassage interne (0 = tous ; mémorisé dans donnees.json)")
+    pj.add_argument("--hashcat", default="", help="Chemin de l'exécutable hashcat : casse les cibles READY avec (GPU, plus rapide que le CPU interne) ; mémorisé dans donnees.json")
+    pj.add_argument("--hashcat-run", dest="hashcat_run", action="store_true", help="Lancer hashcat sans confirmation (nécessite --hashcat ou chemin mémorisé, et une wordlist)")
+    pj.add_argument("--rounds", type=int, default=4, help="Nombre maximum de cycles du moteur (défaut : 4 ; arrêt anticipé à l'état stable)")
+    pj.add_argument("--sae-mask", default=None, help="Mask SAE (hex) pour WPA3 — sinon knowledge base puis question interactive")
+    pj.add_argument("--auth-mask", default=None, help="Mask de crackage applicatif (syntaxe sous-code 1, ex. 'frag?l?l?l')")
+    pj.add_argument("--no-cache", action="store_true", help="Ignorer le cache d'analyse (§31) et tout ré-analyser")
+    pj.add_argument("--no-recursive", action="store_true", help="Ne pas parcourir les sous-dossiers de l'inventaire")
+    pj.add_argument("--no-excel", action="store_true", help="Ne pas générer rapport.xlsx")
+    pj.add_argument("--no-html", action="store_true", help="Ne pas générer rapport.html")
+    pj.add_argument("--fresh", action="store_true", help="Repartir d'un projet vierge (ignore donnees.json existant)")
+    pj.add_argument("--no-ask", dest="ask", action="store_false", default=None, help="Aucune question interactive (wordlist/masks/candidats/WEP deep)")
+    pj.set_defaults(_fn=cmd_project)
+
+    kn = _sub("knowledge", help="Moteur : knowledge base d'un projet — affichage filtrable, import (§6/§7)")
+    kn.add_argument("project_dir", help="Dossier projet (contenant donnees.json)")
+    kn.add_argument("--knowledge", default="", help="Fichier de connaissances à importer (JSON ou type:valeur)")
+    kn.add_argument("--type", default="", help="Filtrer par type (ex. password, secret, pmk, hash)")
+    kn.add_argument("--status", default="", help="Filtrer par statut (ex. VALIDATED, CORRELATED, OBSERVED)")
+    kn.add_argument("--json-out", default="", help="Exporter les entrées filtrées en JSON")
+    kn.set_defaults(_fn=cmd_knowledge)
+
+    gr = _sub("graph", help="Moteur : graphe de connaissances — graphe.dot + statistiques + timeline (§9/§27)")
+    gr.add_argument("project_dir", help="Dossier projet (contenant donnees.json)")
+    gr.add_argument("-o", "--out", default="", help="Chemin du fichier .dot (défaut : <projet>/graphe.dot)")
+    gr.set_defaults(_fn=cmd_graph)
+
+    tg = _sub("targets", help="Moteur : hashes hashcat — revalidation des formats, UN DOSSIER PAR HASH + fichiers par mode + commandes (§11)")
+    tg.add_argument("project_dir", help="Dossier projet (contenant donnees.json)")
+    tg.add_argument("-w", "--wordlist", default="", help="Wordlist à associer aux commandes générées (§13)")
+    tg.set_defaults(_fn=cmd_targets)
+
+    sv = _sub("solve", help="Moteur : poursuivre un projet — nouveaux rounds (solveurs → post-crack → rapports) (§18)")
+    sv.add_argument("project_dir", help="Dossier projet (contenant donnees.json)")
+    sv.add_argument("-w", "--wordlist", default="", help="Wordlist (mise à jour du projet si fournie)")
+    sv.add_argument("--knowledge", default="", help="Fichier de connaissances à importer avant les rounds")
+    sv.add_argument("--deep", action="store_true", help="Mode profond pour les rounds")
+    sv.add_argument("--budget", type=int, default=0, help="Budget en secondes par solveur (0 = défaut)")
+    sv.add_argument("--cores", type=int, default=0, help="Nombre de cœurs CPU pour le cassage interne (0 = tous ; défaut du projet sinon)")
+    sv.add_argument("--hashcat", default="", help="Chemin de hashcat pour casser les cibles READY (GPU) ; mémorisé")
+    sv.add_argument("--hashcat-run", dest="hashcat_run", action="store_true", help="Lancer hashcat sans confirmation")
+    sv.add_argument("--rounds", type=int, default=2, help="Nombre maximum de cycles (défaut : 2)")
+    sv.add_argument("--sae-mask", default=None, help="Mask SAE (hex) pour WPA3")
+    sv.add_argument("--auth-mask", default=None, help="Mask de crackage applicatif")
+    sv.add_argument("--no-cache", action="store_true", help="Ignorer le cache d'analyse (§31)")
+    sv.add_argument("--no-excel", action="store_true", help="Ne pas régénérer rapport.xlsx")
+    sv.add_argument("--no-html", action="store_true", help="Ne pas régénérer rapport.html")
+    sv.add_argument("--no-ask", dest="ask", action="store_false", default=None, help="Aucune question interactive")
+    sv.set_defaults(_fn=cmd_solve)
+
+    # ---- INVENTAIRE RÉSEAU : utilisable indépendamment du moteur ----
+    iv = _sub("inventory", help="Inventaire RÉSEAU EXHAUSTIF d'un fichier ou dossier de captures (pcap/pcapng, même tronqué) — secrets en clair, credentials, tokens, cookies, certificats, SNI, DNS, e-mails, données masquées, clés API, hashes… (toutes les valeurs EN CLAIR, aucun masquage)")
+    iv.add_argument("path", help="Fichier capture (.pcap/.pcapng/.cap/.gz) ou dossier à inventorier")
+    iv.add_argument("--only", default="", help="Restreindre aux protocoles listés (virgules) : dns,http,tls,smtp,ftp,snmp,ldap,radius,mine,… — `inventory --only` affiche la liste complète en cas d'erreur")
+    iv.add_argument("-o", "--out", dest="o", default="", help="Base des fichiers de sortie (défaut : <capture>.inventaire-reseau ou <dossier>/inventaire-reseau)")
+    iv.add_argument("--json", action="store_true", help="(compatibilité) le JSON complet est désormais écrit SYSTÉMATIQUEMENT")
+    iv.add_argument("--csv", action="store_true", help="(compatibilité) le CSV complet est désormais écrit SYSTÉMATIQUEMENT")
+    iv.add_argument("--no-redact", action="store_true", help="(compatibilité) depuis la v1.2 tout est déjà EN CLAIR : cette option n'a plus d'effet")
+    iv.add_argument("--deep", action="store_true", help="Mode profond : candidats hex-hash ambigus inclus")
+    iv.add_argument("--debug", action="store_true", help="Trace de débogage : anomalies détaillées par trame")
+    iv.add_argument("--limit", type=int, default=0, help="Nombre maximum de paquets à traiter (0 = tous)")
+    iv.add_argument("--budget", type=float, default=0.0, help="Budget temps en secondes par fichier (0 = illimité)")
+    iv.set_defaults(_fn=cmd_inventory)
+
     return p
 
 def _maybe_banner(args) -> None:
@@ -9440,8 +22208,13 @@ def _run_extraction(
     no_progress: bool = False,
     quiet: bool = False,
     verbose: bool = False,
+    return_packets: bool = False,
 ) -> tuple[ExtractResult, list[ExportArtifact], float]:
-    """Charge, extrait, exporte. Partagé par extract et auto."""
+    """Charge, extrait, exporte. Partagé par extract et auto.
+
+    ``return_packets=True`` ajoute en 4e élément les paquets tshark chargés,
+    réutilisés par les solveurs intégrés (pas de second appel à tshark).
+    """
     stages = MultiStage(
         [
             ("load", t("stage.run_tshark") if not is_json_export(pcap) else t("stage.parse_json")),
@@ -9491,6 +22264,8 @@ def _run_extraction(
         )
         arts = export_all(result, req)
         stages.done("export")
+    if return_packets:
+        return result, arts, timer.seconds, packets
     return result, arts, timer.seconds
 
 def _print_extract_results(
@@ -9529,13 +22304,27 @@ def _print_extract_results(
     return 0
 
 def cmd_auto(args) -> int:
-    """Un fichier → hashes + toutes les données confidentielles + rapport."""
+    """Un fichier → hashes + toutes les données confidentielles + rapport.
+
+    Intègre automatiquement les 4 solveurs hors ligne (auth, WPA2-Enterprise,
+    WEP, SAE) après l'extraction :
+      --no-solve      désactive l'étape solveurs (comportement d'origine) ;
+      --deep          brute force complet, sans budget temps ;
+      --solve-timeout budget en secondes par solveur (0 = défaut) ;
+      --sae-mask      mask hexadécimal du solveur WPA3-SAE (défaut : valeur
+                      du script auto-sae d'origine).
+    Le code de retour reste celui de l'extraction (inchangé) ; l'étape
+    solveurs est isolée et ne peut ni crasher la commande ni changer son rc.
+    """
     _need_file(args.pcap)
     fmts = split_csv(args.formats) or ["xlsx", "txt"]
     src = Path(args.pcap)
     out = args.output or str(src.with_name("tshark2hashcat-rapport.xlsx"))
+    result = None
+    packets = None
+    rc = 1
     try:
-        result, arts, elapsed = _run_extraction(
+        result, arts, elapsed, packets = _run_extraction(
             args.pcap,
             out,
             fmts,
@@ -9548,18 +22337,44 @@ def cmd_auto(args) -> int:
             no_progress=args.no_progress,
             quiet=args.quiet,
             verbose=args.verbose,
+            return_packets=True,
         )
     except TsharkError as exc:
         err(str(exc))
-        return 1
-    return _print_extract_results(
-        result,
-        arts,
-        output=out,
-        wordlist=getattr(args, "wordlist", "wordlist.txt"),
-        elapsed=elapsed,
-        verbose=args.verbose,
-    )
+        rc = 1
+    if result is not None:
+        rc = _print_extract_results(
+            result,
+            arts,
+            output=out,
+            wordlist=getattr(args, "wordlist", "wordlist.txt"),
+            elapsed=elapsed,
+            verbose=args.verbose,
+        )
+    # --- Solveurs intégrés (automatiques ; isolation totale du pipeline) ---
+    if not getattr(args, "no_solve", False):
+        try:
+            run_integrated_solvers(
+                args.pcap,
+                result=result,
+                packets=packets,
+                tshark_path=args.tshark,
+                wordlist=getattr(args, "wordlist", "wordlist.txt"),
+                deep=getattr(args, "deep", False),
+                solve_timeout=getattr(args, "solve_timeout", 0) or 0,
+                sae_mask=getattr(args, "sae_mask", None),
+                auth_mask=getattr(args, "auth_mask", None),
+                ask=(False if getattr(args, "no_ask", False) else None),
+                quiet=args.quiet,
+                verbose=args.verbose,
+                artifact_path=_solve_artifact_path(out),
+            )
+        except Exception as exc:  # noqa: BLE001 — filet de sécurité global
+            err(f"solveurs intégrés : erreur inattendue : {exc}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
+    return rc
 
 def discover_pcaps(root: str | os.PathLike, recursive: bool = True) -> list[Path]:
     """Liste les .pcap / .pcapng / .cap / .dmp d'un dossier."""
@@ -10309,6 +23124,15 @@ def cmd_doctor(args) -> int:
         except ImportError:
             deps[name] = "MANQUANT"
     print_kv_panel("Dépendances Python", list(deps.items()))
+    try:
+        _selftest_ok = selftest(verbose=False)
+    except Exception as exc:  # noqa: BLE001 — le self-test ne doit jamais casser doctor
+        _selftest_ok = False
+        warn(f"self-test solveurs : erreur : {exc}")
+    print_kv_panel(
+        "Self-test solveurs intégrés",
+        [("vecteurs RFC (SCRAM / CRAM-MD5 / Digest / APOP)", "ok" if _selftest_ok else "ÉCHEC")],
+    )
     if not st.get("tshark"):
         warn(t("err.tshark_missing"))
         return 1
@@ -10324,6 +23148,17 @@ def cmd_init_config(args) -> int:
     path = write_example_config(args.output)
     ok(str(path))
     return 0
+
+# Console Windows (cp850/cp1252/latin-1) : les caractères non encodables
+# (mots exotiques des wordlists, payloads CTF) sont REMPLACÉS à l'affichage
+# au lieu de faire planter les solveurs (UnicodeEncodeError). Sans effet sur
+# les terminaux UTF-8 et sur les fichiers de sortie (écrits en UTF-8).
+for _std_stream in (sys.stdout, sys.stderr):
+    try:
+        _std_stream.reconfigure(errors="replace")
+    except Exception:  # flux déjà remplacé / non reconfigurable
+        pass
+
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -10359,7 +23194,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # banner sauf pour les commandes « data » silencieuses
     silent = {"fields", "follow", "stats", "hosts", "expert", "protocols", "ifaces"}
     if args.cmd not in silent and not args.quiet and not args.no_banner:
-        if args.cmd in {"extract", "auto", "folder", "analyze", "report", "doctor"}:
+        if args.cmd in {"extract", "auto", "folder", "analyze", "report", "doctor", "project", "inventory"}:
             print_logo(lang=get_lang(), compact=True, no_color=args.no_color)
 
     try:
