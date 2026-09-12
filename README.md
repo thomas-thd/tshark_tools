@@ -1,37 +1,85 @@
-<p align="center">
-  <img src="banner.png" alt="tshark2hashcat" width="100%">
-</p>
+# tshark2hashcat
 
-<h1 align="center">tshark2hashcat</h1>
+**tshark2hashcat** est un outil Python d'analyse de captures réseau basé sur **TShark**, avec extraction d'informations, identification de cibles, génération de formats Hashcat et gestion de projets d'analyse.
 
-<p align="center">
-  <b>Analyse de captures réseau avec TShark, extraction de hashes et analyse des identifiants.</b>
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.10%2B-3776ab?style=for-the-badge&logo=python&logoColor=white">
-  <img src="https://img.shields.io/badge/TShark-Wireshark-1679a7?style=for-the-badge&logo=wireshark&logoColor=white">
-  <img src="https://img.shields.io/badge/Hashcat-ready-d75fff?style=for-the-badge">
-  <img src="https://img.shields.io/badge/license-Apache--2.0-5fd75f?style=for-the-badge">
-</p>
-
-<p align="center">
-  <code>v1.2.0</code>
-</p>
-
-> Audit, pentest, CTF et recherche. Utilisez uniquement des captures que vous êtes autorisé à analyser.
+> Version **1.2.0** · Licence **Apache-2.0**
 
 ---
 
-# Utilisation
+## Sommaire
 
-Le moyen le plus simple d'utiliser `tshark2hashcat` est le **menu interactif**.
+* [Fonctionnement](#fonctionnement)
+* [Installation](#installation)
+* [Utilisation CLI](#utilisation-cli)
 
-```bash
+  * [1. Nouveau projet](#1--nouveau-projet)
+  * [2. Ouvrir un projet](#2--ouvrir-un-projet)
+  * [3. Mode classique](#3--mode-classique)
+* [Menu projet](#menu-projet)
+* [Hashcat](#hashcat)
+* [Inventaire réseau](#inventaire-réseau)
+* [Protocoles analysés](#protocoles-analysés)
+* [Options CLI](#options-cli)
+* [Diagnostic](#diagnostic)
+* [Formats de sortie](#formats-de-sortie)
+
+---
+
+# Fonctionnement
+
+Le programme propose deux approches principales :
+
+```text
+                         tshark2hashcat
+                               │
+                ┌──────────────┼──────────────┐
+                │              │              │
+                ▼              ▼              ▼
+          Nouveau projet   Projet existant   Classique
+                │              │              │
+                ▼              ▼              ▼
+          Analyse complète   Reprise       Extraction
+          + rapports         + rounds      directe
+                │              │
+                └───────┬──────┘
+                        ▼
+                 Cibles / Hashcat
+                        │
+                        ▼
+                  Rapports
+```
+
+Le mode **projet** permet de conserver les résultats entre plusieurs analyses et de poursuivre le traitement ultérieurement.
+
+---
+
+# Installation
+
+Le programme nécessite notamment :
+
+* Python
+* TShark / Wireshark
+* les dépendances Python du projet
+
+Le chemin vers TShark peut être fourni directement avec `--tshark`.
+
+Exemple Windows :
+
+```powershell
+python tshark2hashcat.py --tshark "C:\Program Files\Wireshark\tshark.exe"
+```
+
+---
+
+# Utilisation CLI
+
+Lancement :
+
+```powershell
 python tshark2hashcat.py
 ```
 
-Le programme affiche :
+Le menu principal est :
 
 ```text
 ◆ tshark2hashcat  —  menu principal
@@ -50,47 +98,24 @@ Le programme affiche :
   Votre choix :
 ```
 
-Le type d'entrée est automatiquement détecté pour l'option `3`. Il suffit donc de choisir le numéro puis de fournir le chemin demandé.
-
 ---
 
-# 1. MOTEUR : nouveau projet
+# 1. Nouveau projet
 
-L'option **1** lance le moteur complet sur un dossier contenant les captures.
+L'option **1** crée un nouveau projet à partir d'un dossier de captures.
 
-```text
-Votre choix : 1
-
-Dossier du projet (captures .pcap / .pcapng / .cap / .json) :
-```
-
-Le programme demande ensuite où écrire les résultats :
+Le programme demande :
 
 ```text
-OÙ ÉCRIRE LES FICHIERS DE SORTIE ? (rapports, hashes, journaux)
-
-  défaut (Entrée) : <dossier de sortie>
-
-  autre dossier   : tapez son chemin complet
-
-  Dossier de sortie :
+Dossier de captures (.pcap/.pcapng/.cap/.json) :
+Dossier de sortie :
+Fichier knowledge optionnel :
+Deep mode ? [o/N] :
 ```
 
-Puis éventuellement un fichier de connaissances :
+Le programme effectue ensuite l'analyse du projet.
 
-```text
-Fichier de connaissances — lignes type:valeur ou JSON (Entrée = aucun) :
-```
-
-Et le mode profond :
-
-```text
-Mode profond — échelles complètes, sans budget temps ? [o/N] :
-```
-
-Ces questions correspondent directement au parcours du wizard.
-
-Une fois l'analyse terminée :
+À la fin :
 
 ```text
 TOUT EST DANS : <dossier de sortie>
@@ -100,39 +125,36 @@ RAPPORT.txt (rapport texte) ou rapport.html
 (double-clic → navigateur)
 ```
 
-### Ce mode est destiné à l'analyse complète
+### Organisation générale
 
-Le moteur projet regroupe notamment :
+Le projet conserve ses données afin de pouvoir être rouvert et poursuivi.
 
-```text
-Captures
-   ↓
-Analyse
-   ↓
-Extraction
-   ↓
-Solveurs
-   ↓
-Post-crack
-   ↓
-Rapports
-```
+Les résultats peuvent notamment contenir :
 
-Il peut ensuite être rouvert avec l'option `2`.
+* informations réseau
+* identités
+* secrets
+* métadonnées
+* protocoles détectés
+* anomalies
+* cibles
+* résultats des solveurs
+* résultats de cracking
+* rapports
 
 ---
 
-# 2. MOTEUR : ouvrir un projet
+# 2. Ouvrir un projet
 
 L'option **2** permet de reprendre un projet existant.
 
-```text
-Votre choix : 2
+Le programme demande un dossier contenant notamment :
 
-Dossier projet (celui qui contient data.json) :
+```text
+data.json
 ```
 
-Le programme ouvre ensuite le sous-menu du projet :
+Puis affiche :
 
 ```text
 ▸ PROJET — <dossier>
@@ -158,210 +180,428 @@ Le programme ouvre ensuite le sous-menu du projet :
   Votre choix :
 ```
 
-Ce sous-menu correspond directement aux fonctions présentes dans le code.
+---
 
-## 2.1 Poursuivre
+## 2.1 Poursuivre le projet
 
-```text
-Votre choix : 1
-```
+L'option **1** reprend l'analyse d'un projet.
 
-Permet de reprendre l'analyse du projet et d'effectuer de nouveaux rounds.
-
-Le programme demande éventuellement un fichier de connaissances :
+Le moteur peut enchaîner plusieurs rounds :
 
 ```text
-Fichier de connaissances à importer avant les rounds (Entrée = aucun) :
+analyse
+   ↓
+identification des cibles
+   ↓
+solveurs
+   ↓
+post-crack
+   ↓
+propagation des informations
+   ↓
+nouveau round
 ```
+
+Les informations récupérées peuvent être réinjectées dans le projet afin de servir de nouvelles candidates lors des rounds suivants.
 
 ---
 
 ## 2.2 Knowledge Base
 
-```text
-Votre choix : 2
-```
+L'option **2** permet d'utiliser la base de connaissances du projet.
 
-Le programme demande éventuellement :
+Elle permet notamment :
 
-```text
-Filtrer par statut (VALIDATED / CORRELATED / OBSERVED…, Entrée = tous) :
-Filtrer par type (password / secret / pmk / hash…, Entrée = tous) :
-Fichier de connaissances à importer (Entrée = aucun) :
-```
+* d'afficher les informations enregistrées ;
+* de filtrer les données ;
+* d'importer un fichier de knowledge.
+
+Un fichier de knowledge peut également être fourni lors de la reprise d'un projet.
 
 ---
 
-## 2.3 Graphe
+## 2.3 Graphe de connaissances
+
+L'option **3** génère et exploite le graphe de connaissances du projet.
+
+Le programme peut produire :
 
 ```text
-Votre choix : 3
+graphe.dot
 ```
 
-Lance le graphe de connaissances du projet.
-
-```text
-graph.dot
-```
-
-est généré par la commande correspondante.
+Le graphe permet notamment de représenter les relations découvertes pendant l'analyse et d'utiliser des fenêtres temporelles.
 
 ---
 
 ## 2.4 Hashes Hashcat
 
-```text
-Votre choix : 4
-```
+L'option **4** prépare les cibles destinées à Hashcat.
 
-Le programme demande éventuellement une wordlist :
+Le programme organise les cibles dans des dossiers individuels et prépare les commandes nécessaires.
 
-```text
-Wordlist à associer aux commandes hashcat (Entrée = aucune) :
-```
-
-Puis traite les cibles Hashcat du projet.
-
-Les commandes générées peuvent notamment utiliser :
+Exemple de structure :
 
 ```text
-Dictionnaire
-Rules
-Combinator
-Mask
-Hybrid
+<projet>/
+└── ...
+    └── hash/
+        ├── ...
+        ├── ...
+        └── ...
 ```
 
-Par exemple, le code génère des commandes de type :
+Une wordlist peut être demandée lors du traitement.
 
-```bash
-hashcat -m <mode> -a 1 -O -w 3 <hashfile> <wordlist> <wordlist>
+Les modes Hashcat déclarés par le projet sont :
+
+```text
+20
+4800
+5500
+5600
+7500
+11400
+13100
+16500
+18200
+19600
+19700
+19800
+19900
+22000
+32100
+32200
 ```
 
-ou :
+Le moteur sait également générer des commandes utilisant notamment :
 
-```bash
-hashcat -m <mode> -a 3 -O -w 3 <hashfile> ?l?l?l?l?l?l?l?l
+```text
+hashcat
+--show
+--wordlist
 ```
 
-et :
-
-```bash
-hashcat -m <mode> --show <hashfile>
-```
+ainsi que différents types d'attaques selon la cible.
 
 ---
 
 ## 2.5 Rapport HTML
 
-```text
-Votre choix : 5
-```
+L'option **5** ouvre directement le rapport HTML du projet dans le navigateur.
 
-Le rapport HTML du projet est ouvert automatiquement dans le navigateur lorsqu'il existe.
+Le programme tente d'ouvrir automatiquement le fichier.
 
-Si le navigateur ne peut pas être ouvert automatiquement :
-
-```text
-aucun navigateur trouvé — ouvrez manuellement : <rapport.html>
-```
+Si l'ouverture automatique échoue, le chemin du rapport est indiqué afin de pouvoir l'ouvrir manuellement.
 
 ---
 
 ## 2.6 Inventaire réseau
 
-```text
-Votre choix : 6
-```
+L'option **6** lance l'inventaire réseau sur une capture.
 
-Cette fonction permet d'extraire les informations réseau d'une capture.
-
-Elle peut produire notamment :
+L'inventaire extrait notamment :
 
 ```text
-secrets
-tokens
-SNI
-e-mails
-identités
-PII
-métadonnées
+IPs
 protocoles
+identités
+secrets
+métadonnées
+anomalies
+découvertes
 ```
 
-Les sorties d'inventaire sont écrites en TXT, JSON et CSV dans la version actuelle du code.
+Les résultats sont exportés dans plusieurs formats :
+
+```text
+TXT
+JSON
+CSV
+```
+
+Les informations de trames et les relations source/destination sont également conservées dans les résultats.
 
 ---
 
 # 3. Mode classique
 
-L'option **3** est le mode le plus simple pour analyser rapidement une capture.
+L'option **3** permet de travailler directement sur un fichier ou un dossier de captures.
 
 ```text
-Votre choix : 3
-
 Fichier OU dossier de captures
 (.pcap / .pcapng / .cap / .json) :
 ```
 
-Le programme détecte automatiquement si le chemin fourni correspond à un fichier ou à un dossier.
+Le programme détecte automatiquement s'il s'agit :
+
+* d'un fichier ;
+* d'un dossier.
 
 ### Fichier
 
-```text
-Votre choix : 3
+Exemple :
 
-Fichier OU dossier de captures :
-C:\captures\capture.pcapng
+```powershell
+python tshark2hashcat.py capture.pcap
 ```
 
-Le programme lance automatiquement :
-
-```text
-auto
-```
+Le fichier est traité en mode `auto`.
 
 ### Dossier
 
-```text
-Votre choix : 3
+Exemple :
 
-Fichier OU dossier de captures :
-C:\captures\
+```powershell
+python tshark2hashcat.py .\captures
 ```
 
-Le programme lance automatiquement :
+Le dossier est traité en mode `folder`.
+
+Le traitement des dossiers prend en charge la recherche récursive des captures et le traitement parallèle.
+
+---
+
+# Hashcat
+
+Le projet intègre plusieurs étapes autour de Hashcat :
 
 ```text
-folder
+Capture
+   │
+   ▼
+Analyse TShark
+   │
+   ▼
+Détection / extraction
+   │
+   ▼
+Identification du format
+   │
+   ▼
+Cible Hashcat
+   │
+   ▼
+Commande Hashcat
+   │
+   ▼
+Résultat
+```
+
+Les commandes générées peuvent utiliser une wordlist et différentes stratégies d'attaque.
+
+Le projet dispose également de mécanismes permettant de réutiliser les informations récupérées pendant un cracking dans les analyses suivantes du projet.
+
+---
+
+# Solveurs intégrés
+
+Le moteur contient quatre solveurs principaux :
+
+```text
+auth
+wpa2e
+wep
+sae
+```
+
+### `auth`
+
+Prise en charge de plusieurs mécanismes d'authentification, notamment :
+
+* XMPP / SASL
+* SCRAM-SHA-1
+* SCRAM-SHA-256
+* SCRAM-SHA-512
+* DIGEST-MD5
+* CRAM-MD5
+* PLAIN
+* LOGIN
+* HTTP Basic
+* HTTP Digest
+* POP3
+* IMAP
+* SMTP
+* FTP
+* Telnet
+
+### `wpa2e`
+
+Analyse des échanges WPA2-Enterprise avec notamment :
+
+* RADIUS
+* Message-Authenticator
+* PMK
+* MS-MPPE
+* EAPOL 4-way
+* PTK
+* MIC
+* AES-CCMP
+
+### `wep`
+
+Analyse WEP avec notamment :
+
+* WEP-40
+* IV
+* known plaintext
+* ICV
+* CRC32
+
+### `sae`
+
+Analyse WPA3-SAE avec notamment :
+
+* PWE
+* masks
+* confirmation
+* KCK
+* PMK
+* PTK
+* KEK
+* TK
+* GTK
+* CCMP
+
+---
+
+# Inventaire réseau
+
+L'inventaire prend en charge l'extraction de nombreuses informations présentes dans une capture.
+
+Les résultats peuvent inclure :
+
+```text
+┌──────────────────────────────────┐
+│ Frame                            │
+│ Source / Destination             │
+│ Protocoles                       │
+│ Identités                        │
+│ Secrets                          │
+│ Métadonnées                      │
+│ Anomalies                        │
+│ Découvertes                      │
+│ Notes                            │
+└──────────────────────────────────┘
+```
+
+Les valeurs extraites sont actuellement conservées telles quelles dans les sorties générées.
+
+---
+
+# Protocoles analysés
+
+Le moteur contient des parseurs et traitements pour notamment :
+
+### Réseau
+
+```text
+ARP
+IPv4
+IPv6
+TCP
+UDP
+ICMP
+```
+
+### Infrastructure
+
+```text
+DNS
+DHCP
+NTP
+RADIUS
+SNMP
+```
+
+### Web / chiffrement
+
+```text
+HTTP
+TLS
+```
+
+Pour TLS, l'inventaire peut notamment relever :
+
+```text
+ClientHello
+ServerHello
+version TLS
+SNI
+ALPN
+PSK
+certificat
+subject
+issuer
+serial
+validité
+SAN
+```
+
+### Authentification / accès
+
+```text
+SSH
+FTP
+Telnet
+LDAP
+Kerberos
+RDP
+```
+
+### Messagerie
+
+```text
+POP3
+IMAP
+SMTP
+```
+
+### Applications / autres protocoles
+
+```text
+MySQL
+PostgreSQL
+XMPP
+SIP
+Redis
+IRC
+Modbus
+S7
+BACnet
 ```
 
 ---
 
-# Exemple : analyse classique d'une capture
+# Extraction
+
+Le mode d'extraction accepte notamment :
 
 ```text
-◆ tshark2hashcat
-
-Votre choix : 3
-
-Fichier OU dossier de captures :
-C:\CTF\capture.pcapng
-
-[INFO] Analyse de la capture...
-[INFO] Extraction TShark...
-[INFO] Analyse des protocoles...
-[INFO] Extraction des hashes...
-[INFO] Génération des rapports...
+-Y
+-d
+--limit
+-x
 ```
 
-Les messages exacts dépendent naturellement du contenu de la capture. Mettre une sortie avec `NTLM : 4`, `Kerberos : 12` et `password : 2` dans un README serait très joli, mais ce serait aussi inventer des résultats. L'outil, lui, n'a malheureusement pas la délicatesse de produire toujours la même capture pour nous arranger.
+Des extractions spécifiques peuvent être désactivées avec :
+
+```text
+--no-ntlm
+--no-kerberos
+--no-wpa
+--no-apop
+--no-creds
+--no-raw
+```
+
+Le mode `-x` permet notamment de conserver les données hexadécimales brutes lorsque le traitement spécifique ne permet pas d'extraire directement l'information recherchée.
 
 ---
 
-# Formats générés
+# Formats de sortie
 
-Le mode classique peut générer différents formats d'analyse, notamment :
+Le projet utilise plusieurs formats selon le mode utilisé :
 
 ```text
 TXT
@@ -370,177 +610,180 @@ JSON
 XLSX
 HTML
 Markdown
+PCAP
+PCAPNG
 ```
 
-Le code déclare ces formats dans ses constantes d'export et dans la CLI.
-
-Les fichiers Hashcat sont également séparés par mode lorsque l'extraction produit plusieurs types de hashes.
-
-Exemples de noms :
+Le mode `extract` permet notamment de sélectionner :
 
 ```text
-*_m5600.txt
-*_m5500.txt
-*_m22000.txt
+txt
+csv
+json
+xlsx
+html
+md
 ```
 
 ---
 
-# Hashcat
+# Gros fichiers et dossiers
 
-Le programme associe les hashes extraits aux modes Hashcat correspondants.
+Lorsqu'une capture dépasse un certain volume de paquets, le programme peut utiliser `editcap` afin de découper la capture, traiter les morceaux en parallèle puis fusionner les résultats.
 
-Quelques modes présents dans le catalogue du code :
+Pour les dossiers, la recherche des captures est récursive et le traitement peut être effectué en parallèle.
 
-|    Mode | Type            |
-| ------: | --------------- |
-|    `20` | APOP            |
-|  `4800` | CHAP            |
-|  `5500` | NetNTLMv1       |
-|  `5600` | NetNTLMv2       |
-|  `7500` | Kerberos        |
-| `11400` | SIP Digest      |
-| `13100` | Kerberos TGS    |
-| `16500` | JWT             |
-| `18200` | Kerberos AS-REP |
-| `22000` | WPA             |
-| `32100` | Kerberos AS-REP |
-| `32200` | Kerberos AS-REP |
+Extensions reconnues :
 
-Le catalogue du code contient également de nombreux autres modes Hashcat génériques.
+```text
+.pcap
+.pcapng
+.cap
+.dmp
+```
+
+Les JSON produits par TShark peuvent également être utilisés lorsque le traitement correspondant est disponible.
 
 ---
 
-# Exemple de fichier Hashcat
+# Options CLI
 
-Pour un hash associé au mode `5600`, le projet peut générer un fichier de cible accompagné de commandes.
+Les options globales comprennent notamment :
 
 ```text
-hash.txt
-hashcat.txt
+--lang fr|en
+--no-banner
+--no-color
+--quiet
+--verbose
+--no-progress
+--config
+--tshark
 ```
 
-Une commande peut prendre la forme :
+### Langue
 
-```bash
-hashcat -m 5600 -a 0 -O -w 3 hash.txt wordlist.txt
+```powershell
+python tshark2hashcat.py --lang fr
 ```
 
-Et pour afficher les résultats déjà récupérés :
+ou :
 
-```bash
-hashcat -m 5600 --show hash.txt
+```powershell
+python tshark2hashcat.py --lang en
 ```
 
-Le code génère également des variantes par masque et hybride.
+La variable d'environnement `T2H_LANG` peut également être utilisée.
 
 ---
 
 # Diagnostic
 
-Avant de commencer :
+Le programme fournit une commande `doctor` permettant de vérifier l'environnement.
 
-```bash
+Elle contrôle notamment :
+
+```text
+TShark / Wireshark
+dépendances Python
+solveurs
+self-tests
+```
+
+Exemple :
+
+```powershell
 python tshark2hashcat.py doctor
 ```
 
-Le diagnostic vérifie la présence des outils et dépendances nécessaires au fonctionnement du programme.
+---
+
+# Exemples d'utilisation
+
+### Lancer l'interface interactive
+
+```powershell
+python tshark2hashcat.py
+```
+
+Puis :
+
+```text
+1
+```
+
+pour créer un projet.
 
 ---
 
-# Utilisation directe
+### Reprendre un projet
 
-Le menu n'est pas obligatoire.
+```powershell
+python tshark2hashcat.py
+```
 
-Une capture peut être passée directement :
+Puis :
 
-```bash
+```text
+2
+```
+
+et sélectionner ensuite l'action voulue.
+
+---
+
+### Analyser une capture directement
+
+```powershell
 python tshark2hashcat.py capture.pcap
 ```
 
-Un dossier :
-
-```bash
-python tshark2hashcat.py ./captures
-```
-
-Le programme détecte alors automatiquement le type d'entrée et l'oriente vers le traitement correspondant.
-
 ---
 
-# Résumé du menu
+### Analyser un dossier de captures
 
-```text
-┌──────────────────────────────────────────────────────────────┐
-│                    tshark2hashcat                            │
-├──────────────────────────────────────────────────────────────┤
-│                                                              │
-│  1. MOTEUR                                                   │
-│     Nouveau projet complet                                   │
-│                                                              │
-│  2. MOTEUR                                                   │
-│     Ouvrir un projet existant                                │
-│                                                              │
-│  3. CLASSIQUE                                                │
-│     Fichier OU dossier → analyse automatique                 │
-│                                                              │
-│  0. Quitter                                                   │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### Le parcours typique
-
-```text
-Pour une analyse complète :
-
-python tshark2hashcat.py
-        │
-        └── 1
-             │
-             ├── dossier de captures
-             ├── dossier de sortie
-             ├── knowledge optionnel
-             └── mode profond optionnel
-                    │
-                    ▼
-                 PROJET
-                    │
-          ┌─────────┼─────────┐
-          ▼         ▼         ▼
-       solve    knowledge   graph
-          │
-          ▼
-       targets
-          │
-          ▼
-       rapports
-```
-
-### Pour une analyse rapide
-
-```text
-python tshark2hashcat.py
-        │
-        └── 3
-             │
-             ├── fichier → auto
-             │
-             └── dossier → folder
+```powershell
+python tshark2hashcat.py .\captures
 ```
 
 ---
 
-# Licence
+### Vérifier l'environnement
 
-Le code fourni indique la licence :
-
-```text
-Apache-2.0
+```powershell
+python tshark2hashcat.py doctor
 ```
 
-Version actuelle du fichier :
+---
+
+# Résumé du CLI
 
 ```text
-1.2.0
+MENU PRINCIPAL
+│
+├── 1  Nouveau projet
+│      ├── Analyse
+│      ├── Solveurs
+│      ├── Cracking
+│      └── Rapports
+│
+├── 2  Ouvrir un projet
+│      ├── 1  Poursuivre
+│      ├── 2  Knowledge Base
+│      ├── 3  Graphe
+│      ├── 4  Hashcat
+│      ├── 5  Rapport HTML
+│      └── 6  Inventaire réseau
+│
+├── 3  Mode classique
+│      ├── Fichier
+│      └── Dossier
+│
+└── 0  Quitter
 ```
+
+---
+
+## Licence
+
+Ce projet est distribué sous licence **Apache-2.0**.
