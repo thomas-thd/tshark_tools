@@ -5,83 +5,44 @@
 <h1 align="center">tshark2hashcat</h1>
 
 <p align="center">
-  <b>Analyse de captures réseau, extraction de secrets et génération Hashcat.</b>
+  <b>Extraction de hashes Hashcat et analyse de captures réseau via TShark.</b>
 </p>
 
 <p align="center">
-  <a href="https://www.python.org/downloads/">
-    <img src="https://img.shields.io/badge/Python-3.10%2B-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+">
-  </a>
-  <a href="https://www.wireshark.org/">
-    <img src="https://img.shields.io/badge/TShark-Wireshark-1679a7?style=for-the-badge&logo=wireshark&logoColor=white" alt="TShark">
-  </a>
-  <a href="https://hashcat.net/hashcat/">
-    <img src="https://img.shields.io/badge/Hashcat-ready-d75fff?style=for-the-badge" alt="Hashcat">
-  </a>
-  <a href="LICENSE">
-    <img src="https://img.shields.io/badge/license-MIT-5fd75f?style=for-the-badge" alt="MIT License">
-  </a>
+  <img src="https://img.shields.io/badge/Python-3.10%2B-3776ab?style=for-the-badge&logo=python&logoColor=white">
+  <img src="https://img.shields.io/badge/TShark-Wireshark-1679a7?style=for-the-badge&logo=wireshark&logoColor=white">
+  <img src="https://img.shields.io/badge/Hashcat-ready-d75fff?style=for-the-badge">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-5fd75f?style=for-the-badge">
 </p>
 
 <p align="center">
-  Windows · Linux · macOS · Python 3.10+
+  <code>v1.2.0</code> · Windows · Linux · macOS
 </p>
 
-> Audit réseau, pentest et CTF. Utilisez uniquement des captures que vous êtes autorisé à analyser.
+> Audit, pentest, CTF et recherche : utilisez uniquement des captures que vous êtes autorisé à analyser.
 
 ---
 
 ## Présentation
 
-**tshark2hashcat** est un outil d'analyse de captures réseau basé sur **TShark**.
+`tshark2hashcat` est un outil Python qui utilise **TShark** pour analyser des captures réseau et extraire des informations exploitables pour l'analyse réseau et le cracking hors ligne.
 
-Il transforme une ou plusieurs captures PCAP/PCAPNG en données directement exploitables pour l'audit :
+Le programme peut travailler sur :
 
-* hashes compatibles Hashcat ;
-* identifiants et secrets observés ;
-* informations Kerberos et Active Directory ;
-* exposition réseau ;
-* métadonnées et OSINT ;
-* findings de sécurité ;
-* chemins d'attaque ;
-* mapping MITRE ATT&CK ;
-* rapports HTML, Markdown, JSON, CSV et Excel ;
-* commandes Hashcat prêtes à être utilisées.
+* un fichier PCAP / PCAPNG / CAP / DMP ;
+* un export JSON TShark ;
+* un dossier de captures ;
+* un projet d'analyse complet.
 
-Le fonctionnement principal est simple :
+Le traitement peut produire des hashes Hashcat, des identifiants, des secrets, des informations réseau, des données Kerberos, des résultats d'analyse et différents formats de rapports.
 
-```text
-PCAP / PCAPNG
-      │
-      ▼
-   TShark
-      │
-      ├── Protocoles
-      ├── Credentials
-      ├── Hashes
-      ├── Kerberos
-      ├── Wi-Fi
-      ├── Métadonnées
-      └── OSINT
-      │
-      ▼
- Analyse / Corrélation
-      │
-      ├── Findings
-      ├── Score
-      ├── MITRE ATT&CK
-      ├── Chemins d'attaque
-      └── Cartographie
-      │
-      ▼
- Hashcat + Rapports
-```
+Le projet est contenu dans un **seul fichier Python**.
 
 ---
 
 # Installation
 
-## 1. Installer TShark
+## TShark
 
 ### Debian / Ubuntu
 
@@ -113,777 +74,932 @@ Vérification :
 tshark --version
 ```
 
----
-
-## 2. Installer tshark2hashcat
+## Dépendances Python optionnelles
 
 ```bash
-git clone https://github.com/tshark2hashcat/tshark2hashcat.git
-cd tshark2hashcat
+pip install rich openpyxl tqdm
 ```
 
-Dépendances optionnelles :
+Le code teste automatiquement leur présence.
 
-```bash
-pip install openpyxl rich tqdm
-```
-
-Le programme reste utilisable sans ces dépendances, avec une sortie texte simplifiée.
-
----
-
-# Démarrage rapide
-
-### Vérifier l'environnement
+`doctor` permet de vérifier l'environnement :
 
 ```bash
 python tshark2hashcat.py doctor
 ```
 
-### Analyser une capture
+Le diagnostic vérifie notamment TShark, les outils Wireshark utilisés par le programme et les dépendances Python. Un self-test des solveurs intégrés est également exécuté.
+
+---
+
+# Utilisation rapide
+
+## Analyse automatique d'une capture
 
 ```bash
 python tshark2hashcat.py auto capture.pcapng
 ```
 
-### Analyser un dossier
+`auto` effectue l'extraction puis lance les solveurs intégrés, sauf avec `--no-solve`.
+
+## Extraction
+
+```bash
+python tshark2hashcat.py extract capture.pcapng
+```
+
+Formats disponibles :
+
+```bash
+python tshark2hashcat.py extract capture.pcapng -f txt,csv,json,xlsx,html,md
+```
+
+## Analyse d'un dossier
 
 ```bash
 python tshark2hashcat.py folder ./captures
 ```
 
-### Utilisation implicite
+Les captures sont découvertes récursivement par défaut et traitées en parallèle. Le résultat est regroupé dans un classeur Excel.
+
+## Menu interactif
 
 ```bash
-python tshark2hashcat.py capture.pcap
+python tshark2hashcat.py wizard
 ```
 
-équivaut à :
+Sans argument :
 
 ```bash
-python tshark2hashcat.py auto capture.pcap
+python tshark2hashcat.py
 ```
 
-Et :
+le programme ouvre directement le menu interactif.
 
-```bash
-python tshark2hashcat.py ./captures
+---
+
+# Extraction Hashcat
+
+Le code définit actuellement les modes Hashcat suivants :
+
+```text
+20
+4800
+5500
+5600
+7500
+11400
+13100
+16500
+18200
+19600
+19700
+19800
+19900
+22000
+32100
+32200
 ```
 
-équivaut à :
+Les hashes extraits sont regroupés par mode et les commandes Hashcat correspondantes peuvent être générées automatiquement.
 
 ```bash
-python tshark2hashcat.py folder ./captures
+python tshark2hashcat.py hashcat hashes.txt
+```
+
+Avec un mode explicite :
+
+```bash
+python tshark2hashcat.py hashcat hashes.txt -m 5600
+```
+
+Une wordlist peut être associée aux commandes :
+
+```bash
+python tshark2hashcat.py hashcat hashes.txt --wordlist wordlist.txt
 ```
 
 ---
 
-# Hashes compatibles Hashcat
+# NTLM
 
-Les hashes sont validés contre le format attendu avant leur export et sont dédupliqués automatiquement.
+Le moteur d'extraction traite notamment les échanges NTLMSSP.
 
-| Protocole        | Détection                              |                    Hashcat |
-| ---------------- | -------------------------------------- | -------------------------: |
-| NetNTLMv2        | NTLMSSP AUTH, NT Response > 24 octets  |                  `-m 5600` |
-| NetNTLMv1        | NTLMSSP AUTH, NT Response = 24 octets  |                  `-m 5500` |
-| NetNTLMv1 + ESS  | NTLMSSP avec Extended Session Security |                  `-m 5500` |
-| Kerberos AS-REQ  | PA-ENC-TIMESTAMP                       |  `-m 7500 / 19800 / 19900` |
-| Kerberos AS-REP  | `msg-type 11` + `enc-part`             | `-m 18200 / 32100 / 32200` |
-| Kerberos TGS-REP | Ticket Service                         | `-m 13100 / 19600 / 19700` |
-| WPA PMKID        | RSN / EAPOL M1                         |                 `-m 22000` |
-| APOP             | MD5(challenge + password)              |                    `-m 20` |
-| SIP Digest       | Authorization Digest                   |                 `-m 11400` |
-| JWT              | Bearer JWT                             |                 `-m 16500` |
-| CHAP             | Champs CHAP disséqués                  |                  `-m 4800` |
+Les données peuvent être extraites depuis les champs TShark et, lorsque nécessaire, depuis les octets bruts de la capture.
 
-### Extraction multi-niveaux
+Le code valide les données avant leur génération en cible Hashcat.
 
-L'extraction utilise en priorité les champs disséqués par TShark :
+Les erreurs d'extraction NTLM sont également signalées lorsque des champs nécessaires sont absents ou que la longueur de la réponse ne correspond pas aux formats attendus.
 
-```text
-ntlmssp.*
-kerberos.*
-...
-```
+---
 
-Si les champs ne sont pas disponibles, un second chemin peut analyser les octets bruts :
+# Kerberos
 
-```text
-TShark -x
-    │
-    ├── NTLMSSP signatures
-    ├── Base64
-    ├── HTTP
-    ├── IMAP
-    └── SMTP
-```
+Le programme analyse les échanges Kerberos et conserve notamment les informations permettant de caractériser les identités observées.
 
-Les échanges sont ensuite corrélés lorsque cela est possible par :
+Le rapport peut afficher :
 
-```text
-IP source
-IP destination
-port source
-port destination
-```
+* frame ;
+* type de message ;
+* utilisateur ;
+* realm ;
+* SPN ;
+* salt ;
+* types de chiffrement.
+
+Le programme conserve également les utilisateurs Kerberos ayant une pré-authentification observée.
+
+Les modes Hashcat associés aux différentes cibles Kerberos sont intégrés dans le catalogue du programme.
+
+---
+
+# WPA / Wi-Fi
+
+Le projet contient plusieurs traitements liés au Wi-Fi.
+
+Le moteur de solveurs intégré comprend :
+
+### WPA2-Enterprise / RADIUS
+
+Le solveur `wpa2e` traite notamment :
+
+* secret RADIUS ;
+* `Message-Authenticator` ;
+* PMK ;
+* MS-MPPE-Recv-Key ;
+* handshake 4-way ;
+* PTK ;
+* MIC EAPOL ;
+* déchiffrement AES-CCMP.
+
+### WEP
+
+Le solveur `wep` traite le WEP-40 avec :
+
+* clair connu ;
+* différents alphabets ;
+* validation ICV ;
+* validation CRC32.
+
+### WPA3-SAE
+
+Le solveur `sae` traite notamment :
+
+* récupération du PWE ;
+* masks ;
+* confirmation SAE ;
+* dérivation KCK / PMK ;
+* PTK / KEK / TK ;
+* GTK ;
+* déchiffrement CCMP.
+
+Ces quatre solveurs sont intégrés directement dans le fichier Python.
+
+---
+
+# Authentifications réseau
+
+Le solveur `auth` intégré traite plusieurs mécanismes d'authentification.
+
+### XMPP / SASL
+
+* SCRAM-SHA-1
+* SCRAM-SHA-256
+* SCRAM-SHA-512
+* DIGEST-MD5
+* CRAM-MD5
+* PLAIN
+* LOGIN
+
+### HTTP
+
+* Basic
+* Digest
+
+### POP3
+
+* USER/PASS
+* APOP
+
+### IMAP
+
+* LOGIN
+
+### SMTP
+
+* AUTH PLAIN
+* AUTH LOGIN
+* CRAM-MD5
+
+### FTP
+
+* USER/PASS
+
+### Telnet
+
+* authentification observée dans la session.
+
+Le solveur peut utiliser une wordlist, des variantes dérivées du login, des fragments du login, du brute force incrémental et des masks selon le mécanisme.
 
 ---
 
 # Identifiants et secrets
 
-tshark2hashcat recherche également les informations sensibles visibles directement dans les captures.
+L'extraction réseau détecte notamment des données d'authentification en clair.
 
-## Identifiants en clair
+Exemples présents dans le code :
 
-Protocoles et mécanismes pris en charge notamment :
+* FTP ;
+* POP3 ;
+* IMAP ;
+* SMTP ;
+* Telnet ;
+* IRC ;
+* XMPP ;
+* LDAP ;
+* SNMP ;
+* SIP.
 
-* FTP `USER/PASS`
-* Telnet
-* HTTP Basic
-* Proxy Basic
-* HTTP Forms
-* SMTP
-* POP3
-* IMAP
-* AUTH PLAIN
-* AUTH LOGIN
-* PAP
-* LDAP Simple Bind
-* TACACS+
-* MQTT
+Le parseur FTP extrait notamment `USER`, `PASS`, `ACCT` et `AUTH`.
 
-## Tokens et clés
+Le parseur POP3 traite `USER`, `PASS`, `AUTH PLAIN` et APOP.
 
-Détection notamment de :
+Le parseur IMAP traite notamment `LOGIN` et `AUTHENTICATE PLAIN`.
 
-* Cookies ;
-* `Set-Cookie` ;
-* `Authorization` ;
-* Bearer tokens ;
-* JWT ;
-* API keys ;
-* AWS Access Keys.
-
-## Informations réseau
-
-Extraction de :
-
-* SNMP community strings ;
-* utilisateurs SNMPv3 ;
-* RADIUS User-Name ;
-* DHCP hostname ;
-* TLS SNI ;
-* QUIC SNI ;
-* DTLS SNI.
+Le parseur SMTP traite notamment `AUTH PLAIN`, `AUTH LOGIN` et certains en-têtes de messages.
 
 ---
 
-# Analyse réseau et OSINT
+# Inventaire réseau
 
-L'outil collecte également les informations utiles à la compréhension de l'environnement observé.
+La commande `inventory` fournit un moteur d'inventaire indépendant du reste du pipeline.
 
-### Identités
+```bash
+python tshark2hashcat.py inventory capture.pcap
+```
 
-* utilisateurs ;
-* comptes machine ;
-* domaines ;
-* UPN ;
-* realms Kerberos ;
-* SPN ;
-* identités avec ou sans pré-authentification.
+Ou sur un dossier :
 
-### Réseau
+```bash
+python tshark2hashcat.py inventory ./captures
+```
 
-* IPv4 / IPv6 ;
-* MAC ;
-* fabricants via OUI ;
-* DNS ;
-* mDNS ;
-* LLMNR ;
-* NBNS ;
-* DHCP ;
-* hosts ;
-* équipements réseau.
-
-### Active Directory
-
-* domaine ;
-* contrôleurs de domaine ;
-* utilisateurs ;
-* SPN ;
-* comptes machine ;
-* partages SMB ;
-* fichiers observés ;
-* informations Kerberos.
-
-### Wi-Fi
-
-* SSID ;
-* BSSID ;
-* RSN ;
-* EAPOL ;
-* PMKID ;
-* informations WPA/WPA2/WPA3.
-
-### OSINT réseau
-
-Détection de :
-
-* adresses e-mail ;
-* numéros français ;
-* noms présents dans les chemins ;
-* claims JWT ;
-* sujets d'e-mails ;
-* noms de machines ;
-* organisations ;
-* domaines ;
-* SNI ;
-* équipements ;
-* partages et fichiers.
-
-Des filtres réduisent certains faux positifs courants :
-
-* cookies Cloudflare ;
-* chaînes de test ;
-* faux numéros de téléphone ;
-* bannières SSH ;
-* comptes machine ;
-* valeurs SNMP de test.
-
----
-
-# Analyse de sécurité
-
-Le moteur transforme les éléments observés en findings exploitables.
-
-Chaque finding peut contenir :
+Les sorties sont :
 
 ```text
-Gravité
-Preuve
-Impact
-Remédiation
-Actifs concernés
+.txt
+.json
+.csv
+```
+
+Elles sont générées systématiquement par cette commande.
+
+L'inventaire conserve notamment :
+
+* secrets ;
+* identités ;
+* PII ;
+* métadonnées ;
+* protocoles ;
+* parseurs utilisés ;
+* anomalies ;
+* compteurs ;
+* découvertes ;
+* frame ;
+* source ;
+* destination ;
+* notes.
+
+Dans la version `1.2.0`, les valeurs de l'inventaire sont explicitement conservées et exportées **en clair**, sans masquage.
+
+---
+
+# Protocoles analysés
+
+Le moteur possède un système de dispatch par ports et par reconnaissance structurelle des payloads.
+
+Il peut notamment identifier ou analyser :
+
+* ARP ;
+* IPv4 ;
+* IPv6 ;
+* TCP ;
+* UDP ;
+* ICMP ;
+* DNS ;
+* DHCP ;
+* RADIUS ;
+* SNMP ;
+* TLS ;
+* SSH ;
+* HTTP ;
+* POP3 ;
+* SMTP ;
+* FTP ;
+* MySQL ;
+* PostgreSQL ;
+* XMPP ;
+* SIP ;
+* Redis ;
+* LDAP ;
+* Kerberos ;
+* IRC ;
+* RDP.
+
+La reconnaissance structurelle permet également d'identifier certains protocoles lorsque le port ne suffit pas.
+
+Le système limite le nombre de parseurs candidats et isole les erreurs de chaque parseur afin qu'une anomalie ne fasse pas arrêter toute l'analyse.
+
+---
+
+# Protocoles supplémentaires
+
+Le moteur d'inventaire contient également des parseurs pour plusieurs protocoles et environnements spécifiques, notamment :
+
+* NTP ;
+* Modbus ;
+* S7 ;
+* BACnet ;
+* MySQL ;
+* TLS ;
+* DHCP ;
+* SNMP ;
+* SIP.
+
+Par exemple, le parseur Modbus identifie certaines fonctions et signale le contexte OT/SCADA.
+
+Le parseur S7 identifie notamment le type de message et la fonction S7comm.
+
+---
+
+# TLS
+
+Le moteur d'inventaire peut analyser les structures TLS présentes dans les données disponibles.
+
+Il extrait notamment :
+
+* ClientHello ;
+* version TLS ;
+* SNI ;
+* ALPN ;
+* extension PSK ;
+* ServerHello ;
+* certificats ;
+* sujet ;
+* émetteur ;
+* numéro de série ;
+* validité ;
+* SAN DNS.
+
+Le réassemblage TCP utilisé pour ces données est borné afin de limiter la mémoire utilisée par les flux.
+
+---
+
+# Rapport d'analyse
+
+L'analyse réseau peut produire un rapport contenant notamment :
+
+* score ;
+* niveau de risque ;
+* findings ;
+* expositions ;
+* recommandations ;
+* OSINT ;
+* chemins ;
+* écarts ;
+* mapping MITRE ;
+* cartographie ;
+* conclusion ;
+* périmètre.
+
+Le rapport console présente également les hashes Hashcat et les informations Kerberos associées.
+
+Le score est basé sur les éléments extraits par l'analyse plutôt que simplement sur la présence d'un protocole. La méthode de rapport le précise explicitement.
+
+---
+
+# MITRE ATT&CK
+
+Le moteur de rapport associe certains éléments observés à des techniques MITRE ATT&CK.
+
+Le rapport console possède une section dédiée :
+
+```text
 MITRE ATT&CK
 ```
 
-## Exemples de findings
-
-* mots de passe en clair ;
-* FTP / Telnet ;
-* HTTP Basic ;
-* LDAP non chiffré ;
-* NetNTLMv1 ;
-* NetNTLMv2 ;
-* AS-REP Roasting ;
-* Kerberoasting ;
-* LLMNR ;
-* NBNS ;
-* WPAD ;
-* SNMP ;
-* APOP ;
-* WPA ;
-* exposition de cookies ;
-* exposition de PII.
-
----
-
-# Score de sécurité
-
-Un score sur 100 est calculé à partir des **preuves effectivement observées dans la capture**.
+avec :
 
 ```text
-FAIBLE
-MODÉRÉ
-ÉLEVÉ
-CRITIQUE
-```
-
-La simple présence d'un protocole ne suffit pas à déclencher automatiquement un finding critique.
-
-L'objectif est de distinguer :
-
-```text
-Protocole observé
-        ≠
-Vulnérabilité démontrée
+ID
+Technique
+Tactique
 ```
 
 ---
 
 # Chemins d'attaque
 
-Lorsque les données disponibles permettent une corrélation, l'outil peut reconstruire des scénarios d'attaque.
+Le rapport peut présenter des chemins d'attaque sous forme d'étapes.
 
-Exemple :
-
-```text
-Capture réseau
-      │
-      ▼
-Vol d'authentification NTLM
-      │
-      ▼
-Cracking / récupération du secret
-      │
-      ▼
-Kerberoasting
-      │
-      ▼
-Compte de service compromis
-      │
-      ▼
-Accès SMB / SYSVOL
-      │
-      ▼
-Exposition de données
-```
-
-Les chemins sont accompagnés des preuves disponibles dans la capture.
-
----
-
-# MITRE ATT&CK
-
-Les observations peuvent être associées à des techniques MITRE ATT&CK pertinentes.
-
-Exemples :
-
-| Technique | Utilisation                                 |
-| --------- | ------------------------------------------- |
-| T1040     | Network Sniffing                            |
-| T1003     | OS Credential Dumping / Credential Material |
-| T1558.003 | Kerberoasting                               |
-| T1558.004 | AS-REP Roasting                             |
-| T1557.001 | LLMNR/NBT-NS Poisoning                      |
-| T1021.002 | SMB/Windows Admin Shares                    |
-
-Le mapping est basé sur les éléments réellement observés et non uniquement sur les protocoles présents.
-
----
-
-# Kerberos
-
-Une section dédiée permet de retrouver les identités Kerberos observées :
+Chaque entrée peut contenir :
 
 ```text
-Frame
-Message Type
-User
-Realm
-UPN
-SPN
-Salt
-ETYPE_INFO2
-Encryption Types
-Pre-authentication
+Étape
+Nom
+Scénario
+Résultat
+MITRE
 ```
-
-Les informations de casse exacte peuvent également être conservées lorsqu'elles sont nécessaires à certains environnements CTF.
 
 ---
 
-# Commandes Hashcat
+# Cartographie
 
-Le module `hashcat` génère des commandes directement exploitables.
-
-Exemples de méthodes supportées :
+Le rapport peut afficher les éléments effectivement observés sous forme de cartographie :
 
 ```text
-Dictionnaire
-Rules
-Best64
-Rockyou
-Combinator
-Mask
-Hybrid
---show
---left
+Type
+Nom
+Rôle
+Détail
 ```
-
-Le mode Hashcat est sélectionné automatiquement lorsque le format extrait est suffisamment déterminé.
-
-Les résultats récupérés peuvent ensuite être associés aux hashes correspondants afin de faciliter leur classement dans le rapport.
 
 ---
 
-# Rapport d'audit
+# Projet d'analyse
 
-La commande `report` génère un rapport complet :
+Le mode `project` constitue le moteur complet du programme.
 
 ```bash
-python tshark2hashcat.py report capture.pcapng
+python tshark2hashcat.py project ./captures
 ```
 
-Formats disponibles :
+Le contexte peut être déclaré :
+
+```bash
+--context CTF
+--context PENTEST
+--context AUDIT
+--context RESEARCH
+```
+
+Le projet accepte également :
 
 ```text
-HTML
-Markdown
-JSON
-XLSX
+--scope
+--exclude
+--wordlist
+--knowledge
+--deep
+--budget
+--cores
+--hashcat
+--hashcat-run
+--rounds
+--sae-mask
+--auth-mask
+--no-cache
+--no-recursive
+--no-excel
+--no-html
+--fresh
+--no-ask
 ```
 
-Le rapport contient notamment :
+---
 
-* synthèse exécutive ;
-* score ;
-* findings ;
-* preuves ;
-* remédiations ;
-* expositions ;
-* MITRE ATT&CK ;
-* chemins d'attaque ;
-* écarts attendu / observé ;
-* cartographie réseau ;
-* OSINT ;
-* identités ;
-* hôtes ;
-* Wi-Fi ;
-* fichiers ;
-* secrets ;
-* hashes ;
-* informations Kerberos.
+# Knowledge Base
+
+Un projet peut conserver une base de connaissances.
+
+```bash
+python tshark2hashcat.py knowledge projet/
+```
+
+Elle peut être filtrée par :
+
+```bash
+--type password
+--status VALIDATED
+```
+
+et exportée en JSON :
+
+```bash
+--json-out resultat.json
+```
+
+Un fichier externe peut également être importé avec `--knowledge`.
 
 ---
 
-# Export Excel
+# Graphe
 
-L'export `.xlsx` est organisé en plusieurs onglets.
+Le projet possède une commande dédiée à la génération du graphe de connaissances :
 
-### Synthèse
+```bash
+python tshark2hashcat.py graph projet/
+```
 
-* Couverture
-* KPI
-* Synthèse
-* Findings
-* Actions P1/P2/P3
-* Méthodologie
-
-### Analyse
-
-* volumes ;
-* durée ;
-* débit ;
-* familles de protocoles ;
-* protocoles clair/chiffré/authentifié ;
-* IP ;
-* MAC.
-
-### Sécurité
-
-* Findings ;
-* Expositions ;
-* MITRE ATT&CK ;
-* Chemins ;
-* Écarts.
-
-### Inventaire
-
-* Cartographie ;
-* OSINT ;
-* Identités ;
-* Hôtes ;
-* Wi-Fi ;
-* Fichiers ;
-* Kerberos.
-
-### Credentials
-
-* Secrets ;
-* Hashes ;
-* commandes Hashcat.
-
-Le classeur utilise notamment :
-
-* filtres automatiques ;
-* volets figés ;
-* en-têtes ;
-* pieds de page ;
-* zébrage ;
-* niveaux de sévérité ;
-* graphiques.
+Elle produit un fichier `.dot` et des informations associées au graphe et à la timeline.
 
 ---
 
-# Autres exports
+# Targets
 
-L'analyse peut également produire :
+La commande `targets` traite les cibles Hashcat d'un projet :
+
+```bash
+python tshark2hashcat.py targets projet/
+```
+
+Elle effectue notamment une revalidation des formats, organise les hashes par cible et génère les commandes associées.
+
+---
+
+# Solve
+
+Un projet peut être repris ultérieurement :
+
+```bash
+python tshark2hashcat.py solve projet/
+```
+
+Le moteur peut effectuer plusieurs rounds :
+
+```text
+analyse
+  ↓
+cibles
+  ↓
+solveurs
+  ↓
+propagation
+  ↓
+post-crack
+  ↓
+nouveaux candidats
+  ↓
+nouveau round
+```
+
+Le cycle continue jusqu'à atteindre l'état stable ou le nombre maximal de rounds configuré.
+
+Les informations récupérées par les solveurs peuvent être réinjectées dans le projet comme nouveaux candidats.
+
+---
+
+# Hashcat externe
+
+Le moteur projet peut également utiliser un exécutable Hashcat externe.
+
+```bash
+python tshark2hashcat.py project ./captures \
+  --hashcat /chemin/vers/hashcat \
+  --hashcat-run
+```
+
+Le code prévoit l'association d'une wordlist aux cibles et l'exécution des cibles `READY`.
+
+---
+
+# Commandes disponibles
+
+## Extraction et analyse
+
+```text
+auto
+folder
+extract
+analyze
+stats
+packets
+follow
+objects
+filter
+report
+creds
+```
+
+## Outils TShark / Wireshark
+
+```text
+capture
+decode
+fields
+info
+ifaces
+protocols
+expert
+hosts
+voip
+```
+
+## Hashcat
+
+```text
+hashcat
+modes
+```
+
+## Utilitaires
+
+```text
+filters
+tshark-help
+doctor
+examples
+init-config
+wizard
+```
+
+## Moteur projet
+
+```text
+project
+knowledge
+graph
+targets
+solve
+inventory
+```
+
+L'ensemble de ces sous-commandes est directement déclaré dans le parser CLI du programme.
+
+---
+
+# Commandes principales
+
+| Commande      | Fonction                                    |
+| ------------- | ------------------------------------------- |
+| `auto`        | Extraction automatique + rapport + solveurs |
+| `folder`      | Analyse d'un dossier vers un Excel unique   |
+| `extract`     | Extraction des hashes et identifiants       |
+| `analyze`     | Analyse et statistiques d'une capture       |
+| `stats`       | Exécution de statistiques TShark            |
+| `packets`     | Export de paquets et champs                 |
+| `follow`      | Suivi de flux                               |
+| `objects`     | Export d'objets                             |
+| `filter`      | Filtrage et réécriture de capture           |
+| `report`      | Génération du rapport                       |
+| `creds`       | Extraction des identifiants                 |
+| `convert`     | Conversion, découpage et fusion             |
+| `capture`     | Capture live                                |
+| `decode`      | Decode-as                                   |
+| `fields`      | Extraction de champs TShark                 |
+| `info`        | Informations capinfos                       |
+| `ifaces`      | Interfaces TShark                           |
+| `protocols`   | Protocoles et champs                        |
+| `expert`      | Informations Expert                         |
+| `hosts`       | Informations hosts                          |
+| `voip`        | Statistiques SIP/RTP                        |
+| `hashcat`     | Commandes Hashcat                           |
+| `modes`       | Catalogue des modes Hashcat                 |
+| `filters`     | Catalogue de filtres                        |
+| `tshark-help` | Catalogue options/statistiques TShark       |
+| `doctor`      | Diagnostic                                  |
+| `examples`    | Exemples                                    |
+| `init-config` | Génération de configuration                 |
+| `wizard`      | Menu interactif                             |
+| `project`     | Projet d'analyse complet                    |
+| `knowledge`   | Base de connaissances                       |
+| `graph`       | Graphe de connaissances                     |
+| `targets`     | Gestion des cibles Hashcat                  |
+| `solve`       | Poursuite d'un projet                       |
+| `inventory`   | Inventaire réseau exhaustif                 |
+
+---
+
+# Exports
+
+Les formats déclarés par le programme comprennent :
 
 ```text
 TXT
 CSV
 JSON
+XLSX
 HTML
 Markdown
 PCAP
 PCAPNG
 ```
 
-Les fichiers Hashcat peuvent être séparés par mode :
-
-```text
-*_m5600.txt
-*_m5500.txt
-*_m22000.txt
-...
-```
+Pour `extract`, les formats `txt`, `csv`, `json`, `xlsx`, `html` et `md` sont directement proposés par la CLI.
 
 ---
 
-# CLI
+# Excel
 
-tshark2hashcat fournit un wrapper autour des principales fonctions TShark/Wireshark.
+L'export Excel utilise `openpyxl`.
 
-| Commande      | Fonction                         |
-| ------------- | -------------------------------- |
-| `auto`        | Analyse complète d'un fichier    |
-| `folder`      | Analyse récursive d'un dossier   |
-| `extract`     | Extraction des données           |
-| `analyze`     | Analyse générale + statistiques  |
-| `stats`       | Statistiques TShark              |
-| `packets`     | Extraction de paquets            |
-| `follow`      | Suivi de flux                    |
-| `objects`     | Extraction d'objets              |
-| `filter`      | Réécriture d'une capture filtrée |
-| `report`      | Génération du rapport            |
-| `creds`       | Identifiants en clair            |
-| `convert`     | Conversion / découpage / fusion  |
-| `capture`     | Capture réseau live              |
-| `decode`      | Decode-as / arbre protocolaire   |
-| `fields`      | Extraction de champs TShark      |
-| `info`        | Informations capinfos            |
-| `ifaces`      | Interfaces de capture            |
-| `protocols`   | Catalogue TShark                 |
-| `expert`      | Informations Expert              |
-| `hosts`       | Hosts observés                   |
-| `voip`        | SIP / RTP                        |
-| `hashcat`     | Génération de commandes Hashcat  |
-| `modes`       | Catalogue des modes Hashcat      |
-| `filters`     | Bibliothèque de filtres          |
-| `tshark-help` | Aide et statistiques TShark      |
-| `wizard`      | Interface interactive            |
-| `doctor`      | Diagnostic de l'environnement    |
-| `examples`    | Exemples                         |
-| `init-config` | Configuration initiale           |
+L'export générique de paquets crée notamment :
+
+* feuille `Paquets` ;
+* en-têtes ;
+* filtres automatiques ;
+* volets figés ;
+* largeur automatique des colonnes.
+
+Le rapport complet possède également plusieurs feuilles spécialisées correspondant aux différentes catégories d'analyse du moteur.
 
 ---
 
-# Analyse de dossiers
+# Traitement des gros fichiers
 
-Le mode `folder` permet d'analyser plusieurs captures :
+Le mode dossier compte rapidement les paquets avec `capinfos`.
 
-```bash
-python tshark2hashcat.py folder ./captures
-```
-
-Fonctionnement :
-
-```text
-captures/
-├── capture1.pcap
-├── capture2.pcapng
-├── wifi/
-│   └── capture3.cap
-└── kerberos/
-    └── capture4.pcapng
-```
-
-Les fichiers peuvent être traités en parallèle et les résultats regroupés dans un rapport unique.
-
-Pour les captures importantes, le traitement peut utiliser `editcap` afin de découper les fichiers en plusieurs segments.
+Lorsque la capture dépasse le seuil interne de **1500 paquets**, elle peut être découpée avec `editcap`, puis les morceaux sont traités en parallèle et fusionnés dans le résultat final.
 
 ---
 
-# Configuration
+# TShark
 
-Ordre de priorité :
-
-```text
-Arguments CLI
-     ↓
-Variables T2H_*
-     ↓
-tshark2hashcat.toml / .json
-     ↓
-Valeurs par défaut
-```
-
-Exemple :
+Le moteur principal charge les captures avec TShark et peut utiliser :
 
 ```text
-T2H_TSHARK_PATH
-T2H_LANG
+-Y
+-d
+--limit
+-x
 ```
 
-Si TShark n'est pas dans le `PATH` :
-
-```bash
-python tshark2hashcat.py doctor --tshark "C:\Program Files\Wireshark\tshark.exe"
-```
-
-ou :
+L'extraction peut désactiver individuellement certains traitements :
 
 ```text
-T2H_TSHARK_PATH
+--no-ntlm
+--no-kerberos
+--no-wpa
+--no-apop
+--no-creds
+--no-raw
 ```
 
 ---
 
 # Interface
 
-L'interface utilise Rich lorsqu'il est disponible :
+L'interface utilise `Rich` lorsqu'il est disponible.
 
+Le programme possède notamment :
+
+* logo ;
 * tableaux ;
-* barres de progression ;
-* couleurs de sévérité ;
-* résumé d'analyse ;
-* statistiques.
+* panneaux ;
+* couleurs ;
+* progression ;
+* messages d'état ;
+* mode verbeux ;
+* mode silencieux ;
+* mode sans couleurs.
 
-Options disponibles notamment :
+Sans `Rich`, le programme utilise une sortie texte simplifiée.
+
+Les options globales comprennent :
 
 ```text
+--lang fr|en
+--no-banner
+--no-color
 --quiet
 --verbose
---no-color
 --no-progress
---limit
---lang
+--config
 --tshark
 ```
 
-Un mode texte de repli est disponible lorsque Rich n'est pas installé.
+---
+
+# Internationalisation
+
+Deux langues sont intégrées :
+
+```text
+fr
+en
+```
+
+La langue peut être sélectionnée avec :
+
+```bash
+--lang fr
+```
+
+ou :
+
+```bash
+--lang en
+```
+
+Le programme peut également utiliser `T2H_LANG`.
 
 ---
 
-# Architecture
+# Configuration
 
-Le projet reste volontairement contenu dans **un seul fichier Python**.
+Le programme permet de générer un fichier de configuration :
 
-```text
-tshark2hashcat.py
+```bash
+python tshark2hashcat.py init-config
 ```
 
-Pipeline simplifié :
+Un fichier personnalisé peut ensuite être utilisé avec :
 
 ```text
-Input
- │
- ├── PCAP / PCAPNG
- ├── JSON TShark
- └── dossier de captures
- │
- ▼
-TShark
- │
- ▼
-Extraction
- │
- ├── Protocoles
- ├── Credentials
- ├── Hashes
- ├── Kerberos
- ├── Wi-Fi
- ├── OSINT
- └── Métadonnées
- │
- ▼
-Corrélation
- │
- ▼
-Analyse sécurité
- │
- ├── Findings
- ├── Score
- ├── MITRE
- └── Attack Paths
- │
- ▼
-Exports
- │
- ├── Hashcat
- ├── TXT
- ├── CSV
- ├── JSON
- ├── Markdown
- ├── HTML
- └── XLSX
+--config
+```
+
+Le chemin de TShark peut être spécifié directement :
+
+```text
+--tshark
 ```
 
 ---
 
-# Compatibilité
+# Formats de captures
 
-| Composant       | Support      |
-| --------------- | ------------ |
-| Python          | 3.10+        |
-| Windows         | ✅            |
-| Linux           | ✅            |
-| macOS           | ✅            |
-| TShark          | Requis       |
-| Hashcat         | Optionnel    |
-| John the Ripper | Optionnel    |
-| Rich            | Optionnel    |
-| tqdm            | Optionnel    |
-| openpyxl        | Export Excel |
-
----
-
-# Limites connues
-
-### WPA
-
-Pour certains handshakes WPA nécessitant les octets EAPOL complets, `hcxpcapngtool` reste recommandé pour produire le format Hashcat correspondant.
-
-### OSPF
-
-OSPF avec authentification cryptographique ne dispose pas d'un mode Hashcat natif équivalent aux formats précédents.
-
-### CRAM-MD5
-
-L'extraction peut nécessiter l'utilisation du module `follow` SMTP/IMAP plutôt qu'un export Hashcat direct.
-
----
-
-# Sécurité et utilisation
-
-`tshark2hashcat` est destiné à :
-
-* l'audit de sécurité ;
-* le pentest autorisé ;
-* l'analyse forensique ;
-* les environnements de laboratoire ;
-* les CTF ;
-* la recherche et l'apprentissage.
-
-Les captures réseau peuvent contenir des informations extrêmement sensibles :
+Le code reconnaît notamment :
 
 ```text
-Mots de passe
-Cookies
-Tokens
-Adresses IP
-Adresses e-mail
-Données personnelles
-Informations Active Directory
-Communications privées
+.pcap
+.pcapng
+.cap
+.dmp
 ```
 
-**Ne publiez jamais une capture provenant d'un environnement réel sans avoir vérifié son contenu et obtenu les autorisations nécessaires.**
+ainsi que les exports JSON TShark pour les fonctions qui les acceptent.
 
-Pour un dépôt GitHub, privilégiez des captures synthétiques ou spécialement préparées pour les tests.
+---
+
+# Compatibilité avec l'utilisation directe
+
+Le programme conserve une compatibilité avec l'utilisation historique :
+
+```bash
+python tshark2hashcat.py capture.pcap
+```
+
+est automatiquement transformé en :
+
+```bash
+python tshark2hashcat.py auto capture.pcap
+```
+
+Un dossier est automatiquement transformé en :
+
+```bash
+python tshark2hashcat.py folder dossier/
+```
+
+---
+
+# Sécurité et données analysées
+
+L'outil peut extraire des informations sensibles présentes dans une capture :
+
+```text
+identifiants
+mots de passe
+hashes
+tokens
+cookies
+adresses e-mail
+PII
+informations réseau
+informations Kerberos
+```
+
+Dans la version actuelle de l'inventaire réseau, ces valeurs sont conservées en clair dans les sorties TXT, JSON et CSV.
+
+**Ne publiez donc pas de captures réelles contenant des données sensibles dans le dépôt GitHub.**
 
 ---
 
 # Licence
 
-Distribué sous licence **MIT**.
+Le code fourni déclare actuellement :
 
-Voir [`LICENSE`](LICENSE).
+```text
+Apache-2.0
+```
+
+avec la version :
+
+```text
+1.2.0
+```
+
+et le projet :
+
+```text
+tshark2hashcat
+```
 
 ---
 
 <p align="center">
-  <b>tshark2hashcat</b><br>
-  <i>From network capture to actionable security intelligence.</i>
+  <b>tshark2hashcat v1.2.0</b><br>
+  <i>PCAP · TShark · Hashcat · Network Analysis</i>
 </p>
